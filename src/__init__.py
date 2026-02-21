@@ -1,0 +1,1 @@
+"""MLX diffusion optimization scaffold."""

@@ -1,0 +1,8 @@
+# Ignore everything at root except what we list
+/*
+!/src/
+!README.md
+!.gitignore
+!requirements.txt
+!*.md
+!all_prompts.csv

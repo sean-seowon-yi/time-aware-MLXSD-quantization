@@ -1,0 +1,31 @@
+# Core MLX and inference
+mlx
+mlx-metal
+
+# Hugging Face and models
+huggingface-hub >= 0.25.0
+transformers
+accelerate
+diffusers
+
+# Data and numerics
+numpy
+regex
+safetensors
+
+# PyTorch (for DiffusionKit torch2coreml, filter script)
+torch
+
+# CoreML export (DiffusionKit torch2coreml)
+coremltools
+
+# CLI and validation
+pydantic
+tqdm
+Pillow
+
+# SD pipeline (mlx-examples vendor)
+stable_diffusion
+
+# Optional: install DiffusionKit from local repo when needed
+# pip install -e DiffusionKit/python
