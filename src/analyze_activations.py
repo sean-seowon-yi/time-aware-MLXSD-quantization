@@ -1,254 +1,408 @@
 """
-Analyze collected activation statistics.
+Analyze collected activation statistics to determine per-layer quantization strategy.
 
-Helps identify:
-- Which layers need more bits
-- Timestep-dependent quantization strategies
-- Outlier handling approaches
+Reads layer_statistics.json produced by collect_layer_activations.py and outputs:
+  1. Per-layer outlier score (how "safe" is 4-bit for this layer)
+  2. Shift effectiveness for post-GELU layers
+  3. Recommended bit assignments: W4A4 vs W4A8 per layer per bucket
+  4. SmoothQuant candidates: layers with few extreme channels
+  5. A quantization config JSON ready for use by quantize_model.py
+
+Outlier score (robust):
+  - We have per-channel avg_min/avg_max arrays from calibration.
+  - For non-post-GELU layers: outlier proxy = p99/p50 of per-channel absmax
+    Avoids sensitivity to a single spike; p99/p50 > threshold -> use A8
+  - For post-GELU layers: median is near-zero (dead GELU neurons), so
+    outlier_ratio is meaningless. Instead we only check shifted_absmax.
+
+SmoothQuant detection:
+  - If n_channels_above_99pct / total_channels < SMOOTHQUANT_FRACTION_THRESHOLD
+    AND p100/p99 > SMOOTHQUANT_SPIKE_THRESHOLD (isolated spike), flag as
+    smoothquant_candidate. Per-channel weight scaling can absorb these.
+
+W4A4 feasibility rules (conservative, tunable via CLI):
+  - Post-GELU layers: check shifted_absmax > SHIFTED_ABSMAX_A8_THRESHOLD -> A8
+  - Non-post-GELU: if tensor absmax > 12.0 OR p99/p50 > 4.0 -> A8
+  - SmoothQuant candidates can be downgraded from A8 to A4 with scaling
+
+Step schedule:
+  - Steps 0-34:  W4A4 where feasible (aggressive, ~35 steps)
+  - Steps 35-50: W4A8 always (refinement phase, highest sensitivity)
 
 Usage:
-    python -m src.analyze_activations --stats calibration_data/activations/layer_statistics.json
+    conda run -n diffusionkit python -m src.analyze_activations \\
+        --stats /path/to/calibration_data/activations/layer_statistics.json \\
+        --output /path/to/calibration_data/activations/quant_config.json
 """
 
 import argparse
 import json
+import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import numpy as np
 
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
-def analyze_dynamic_range(stats: Dict) -> Dict:
+
+# ---------------------------------------------------------------------------
+# Thresholds (tunable via CLI)
+# ---------------------------------------------------------------------------
+
+OUTLIER_RATIO_THRESHOLD = 4.0      # p99/p50 per-channel absmax (robust, non-post-GELU)
+ABSMAX_A8_THRESHOLD = 12.0         # tensor-level absmax
+SHIFTED_ABSMAX_A8_THRESHOLD = 8.0  # post-GELU after shift
+LATE_STEP_START = 35               # steps >= this always use A8
+
+# SmoothQuant detection thresholds
+SMOOTHQUANT_FRACTION_THRESHOLD = 0.05   # < 5% channels are outliers
+SMOOTHQUANT_SPIKE_THRESHOLD = 5.0       # p100/p99 spike ratio to flag isolated spikes
+
+
+# ---------------------------------------------------------------------------
+# Analysis helpers
+# ---------------------------------------------------------------------------
+
+def robust_outlier_ratio(per_channel_absmax: np.ndarray) -> float:
     """
-    Analyze dynamic range of each layer.
-    
-    Larger range = needs more bits or careful scaling
+    p99/p50 of per-channel absmax. More stable than max/median:
+    - Ignores single extreme spikes (those go to smoothquant_candidate)
+    - Unaffected by near-zero medians (post-GELU case handled separately)
     """
-    ranges = {}
-    
-    for layer_name, layer_stats in stats.items():
-        full_range = layer_stats['max'] - layer_stats['min']
-        p99_range = layer_stats['percentiles']['p99'] - layer_stats['percentiles']['p01']
-        
-        # Outlier ratio: how much do outliers affect range?
-        outlier_ratio = p99_range / full_range if full_range > 0 else 1.0
-        
-        ranges[layer_name] = {
-            'full_range': full_range,
-            'p99_range': p99_range,
-            'outlier_ratio': outlier_ratio,
+    p50 = float(np.percentile(per_channel_absmax, 50))
+    p99 = float(np.percentile(per_channel_absmax, 99))
+    if p50 < 1e-6:
+        return 1.0
+    return p99 / p50
+
+
+def outlier_ratio(per_channel_absmax: np.ndarray) -> float:
+    """max / median of per-channel absmax. Kept for reporting; use robust_outlier_ratio for decisions."""
+    med = np.median(per_channel_absmax)
+    if med < 1e-6:
+        return float("inf") if np.max(per_channel_absmax) > 1e-6 else 1.0
+    return float(np.max(per_channel_absmax) / med)
+
+
+def smoothquant_candidate(per_channel_absmax: np.ndarray) -> Tuple[bool, float, float]:
+    """
+    Detect layers where a small fraction of channels have isolated extreme values.
+    These can be fixed by per-channel weight scaling (SmoothQuant) rather than A8.
+
+    Returns:
+        (is_candidate, outlier_fraction, spike_ratio)
+        - outlier_fraction: fraction of channels above p99
+        - spike_ratio: p100/p99 (how isolated the top channels are)
+    """
+    p99 = float(np.percentile(per_channel_absmax, 99))
+    p100 = float(np.max(per_channel_absmax))
+    n_total = len(per_channel_absmax)
+    n_above_p99 = int(np.sum(per_channel_absmax > p99))
+    outlier_frac = n_above_p99 / n_total
+
+    if p99 < 1e-6:
+        return False, outlier_frac, 1.0
+
+    spike_ratio = p100 / p99
+    is_candidate = (outlier_frac < SMOOTHQUANT_FRACTION_THRESHOLD and
+                    spike_ratio > SMOOTHQUANT_SPIKE_THRESHOLD)
+    return is_candidate, outlier_frac, spike_ratio
+
+
+def smoothquant_scales(per_channel_absmax: np.ndarray,
+                       alpha: float = 0.5) -> np.ndarray:
+    """
+    Compute per-channel SmoothQuant scaling factors.
+    s_c = act_absmax_c^alpha / mean(act_absmax)^alpha
+    Weights get divided by s_c, activations get divided by s_c before quant.
+    alpha=0.5 balances the migration equally between weights and activations.
+    """
+    s = per_channel_absmax ** alpha
+    s = s / (np.mean(per_channel_absmax) ** alpha + 1e-8)
+    return s
+
+
+def shifted_absmax(per_channel_min: np.ndarray,
+                   per_channel_max: np.ndarray,
+                   shift: np.ndarray) -> float:
+    """After centering by shift, worst-case absmax across channels."""
+    return float(np.maximum(np.abs(per_channel_min - shift),
+                            np.abs(per_channel_max - shift)).max())
+
+
+def recommend_act_bits(stats: Dict,
+                       threshold_absmax: float,
+                       threshold_outlier: float) -> Tuple[int, str]:
+    """Return (bits, reason) for activation quantization."""
+    avg_min = np.array(stats["avg_min"])
+    avg_max = np.array(stats["avg_max"])
+    per_ch_absmax = np.maximum(np.abs(avg_min), np.abs(avg_max))
+    tensor_absmax = float(per_ch_absmax.max())
+
+    if "shift" in stats:
+        # Post-GELU: median is near-zero (dead neurons), outlier_ratio meaningless.
+        # Only check shifted_absmax — per-channel + shift handles the bimodal distribution.
+        shift = np.array(stats["shift"])
+        s_absmax = shifted_absmax(avg_min, avg_max, shift)
+        if s_absmax > SHIFTED_ABSMAX_A8_THRESHOLD:
+            return 8, f"post-GELU shifted_absmax={s_absmax:.2f}>{SHIFTED_ABSMAX_A8_THRESHOLD}"
+        return 4, f"post-GELU ok (shifted_absmax={s_absmax:.2f})"
+
+    # Non-post-GELU: use robust p99/p50 ratio instead of max/median
+    rob_ratio = robust_outlier_ratio(per_ch_absmax)
+    sq_candidate, sq_frac, sq_spike = smoothquant_candidate(per_ch_absmax)
+
+    if tensor_absmax > threshold_absmax:
+        if sq_candidate:
+            return 4, (f"smoothquant_candidate: absmax={tensor_absmax:.2f} but "
+                       f"only {sq_frac*100:.1f}% channels outlier, spike={sq_spike:.1f}x")
+        return 8, f"absmax={tensor_absmax:.2f}>{threshold_absmax}"
+    if rob_ratio > threshold_outlier:
+        if sq_candidate:
+            return 4, (f"smoothquant_candidate: p99/p50={rob_ratio:.2f} but "
+                       f"only {sq_frac*100:.1f}% channels outlier, spike={sq_spike:.1f}x")
+        return 8, f"p99/p50={rob_ratio:.2f}>{threshold_outlier}"
+    return 4, f"ok (absmax={tensor_absmax:.2f}, p99/p50={rob_ratio:.2f})"
+
+
+def analyze_bucket(layers: Dict,
+                   threshold_absmax: float,
+                   threshold_outlier: float) -> Dict:
+    results = {}
+    for layer_name, stats in layers.items():
+        if not stats.get("avg_min"):
+            continue
+        avg_min = np.array(stats["avg_min"])
+        avg_max = np.array(stats["avg_max"])
+        per_ch_absmax = np.maximum(np.abs(avg_min), np.abs(avg_max))
+        is_post_gelu = "shift" in stats
+
+        act_bits, reason = recommend_act_bits(stats, threshold_absmax, threshold_outlier)
+
+        sq_candidate, sq_frac, sq_spike = (False, 0.0, 1.0)
+        if not is_post_gelu:
+            sq_candidate, sq_frac, sq_spike = smoothquant_candidate(per_ch_absmax)
+
+        entry = {
+            "act_bits": act_bits,
+            "weight_bits": 4,
+            "reason": reason,
+            "tensor_absmax": float(per_ch_absmax.max()),
+            "outlier_ratio_max_med": round(outlier_ratio(per_ch_absmax), 3),
+            "outlier_ratio_p99_p50": round(robust_outlier_ratio(per_ch_absmax), 3),
+            "n_channels": int(len(avg_min)),
+            "n_batches": stats.get("n_batches", 0),
+            "is_post_gelu": is_post_gelu,
+            "smoothquant_candidate": sq_candidate,
         }
-    
-    return ranges
+        if sq_candidate:
+            sq_scales = smoothquant_scales(per_ch_absmax)
+            entry["smoothquant_outlier_frac"] = round(sq_frac, 4)
+            entry["smoothquant_spike_ratio"] = round(sq_spike, 2)
+            entry["smoothquant_scales"] = sq_scales.tolist()
+        if is_post_gelu:
+            shift = np.array(stats["shift"])
+            entry["shift_absmax"] = float(stats["shift_absmax"])
+            entry["shifted_absmax"] = round(shifted_absmax(avg_min, avg_max, shift), 4)
+
+        results[layer_name] = entry
+    return results
 
 
-def suggest_bit_widths(stats: Dict) -> Dict:
+# ---------------------------------------------------------------------------
+# Summary printer
+# ---------------------------------------------------------------------------
+
+def print_summary(analysis: Dict):
+    for bucket, layers in analysis.items():
+        if not layers:
+            continue
+        a4 = [n for n, v in layers.items() if v["act_bits"] == 4]
+        a8 = [n for n, v in layers.items() if v["act_bits"] == 8]
+        pg = [n for n, v in layers.items() if v["is_post_gelu"]]
+        sq = [n for n, v in layers.items() if v.get("smoothquant_candidate")]
+
+        print(f"\n{'='*60}")
+        print(f"Bucket [{bucket}]: {len(layers)} layers  "
+              f"A4={len(a4)} ({100*len(a4)//max(1,len(layers))}%)  "
+              f"A8={len(a8)}  post-GELU={len(pg)}  SmoothQuant={len(sq)}")
+
+        if a8:
+            true_a8 = [n for n in a8 if not layers[n].get("smoothquant_candidate")]
+            if true_a8:
+                print(f"  Layers requiring A8 (no fix):")
+                for name in sorted(true_a8)[:8]:
+                    print(f"    {name}: {layers[name]['reason']}")
+                if len(true_a8) > 8:
+                    print(f"    ... and {len(true_a8)-8} more")
+
+        if sq:
+            print(f"  SmoothQuant candidates (A4 with per-channel scaling):")
+            for name in sorted(sq)[:8]:
+                v = layers[name]
+                print(f"    {name}: {v['smoothquant_outlier_frac']*100:.1f}% outlier channels  "
+                      f"spike={v['smoothquant_spike_ratio']:.1f}x  "
+                      f"absmax={v['tensor_absmax']:.2f}")
+            if len(sq) > 8:
+                print(f"    ... and {len(sq)-8} more")
+
+        by_outlier = sorted(layers.items(),
+                            key=lambda x: x[1]["outlier_ratio_p99_p50"], reverse=True)
+        print(f"  Top outlier layers (p99/p50):")
+        for name, v in by_outlier[:5]:
+            sq_tag = " [SQ]" if v.get("smoothquant_candidate") else ""
+            print(f"    {name}: p99/p50={v['outlier_ratio_p99_p50']:.2f}  "
+                  f"max/med={v['outlier_ratio_max_med']:.2f}  "
+                  f"absmax={v['tensor_absmax']:.2f}  -> A{v['act_bits']}{sq_tag}")
+
+        if pg:
+            raw_abs = [layers[n]["tensor_absmax"] for n in pg]
+            shifted = [layers[n]["shifted_absmax"] for n in pg]
+            reduction = (1 - np.mean(shifted) / np.mean(raw_abs)) * 100
+            print(f"  Post-GELU shift: raw absmax mean={np.mean(raw_abs):.2f}  "
+                  f"shifted mean={np.mean(shifted):.2f}  "
+                  f"reduction={reduction:.1f}%")
+
+
+# ---------------------------------------------------------------------------
+# Quantization config builder
+# ---------------------------------------------------------------------------
+
+def build_quant_config(analysis: Dict, raw_stats: Dict, metadata: Dict) -> Dict:
     """
-    Suggest bit-widths for each layer based on activation statistics.
-    
-    Heuristics:
-    - Large dynamic range → more bits needed
-    - High outlier ratio → use percentile-based clipping
-    - High std relative to range → more bits needed
+    Build per-layer quantization config for two phases:
+      Phase 1 (steps 0-34):  W4A4 where analysis says feasible, else W4A8
+      Phase 2 (steps 35-50): W4A8 always (most sensitive refinement steps)
+
+    Also stores per-channel shift arrays for post-GELU layers so
+    quantize_model.py can apply them at inference time.
     """
-    suggestions = {}
-    
-    ranges = analyze_dynamic_range(stats)
-    
-    for layer_name, layer_stats in stats.items():
-        range_info = ranges[layer_name]
-        
-        # Compute relative std (coefficient of variation)
-        rel_std = layer_stats['std'] / (range_info['p99_range'] + 1e-8)
-        
-        # Suggest bits based on range and variation
-        if range_info['p99_range'] > 10:
-            suggested_bits = 8
-        elif range_info['p99_range'] > 5:
-            suggested_bits = 6
-        elif range_info['p99_range'] > 2:
-            suggested_bits = 4
-        else:
-            suggested_bits = 4
-        
-        # Adjust for high variation
-        if rel_std > 0.5:
-            suggested_bits = min(8, suggested_bits + 2)
-        
-        # Recommend clipping if many outliers
-        use_clipping = range_info['outlier_ratio'] < 0.9
-        
-        suggestions[layer_name] = {
-            'suggested_weight_bits': suggested_bits,
-            'suggested_activation_bits': suggested_bits,
-            'use_percentile_clipping': use_clipping,
-            'clip_percentile': (1, 99) if use_clipping else None,
+    # Use "mid" bucket for phase-1 config (most representative — most steps)
+    # Fall back to "early" if "mid" is empty
+    ref_bucket = "mid" if analysis.get("mid") else "early"
+    ref_layers = analysis.get(ref_bucket, {})
+    ref_stats = raw_stats.get(ref_bucket, {})
+
+    phase1 = {}
+    for layer_name, info in ref_layers.items():
+        entry = {
+            "weight_bits": 4,
+            "act_bits": info["act_bits"],
         }
-    
-    return suggestions
+        # Include shift array for post-GELU layers
+        if info["is_post_gelu"] and layer_name in ref_stats:
+            entry["shift"] = ref_stats[layer_name].get("shift")
+            entry["shift_absmax"] = info.get("shift_absmax")
+        # Include SmoothQuant scales for candidates
+        if info.get("smoothquant_candidate"):
+            entry["smoothquant_scales"] = info.get("smoothquant_scales")
+        phase1[layer_name] = entry
 
+    # Phase 2: all A8, include shift if available (still useful for centering)
+    all_names = set(ref_layers.keys())
+    for b in analysis:
+        all_names |= set(analysis[b].keys())
 
-def identify_sensitive_layers(stats: Dict, suggestions: Dict) -> list:
-    """
-    Identify layers that are most sensitive to quantization.
-    
-    These layers should get higher bit-widths or special handling.
-    """
-    sensitive = []
-    
-    for layer_name in stats.keys():
-        sugg = suggestions[layer_name]
-        
-        # Layers needing 8-bit are sensitive
-        if sugg['suggested_activation_bits'] >= 8:
-            sensitive.append({
-                'layer': layer_name,
-                'reason': 'large_dynamic_range',
-                'suggested_bits': sugg['suggested_activation_bits'],
-            })
-    
-    return sensitive
+    phase2 = {}
+    for layer_name in all_names:
+        entry = {"weight_bits": 4, "act_bits": 8}
+        # Carry shift from late bucket if available
+        late_stats = raw_stats.get("late", {})
+        if layer_name in late_stats and "shift" in late_stats[layer_name]:
+            entry["shift"] = late_stats[layer_name]["shift"]
+        phase2[layer_name] = entry
 
+    n_a4 = sum(1 for v in phase1.values() if v["act_bits"] == 4)
+    n_a8 = sum(1 for v in phase1.values() if v["act_bits"] == 8)
+    n_sq = sum(1 for v in ref_layers.values() if v.get("smoothquant_candidate"))
 
-def print_summary(stats: Dict):
-    """Print comprehensive summary of activation statistics."""
-    
-    print("\n" + "="*80)
-    print("ACTIVATION STATISTICS SUMMARY")
-    print("="*80)
-    
-    print(f"\nTotal layers analyzed: {len(stats)}")
-    
-    # Overall statistics
-    all_mins = [s['min'] for s in stats.values()]
-    all_maxs = [s['max'] for s in stats.values()]
-    all_stds = [s['std'] for s in stats.values()]
-    
-    print(f"\nOverall activation range: [{min(all_mins):.4f}, {max(all_maxs):.4f}]")
-    print(f"Mean std across layers: {np.mean(all_stds):.4f}")
-    
-    # Analyze dynamic ranges
-    print("\n" + "-"*80)
-    print("DYNAMIC RANGE ANALYSIS")
-    print("-"*80)
-    
-    ranges = analyze_dynamic_range(stats)
-    
-    # Sort by range
-    sorted_layers = sorted(ranges.items(), 
-                          key=lambda x: x[1]['full_range'], 
-                          reverse=True)
-    
-    print("\nTop 10 layers by dynamic range:")
-    for i, (layer_name, range_info) in enumerate(sorted_layers[:10], 1):
-        print(f"{i:2}. {layer_name:40} "
-              f"Range: {range_info['full_range']:8.4f}  "
-              f"P99: {range_info['p99_range']:8.4f}  "
-              f"Outlier ratio: {range_info['outlier_ratio']:.2f}")
-    
-    # Suggest bit-widths
-    print("\n" + "-"*80)
-    print("QUANTIZATION RECOMMENDATIONS")
-    print("-"*80)
-    
-    suggestions = suggest_bit_widths(stats)
-    
-    # Count by suggested bits
-    bit_counts = {}
-    for sugg in suggestions.values():
-        bits = sugg['suggested_activation_bits']
-        bit_counts[bits] = bit_counts.get(bits, 0) + 1
-    
-    print("\nSuggested bit-width distribution:")
-    for bits in sorted(bit_counts.keys()):
-        count = bit_counts[bits]
-        pct = 100 * count / len(suggestions)
-        print(f"  {bits}-bit: {count:3} layers ({pct:5.1f}%)")
-    
-    # Identify sensitive layers
-    sensitive = identify_sensitive_layers(stats, suggestions)
-    
-    if sensitive:
-        print(f"\nSensitive layers requiring careful quantization ({len(sensitive)}):")
-        for item in sensitive[:10]:  # Show top 10
-            print(f"  - {item['layer']:40} ({item['reason']}, needs {item['suggested_bits']}-bit)")
-    
-    # Layers that can use aggressive quantization
-    aggressive = [name for name, sugg in suggestions.items() 
-                 if sugg['suggested_activation_bits'] <= 4]
-    
-    if aggressive:
-        print(f"\nLayers suitable for aggressive quantization (≤4-bit): {len(aggressive)}")
-        for layer in aggressive[:5]:
-            print(f"  - {layer}")
-    
-    print("\n" + "="*80)
-
-
-def export_quantization_config(stats: Dict, output_path: Path):
-    """
-    Export quantization configuration for use in quantization scripts.
-    
-    Format compatible with TaQ-DiT style quantization.
-    """
-    suggestions = suggest_bit_widths(stats)
-    
-    config = {
-        'layer_configs': {},
-        'default_config': {
-            'weight_bits': 4,
-            'activation_bits': 8,
-            'use_symmetric': True,
-        }
+    return {
+        "strategy": {
+            f"steps_0_to_{LATE_STEP_START - 1}": phase1,
+            f"steps_{LATE_STEP_START}_to_end": phase2,
+        },
+        "late_step_start": LATE_STEP_START,
+        "reference_bucket_for_phase1": ref_bucket,
+        "global_defaults": {"weight_bits": 4, "act_bits": 8},
+        "summary": {
+            "phase1_total": len(phase1),
+            "phase1_a4": n_a4,
+            "phase1_a8": n_a8,
+            "phase1_a4_pct": round(100 * n_a4 / max(1, len(phase1)), 1),
+            "phase1_smoothquant_candidates": n_sq,
+            "phase2_total": len(phase2),
+            "phase2_all_a8": True,
+        },
+        "thresholds": {
+            "outlier_ratio_p99_p50": OUTLIER_RATIO_THRESHOLD,
+            "absmax_a8": ABSMAX_A8_THRESHOLD,
+            "shifted_absmax_a8": SHIFTED_ABSMAX_A8_THRESHOLD,
+            "smoothquant_fraction": SMOOTHQUANT_FRACTION_THRESHOLD,
+            "smoothquant_spike": SMOOTHQUANT_SPIKE_THRESHOLD,
+        },
+        "metadata": metadata,
     }
-    
-    for layer_name, sugg in suggestions.items():
-        config['layer_configs'][layer_name] = {
-            'weight_bits': sugg['suggested_weight_bits'],
-            'activation_bits': sugg['suggested_activation_bits'],
-            'clip_percentile': sugg['clip_percentile'],
-            'calibration_stats': {
-                'min': stats[layer_name]['min'],
-                'max': stats[layer_name]['max'],
-                'mean': stats[layer_name]['mean'],
-                'std': stats[layer_name]['std'],
-                'p01': stats[layer_name]['percentiles']['p01'],
-                'p99': stats[layer_name]['percentiles']['p99'],
-            }
-        }
-    
-    with open(output_path, 'w') as f:
-        json.dump(config, f, indent=2)
-    
-    print(f"\n✓ Exported quantization config to {output_path}")
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Analyze activation statistics"
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument("--stats", type=Path, required=True,
-                       help="Path to layer_statistics.json")
-    parser.add_argument("--export-config", type=Path, default=None,
-                       help="Export quantization config to JSON")
+                        help="layer_statistics.json from collect_layer_activations.py")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Output quant_config.json path")
+    parser.add_argument("--outlier-threshold", type=float, default=OUTLIER_RATIO_THRESHOLD)
+    parser.add_argument("--absmax-threshold", type=float, default=ABSMAX_A8_THRESHOLD)
     args = parser.parse_args()
-    
-    if not args.stats.exists():
-        print(f"Error: Statistics file not found: {args.stats}")
-        print("Run collect_layer_activations.py first")
-        return
-    
-    # Load statistics
-    print(f"Loading statistics from {args.stats}")
+
+    output_path = args.output or (args.stats.parent / "quant_config.json")
+
+    print(f"Loading {args.stats}")
     with open(args.stats) as f:
-        stats = json.load(f)
-    
-    # Print summary
-    print_summary(stats)
-    
-    # Export config if requested
-    if args.export_config:
-        export_quantization_config(stats, args.export_config)
+        data = json.load(f)
+
+    buckets = data["buckets"]
+    metadata = data.get("metadata", {})
+
+    print(f"Calibration: {metadata.get('num_images',0)} images  "
+          f"× {metadata.get('num_timesteps',0)} timesteps  "
+          f"= {metadata.get('total_processed',0)} forward passes")
+
+    # Analyze
+    print("\n=== Per-Layer Analysis ===")
+    analysis = {}
+    for bucket_name, layers in buckets.items():
+        analysis[bucket_name] = analyze_bucket(
+            layers, args.absmax_threshold, args.outlier_threshold)
+
+    print_summary(analysis)
+
+    # Build and save config
+    print(f"\n=== Quantization Config ===")
+    quant_config = build_quant_config(analysis, buckets, metadata)
+    s = quant_config["summary"]
+
+    print(f"\nPhase 1 (steps 0-{LATE_STEP_START-1}, W4A? mixed):")
+    print(f"  {s['phase1_a4']}/{s['phase1_total']} layers -> A4 ({s['phase1_a4_pct']}%)")
+    print(f"    of which {s['phase1_smoothquant_candidates']} use SmoothQuant per-channel scaling")
+    print(f"  {s['phase1_a8']}/{s['phase1_total']} layers -> A8")
+    print(f"\nPhase 2 (steps {LATE_STEP_START}-50):")
+    print(f"  All {s['phase2_total']} layers -> A8 (refinement, max quality)")
+
+    with open(output_path, "w") as f:
+        json.dump(quant_config, f, indent=2)
+    print(f"\n✓ Quant config -> {output_path}")
+
+    analysis_path = args.stats.parent / "layer_analysis.json"
+    with open(analysis_path, "w") as f:
+        json.dump(analysis, f, indent=2)
+    print(f"✓ Full analysis -> {analysis_path}")
 
 
 if __name__ == "__main__":
