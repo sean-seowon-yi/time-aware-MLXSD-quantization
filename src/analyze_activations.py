@@ -354,8 +354,10 @@ def build_quant_config(analysis: Dict, raw_stats: Dict, metadata: Dict) -> Dict:
 def load_stats_v2(stats_path: Path):
     """
     Load per_timestep_npz_v2 format from collect_layer_activations.py.
-    Returns: (timesteps_dict, layer_names, metadata)
-    where timesteps_dict[step_key][layer_name] = {tensor_absmax, hist_p999, ...}
+    Returns: (timesteps_dict, per_channel_stats, layer_names, metadata)
+    where:
+      - timesteps_dict[step_key][layer_name] = {tensor_absmax, hist_p999, ...}
+      - per_channel_stats[layer_name] = {avg_min, avg_max, shift}  (aggregated from all steps)
     """
     with open(stats_path) as f:
         manifest = json.load(f)
@@ -369,6 +371,7 @@ def load_stats_v2(stats_path: Path):
 
     # Load all timesteps and layers
     timesteps = {}
+    per_channel_stats = {}
     layer_names = set()
 
     for step_key in step_keys:
@@ -378,10 +381,24 @@ def load_stats_v2(stats_path: Path):
         with open(index_path) as f:
             index = json.load(f)
 
+        # Load per-channel arrays from npz (needed for SmoothQuant detection)
+        npz = np.load(npz_path)
+
         timesteps[step_key] = index
         layer_names.update(index.keys())
 
-    return timesteps, sorted(layer_names), metadata
+        # Aggregate per-channel stats (store from first step for each layer)
+        # We use the first timestep's per-channel min/max as representative
+        if step_key == step_keys[0]:
+            for layer_name in index.keys():
+                safe = layer_name.replace(".", "_")
+                per_channel_stats[layer_name] = {
+                    "avg_min": npz[f"{safe}__avg_min"].copy() if f"{safe}__avg_min" in npz else None,
+                    "avg_max": npz[f"{safe}__avg_max"].copy() if f"{safe}__avg_max" in npz else None,
+                    "shift": npz[f"{safe}__shift"].copy() if f"{safe}__shift" in npz else None,
+                }
+
+    return timesteps, per_channel_stats, sorted(layer_names), metadata
 
 
 def main():
@@ -399,7 +416,7 @@ def main():
     output_path = args.output or (args.stats.parent / "quant_config.json")
 
     print(f"Loading {args.stats}")
-    timesteps, layer_names, metadata = load_stats_v2(args.stats)
+    timesteps, per_channel_stats, layer_names, metadata = load_stats_v2(args.stats)
 
     print(f"Calibration: {metadata.get('num_images',0)} images  "
           f"× {metadata.get('num_timesteps',0)} timesteps  "
@@ -421,12 +438,32 @@ def main():
                 if "hist_p999" in s:
                     hist_p999_vals.append(s["hist_p999"])
 
+        # SmoothQuant detection: check if per-channel outliers are isolated
+        sq_candidate = False
+        sq_outlier_frac = 0.0
+        sq_spike_ratio = 1.0
+        sq_scales = None
+
+        if layer_name in per_channel_stats and per_channel_stats[layer_name]["avg_min"] is not None:
+            per_ch_min = per_channel_stats[layer_name]["avg_min"]
+            per_ch_max = per_channel_stats[layer_name]["avg_max"]
+            per_ch_absmax = np.maximum(np.abs(per_ch_min), np.abs(per_ch_max))
+
+            # Check for isolated channel outliers
+            sq_candidate, sq_outlier_frac, sq_spike_ratio = smoothquant_candidate(per_ch_absmax)
+            if sq_candidate:
+                sq_scales = smoothquant_scales(per_ch_absmax).tolist()
+
         layer_stats[layer_name] = {
             "mean_absmax": float(np.mean(absmax_vals)) if absmax_vals else 0,
             "max_absmax": float(np.max(absmax_vals)) if absmax_vals else 0,
             "mean_hist_p999": float(np.mean(hist_p999_vals)) if hist_p999_vals else 0,
             "max_hist_p999": float(np.max(hist_p999_vals)) if hist_p999_vals else 0,
             "is_post_gelu": layer_name.endswith(".mlp.fc2"),
+            "smoothquant_candidate": sq_candidate,
+            "smoothquant_outlier_frac": sq_outlier_frac,
+            "smoothquant_spike_ratio": sq_spike_ratio,
+            "smoothquant_scales": sq_scales,
         }
 
     # Decide A4 vs A8 for each layer
@@ -440,25 +477,53 @@ def main():
         # Use hist_p999 for clipping if available and requested
         scale_val = stats["max_hist_p999"] if (args.use_hist_p999 and stats["max_hist_p999"] > 0) else stats["max_absmax"]
 
+        # Decide base bits
+        needs_a8 = False
+        reason = ""
+
         if stats["is_post_gelu"]:
             # Post-GELU: use 8.0 threshold on shifted values
             if scale_val > SHIFTED_ABSMAX_A8_THRESHOLD:
-                a8_layers.append((layer_name, scale_val, "post-GELU > threshold"))
+                needs_a8 = True
+                reason = "post-GELU > 8.0"
             else:
-                a4_layers.append((layer_name, scale_val, "post-GELU low"))
+                reason = "post-GELU low"
         else:
             # Non-post-GELU: check threshold
             if scale_val > args.absmax_threshold:
-                a8_layers.append((layer_name, scale_val, f"absmax > {args.absmax_threshold}"))
+                needs_a8 = True
+                reason = f"absmax > {args.absmax_threshold}"
             else:
-                a4_layers.append((layer_name, scale_val, "safe for A4"))
+                reason = "safe for A4"
+
+        # If it would be A8, but is a SmoothQuant candidate, we can use A4 with scaling
+        if needs_a8 and stats["smoothquant_candidate"]:
+            a4_layers.append((layer_name, scale_val, f"{reason} [downgraded via SmoothQuant]"))
+            smoothquant_candidates.append(layer_name)
+        elif needs_a8:
+            a8_layers.append((layer_name, scale_val, reason))
+        else:
+            a4_layers.append((layer_name, scale_val, reason))
 
     print(f"A4 candidates: {len(a4_layers)}")
     print(f"A8 required: {len(a8_layers)}")
-    for name, scale, reason in a8_layers[:5]:
-        print(f"  {name}: {scale:.2f}  ({reason})")
-    if len(a8_layers) > 5:
-        print(f"  ... and {len(a8_layers) - 5} more")
+    print(f"SmoothQuant-downgraded A4: {len(smoothquant_candidates)}")
+
+    if a8_layers:
+        print(f"\nA8 required layers:")
+        for name, scale, reason in a8_layers[:8]:
+            print(f"  {name}: {scale:.2f}  ({reason})")
+        if len(a8_layers) > 8:
+            print(f"  ... and {len(a8_layers) - 8} more")
+
+    if smoothquant_candidates:
+        print(f"\nSmoothQuant-downgraded layers (would be A8 but isolated outliers):")
+        for name in smoothquant_candidates[:5]:
+            stats = layer_stats[name]
+            print(f"  {name}: {stats['smoothquant_outlier_frac']*100:.1f}% outliers, "
+                  f"spike={stats['smoothquant_spike_ratio']:.1f}x")
+        if len(smoothquant_candidates) > 5:
+            print(f"  ... and {len(smoothquant_candidates) - 5} more")
 
     # Build and save config
     print(f"\n=== Quantization Config ===")
@@ -468,22 +533,50 @@ def main():
 
     print(f"\nPhase 1 (steps 0-{LATE_STEP_START-1}, W4A? mixed):")
     print(f"  {phase1_a4}/{phase1_total} layers -> A4 ({phase1_pct}%)")
+    print(f"    of which {len(smoothquant_candidates)} use SmoothQuant scaling")
     print(f"  {len(a8_layers)}/{phase1_total} layers -> A8")
     print(f"\nPhase 2 (steps {LATE_STEP_START}-50):")
     print(f"  All {phase1_total} layers -> A8 (refinement, max quality)")
 
-    # Build quant config
+    # Build quant config with full per-layer metadata
+    a4_layers_dict = {}
+    for name, scale, reason in a4_layers:
+        a4_layers_dict[name] = {
+            "scale": scale,
+            "reason": reason,
+            "smoothquant": layer_stats[name]["smoothquant_candidate"],
+        }
+        if layer_stats[name].get("smoothquant_scales"):
+            a4_layers_dict[name]["smoothquant_scales"] = layer_stats[name]["smoothquant_scales"]
+
+    a8_layers_dict = {}
+    for name, scale, reason in a8_layers:
+        a8_layers_dict[name] = {
+            "scale": scale,
+            "reason": reason,
+        }
+
     quant_config = {
         "format": "per_timestep_quant_config",
         "phase_split": LATE_STEP_START,
-        "phase1": {"a4": [n for n, _, _ in a4_layers], "a8": [n for n, _, _ in a8_layers]},
+        "phase1": {
+            "a4": a4_layers_dict,
+            "a8": a8_layers_dict,
+        },
         "phase2": {"a8": sorted(layer_names)},
         "summary": {
             "phase1_a4": phase1_a4,
             "phase1_a8": len(a8_layers),
             "phase1_total": phase1_total,
             "phase1_a4_pct": phase1_pct,
+            "phase1_smoothquant_candidates": len(smoothquant_candidates),
             "phase2_total": len(layer_names),
+        },
+        "thresholds": {
+            "outlier_ratio": args.outlier_threshold,
+            "absmax_a8": args.absmax_threshold,
+            "smoothquant_fraction": SMOOTHQUANT_FRACTION_THRESHOLD,
+            "smoothquant_spike": SMOOTHQUANT_SPIKE_THRESHOLD,
         },
         "metadata": metadata,
     }
