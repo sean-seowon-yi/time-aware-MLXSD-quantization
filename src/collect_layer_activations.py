@@ -29,9 +29,9 @@ Which layers get shift treatment:
 
 Usage:
     conda run -n diffusionkit python -m src.collect_layer_activations \\
-        --calib-dir /path/to/calibration_data \\
+        --calib-dir /Users/davidholt/ai_projects/mlxproject/calibration_data \\
         --num-images 5 \\
-        --output-dir /path/to/calibration_data/activations \\
+        --output-dir /Users/davidholt/ai_projects/mlxproject/calibration_data/activations \\
         --force
 
 two separate steps:
@@ -119,7 +119,10 @@ def select_representative_images(manifest: Dict, num_images: int) -> List[int]:
 # Per-channel statistics accumulator
 # ---------------------------------------------------------------------------
 
-HIST_BINS = 256   # number of histogram bins per layer (across all channels/tokens)
+HIST_BINS = 256        # number of histogram bins per layer (across all channels/tokens)
+HIST_MAX_ROWS = 256    # max rows to sample from x_2d per batch for histogram
+                       # Each row is one token; 256 rows × C channels sampled in MLX
+                       # before numpy conversion — keeps histogram fast even for large layers
 
 
 class ChannelStats:
@@ -191,15 +194,25 @@ class ChannelStats:
                 self.shift = SHIFT_MOMENTUM * self.shift + (1 - SHIFT_MOMENTUM) * batch_shift
 
         # --- Histogram accumulation ---
-        # Flatten to 1D for global histogram (all tokens, all channels together)
-        vals = np.array(x_2d).ravel()   # (N*C,)  — already float32
+        # Sample rows from x_2d IN MLX before converting to numpy.
+        # This avoids materializing the full (N, C) tensor in numpy.
+        # For large layers (e.g. fc2: 2048 tokens × 6144 ch = 12M floats),
+        # converting everything is the bottleneck. Instead pick HIST_MAX_ROWS
+        # rows randomly and convert only those.
+        N_rows = x_2d.shape[0]
+        if N_rows > HIST_MAX_ROWS:
+            row_idx = np.random.choice(N_rows, size=HIST_MAX_ROWS, replace=False)
+            row_idx_mx = mx.array(row_idx)
+            vals = np.array(x_2d[row_idx_mx]).ravel()
+        else:
+            vals = np.array(x_2d).ravel()
 
-        # Track global range
-        batch_vmin = float(vals.min())
-        batch_vmax = float(vals.max())
+        # Track global range using full batch min/max (already computed as numpy)
+        batch_vmin = float(batch_min.min())
+        batch_vmax = float(batch_max.max())
 
         if self.n_batches == 0:
-            # Save first batch vals; we'll set edges after seeing more data
+            # Save first batch sample; edges set after batch 2 widens the range
             self._first_batch_vals = vals
             self._global_min = batch_vmin
             self._global_max = batch_vmax
@@ -209,21 +222,20 @@ class ChannelStats:
             self._global_max = max(self._global_max, batch_vmax)
 
             if self.hist_edges is None:
-                # First time we have edges: set from first two batches' range
-                # Pad by 5% on each side so extreme values don't fall outside
+                # Set edges from first two batches' range, padded 5% each side
                 span = self._global_max - self._global_min
                 pad = max(span * 0.05, 1e-6)
                 lo = self._global_min - pad
                 hi = self._global_max + pad
                 self.hist_edges = np.linspace(lo, hi, HIST_BINS + 1)
                 self.hist_counts = np.zeros(HIST_BINS, dtype=np.int64)
-                # Retroactively add first batch
+                # Retroactively histogram first batch sample
                 if self._first_batch_vals is not None:
                     c0, _ = np.histogram(self._first_batch_vals, bins=self.hist_edges)
                     self.hist_counts += c0
                     self._first_batch_vals = None
 
-            # Clamp current batch vals to edge range (outliers go into edge bins)
+            # Clamp to edge range (so outliers beyond pad go into edge bins)
             vals_clamped = np.clip(vals, self.hist_edges[0], self.hist_edges[-1])
             c, _ = np.histogram(vals_clamped, bins=self.hist_edges)
             self.hist_counts += c
