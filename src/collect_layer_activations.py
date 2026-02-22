@@ -33,7 +33,7 @@ if str(_REPO) not in sys.path:
 
 import mlx.core as mx
 from diffusionkit.mlx import DiffusionPipeline, CFGDenoiser
-
+from src.instrumented_forward import collect_activations_instrumented
 
 def select_key_timesteps(num_steps: int) -> List[int]:
     """
@@ -92,6 +92,36 @@ def select_representative_images(manifest: Dict, num_images: int) -> List[int]:
 
 
 class ActivationCollector:
+    """
+    Collects per-layer activations using instrumented forward pass.
+    
+    Uses manual forward pass replication to collect activations without
+    breaking DiffusionKit's internal state (modulation cache).
+    """
+    
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+    
+    def collect_for_sample(self, x, timestep, sigma, conditioning, 
+                          cfg_weight, pooled):
+        """
+        Run instrumented forward pass and collect per-layer activations.
+        
+        Returns:
+            Dict mapping layer names to activation arrays
+        """
+        # Use instrumented forward pass
+        activations = collect_activations_instrumented(
+            self.pipeline,
+            x,
+            timestep,
+            sigma,
+            conditioning,
+            cfg_weight,
+            pooled
+        )
+        
+        return activations   
     """
     Collects activations from DiffusionKit's MMDiT model.
     
