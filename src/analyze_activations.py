@@ -52,10 +52,21 @@ if str(_REPO) not in sys.path:
 # Thresholds (tunable via CLI)
 # ---------------------------------------------------------------------------
 
+# Three-tier activation quantization: A4 / A6 / A8
+# Based on empirical analysis: A4 step size ≈ scale/8, A6 ≈ scale/32, A8 ≈ scale/128
+
+# For non-post-GELU layers
+A4_THRESHOLD = 6.0    # scale < 6.0 → A4 (aggressive, 16 levels)
+A6_THRESHOLD = 10.0   # 6.0 ≤ scale < 10.0 → A6 (moderate, 64 levels)
+# scale ≥ 10.0 → A8 (conservative, 256 levels)
+
+# For post-GELU layers (after shift centering)
+SHIFTED_A4_THRESHOLD = 5.0   # shifted scale < 5.0 → A4
+SHIFTED_A6_THRESHOLD = 8.0   # 5.0 ≤ shifted scale < 8.0 → A6
+# shifted scale ≥ 8.0 → A8
+
 OUTLIER_RATIO_THRESHOLD = 4.0      # p99/p50 per-channel absmax (robust, non-post-GELU)
-ABSMAX_A8_THRESHOLD = 12.0         # tensor-level absmax
-SHIFTED_ABSMAX_A8_THRESHOLD = 8.0  # post-GELU after shift
-LATE_STEP_START = 35               # steps >= this always use A8
+LATE_STEP_START = 35               # steps >= this always use A8 (deprecated, using per-timestep now)
 
 # SmoothQuant detection thresholds
 SMOOTHQUANT_FRACTION_THRESHOLD = 0.05   # < 5% channels are outliers
@@ -452,10 +463,18 @@ def main():
                         help="layer_statistics.json from collect_layer_activations.py")
     parser.add_argument("--output", type=Path, default=None,
                         help="Output quant_config.json path")
-    parser.add_argument("--outlier-threshold", type=float, default=OUTLIER_RATIO_THRESHOLD)
-    parser.add_argument("--absmax-threshold", type=float, default=ABSMAX_A8_THRESHOLD)
+    parser.add_argument("--a4-threshold", type=float, default=A4_THRESHOLD,
+                        help="Scale threshold for A4 vs A6 (default: 6.0)")
+    parser.add_argument("--a6-threshold", type=float, default=A6_THRESHOLD,
+                        help="Scale threshold for A6 vs A8 (default: 10.0)")
+    parser.add_argument("--shifted-a4-threshold", type=float, default=SHIFTED_A4_THRESHOLD,
+                        help="Post-GELU shifted scale threshold for A4 vs A6 (default: 5.0)")
+    parser.add_argument("--shifted-a6-threshold", type=float, default=SHIFTED_A6_THRESHOLD,
+                        help="Post-GELU shifted scale threshold for A6 vs A8 (default: 8.0)")
     parser.add_argument("--use-hist-p999", action="store_true", default=False,
                         help="Use hist_p999 (percentile clipping) instead of tensor_absmax for scales")
+    parser.add_argument("--outlier-threshold", type=float, default=OUTLIER_RATIO_THRESHOLD,
+                        help="Deprecated: p99/p50 outlier ratio threshold")
     args = parser.parse_args()
 
     output_path = args.output or (args.stats.parent / "quant_config.json")
@@ -517,6 +536,7 @@ def main():
         absmax_vals = []
         p999_vals = []
         a4_count = 0
+        a6_count = 0
         a8_count = 0
 
         for step_key in step_keys_sorted:
@@ -529,14 +549,8 @@ def main():
             if data.get("hist_p999"):
                 p999_vals.append(data["hist_p999"])
 
-            # Decide A4 vs A8 for this specific timestep
+            # Decide A4 / A6 / A8 for this specific timestep
             is_post_gelu = layer_name.endswith(".mlp.fc2")
-            needs_a8 = False
-
-            if is_post_gelu:
-                needs_a8 = scale_val > SHIFTED_ABSMAX_A8_THRESHOLD
-            else:
-                needs_a8 = scale_val > args.absmax_threshold
 
             # Check SmoothQuant candidacy (use first timestep's per-channel stats)
             sq_candidate = False
@@ -548,19 +562,44 @@ def main():
                     if sq_candidate:
                         sq_scales = smoothquant_scales(per_ch_absmax).tolist()
 
-            # Downgrade A8 to A4 if SmoothQuant applicable
-            if needs_a8 and sq_candidate:
-                bits = 4
-                reason = "SmoothQuant downgrade"
-                a4_count += 1
-            elif needs_a8:
-                bits = 8
-                reason = "threshold exceeded"
-                a8_count += 1
+            # Three-tier quantization decision
+            if is_post_gelu:
+                if scale_val < args.shifted_a4_threshold:
+                    bits = 4
+                    reason = "post-GELU < A4 threshold"
+                elif scale_val < args.shifted_a6_threshold:
+                    bits = 6
+                    reason = "post-GELU A4-A6 range"
+                else:
+                    bits = 8
+                    reason = "post-GELU > A6 threshold"
             else:
+                if scale_val < args.a4_threshold:
+                    bits = 4
+                    reason = "< A4 threshold"
+                elif scale_val < args.a6_threshold:
+                    bits = 6
+                    reason = "A4-A6 range"
+                else:
+                    bits = 8
+                    reason = "> A6 threshold"
+
+            # SmoothQuant can downgrade by one tier
+            if bits == 8 and sq_candidate:
+                bits = 6
+                reason = f"{reason} (SmoothQuant downgrade)"
+            elif bits == 6 and sq_candidate and scale_val < args.a4_threshold * 1.2:
+                # Only downgrade A6→A4 if close to A4 threshold
                 bits = 4
-                reason = "safe"
+                reason = f"{reason} (SmoothQuant downgrade)"
+
+            # Track counts
+            if bits == 4:
                 a4_count += 1
+            elif bits == 6:
+                a6_count += 1
+            else:
+                a8_count += 1
 
             if step_key not in per_timestep_config:
                 per_timestep_config[step_key] = {}
@@ -578,14 +617,18 @@ def main():
 
         # Track temporal variability
         if absmax_vals:
+            total_steps = len(absmax_vals)
             layer_temporal_stats[layer_name] = {
                 "mean_absmax": float(np.mean(absmax_vals)),
                 "min_absmax": float(np.min(absmax_vals)),
                 "max_absmax": float(np.max(absmax_vals)),
                 "variability_ratio": float(np.max(absmax_vals) / (np.min(absmax_vals) + 1e-6)),
                 "a4_steps": a4_count,
+                "a6_steps": a6_count,
                 "a8_steps": a8_count,
-                "a4_fraction": a4_count / len(absmax_vals),
+                "a4_fraction": a4_count / total_steps,
+                "a6_fraction": a6_count / total_steps,
+                "a8_fraction": a8_count / total_steps,
             }
 
     # Summarize temporal variability
@@ -596,24 +639,28 @@ def main():
     print(f"\nHigh temporal variability layers (>2x swing):")
     for name, ratio in high_variability[:10]:
         stats = layer_temporal_stats[name]
+        total = stats['a4_steps'] + stats['a6_steps'] + stats['a8_steps']
         print(f"  {name}: {ratio:.1f}x swing  "
               f"(min={stats['min_absmax']:.1f}, max={stats['max_absmax']:.1f}, "
-              f"A4={stats['a4_steps']}/{stats['a4_steps']+stats['a8_steps']} steps)")
+              f"A4/A6/A8={stats['a4_steps']}/{stats['a6_steps']}/{stats['a8_steps']} of {total})")
 
-    # Summarize layers that switch between A4/A8 across timesteps
+    # Summarize layers that switch bits across timesteps
     switchers = [(n, s) for n, s in layer_temporal_stats.items()
-                 if 0 < s["a4_fraction"] < 1.0]
-    switchers.sort(key=lambda x: abs(0.5 - x[1]["a4_fraction"]))  # Sort by most balanced switching
+                 if s["a4_steps"] > 0 and s["a8_steps"] > 0]  # Has both A4 and A8
+    switchers.sort(key=lambda x: -x[1]["a6_steps"])  # Sort by most A6 usage
 
     print(f"\nLayers that switch bits across timesteps: {len(switchers)}")
     for name, stats in switchers[:8]:
-        print(f"  {name}: A4 for {stats['a4_steps']}/{stats['a4_steps']+stats['a8_steps']} steps "
-              f"({stats['a4_fraction']*100:.0f}%)")
+        total = stats['a4_steps'] + stats['a6_steps'] + stats['a8_steps']
+        print(f"  {name}: A4/A6/A8 = {stats['a4_steps']}/{stats['a6_steps']}/{stats['a8_steps']} "
+              f"({stats['a4_fraction']*100:.0f}%/{stats['a6_fraction']*100:.0f}%/{stats['a8_fraction']*100:.0f}%)")
 
-    # Identify always-A8 layers
-    always_a8 = [n for n, s in layer_temporal_stats.items() if s["a4_steps"] == 0]
-    always_a4 = [n for n, s in layer_temporal_stats.items() if s["a8_steps"] == 0]
+    # Identify always-same-bits layers
+    always_a8 = [n for n, s in layer_temporal_stats.items() if s["a4_steps"] == 0 and s["a6_steps"] == 0]
+    always_a4 = [n for n, s in layer_temporal_stats.items() if s["a6_steps"] == 0 and s["a8_steps"] == 0]
+    always_a6 = [n for n, s in layer_temporal_stats.items() if s["a4_steps"] == 0 and s["a8_steps"] == 0]
     print(f"\nAlways A8: {len(always_a8)} layers")
+    print(f"Always A6: {len(always_a6)} layers")
     print(f"Always A4: {len(always_a4)} layers")
 
     # Build and save per-timestep config
@@ -623,7 +670,10 @@ def main():
     total_decisions = len(step_keys_sorted) * len(layer_names)
     total_a4 = sum(1 for sk in step_keys_sorted for ln in layer_names
                    if per_timestep_config.get(sk, {}).get(ln, {}).get("bits") == 4)
-    total_a8 = total_decisions - total_a4
+    total_a6 = sum(1 for sk in step_keys_sorted for ln in layer_names
+                   if per_timestep_config.get(sk, {}).get(ln, {}).get("bits") == 6)
+    total_a8 = sum(1 for sk in step_keys_sorted for ln in layer_names
+                   if per_timestep_config.get(sk, {}).get(ln, {}).get("bits") == 8)
 
     # Count SmoothQuant usage (only counted once per layer)
     smoothquant_layers = set()
@@ -634,12 +684,13 @@ def main():
 
     print(f"Per-timestep decisions: {total_decisions} total")
     print(f"  A4: {total_a4}/{total_decisions} ({100*total_a4/total_decisions:.1f}%)")
+    print(f"  A6: {total_a6}/{total_decisions} ({100*total_a6/total_decisions:.1f}%)")
     print(f"  A8: {total_a8}/{total_decisions} ({100*total_a8/total_decisions:.1f}%)")
     print(f"  SmoothQuant layers: {len(smoothquant_layers)}")
     print(f"  High-variability layers (switch bits): {len(switchers)}")
 
     quant_config = {
-        "format": "per_timestep_quant_config_v2",
+        "format": "per_timestep_quant_config_v3",  # v3 adds three-tier A4/A6/A8
         "per_timestep": per_timestep_config,
         "sigma_map": {str(k): v for k, v in sigma_map.items()},
         "shift_analysis": shift_analysis,
@@ -648,18 +699,24 @@ def main():
             "total_layers": len(layer_names),
             "total_decisions": total_decisions,
             "total_a4": total_a4,
+            "total_a6": total_a6,
             "total_a8": total_a8,
             "a4_percentage": round(100 * total_a4 / total_decisions, 1),
+            "a6_percentage": round(100 * total_a6 / total_decisions, 1),
+            "a8_percentage": round(100 * total_a8 / total_decisions, 1),
             "smoothquant_layers": len(smoothquant_layers),
             "high_variability_layers": len(high_variability),
             "switching_layers": len(switchers),
             "always_a8": len(always_a8),
+            "always_a6": len(always_a6),
             "always_a4": len(always_a4),
         },
         "thresholds": {
+            "a4_threshold": args.a4_threshold,
+            "a6_threshold": args.a6_threshold,
+            "shifted_a4_threshold": args.shifted_a4_threshold,
+            "shifted_a6_threshold": args.shifted_a6_threshold,
             "outlier_ratio": args.outlier_threshold,
-            "absmax_a8": args.absmax_threshold,
-            "shifted_absmax_a8": SHIFTED_ABSMAX_A8_THRESHOLD,
             "smoothquant_fraction": SMOOTHQUANT_FRACTION_THRESHOLD,
             "smoothquant_spike": SMOOTHQUANT_SPIKE_THRESHOLD,
         },
