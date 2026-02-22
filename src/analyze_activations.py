@@ -351,6 +351,39 @@ def build_quant_config(analysis: Dict, raw_stats: Dict, metadata: Dict) -> Dict:
 # Main
 # ---------------------------------------------------------------------------
 
+def load_stats_v2(stats_path: Path):
+    """
+    Load per_timestep_npz_v2 format from collect_layer_activations.py.
+    Returns: (timesteps_dict, layer_names, metadata)
+    where timesteps_dict[step_key][layer_name] = {tensor_absmax, hist_p999, ...}
+    """
+    with open(stats_path) as f:
+        manifest = json.load(f)
+
+    if manifest.get("format") != "per_timestep_npz_v2":
+        raise ValueError(f"Expected per_timestep_npz_v2, got {manifest.get('format')}")
+
+    ts_dir = Path(manifest["timestep_dir"])
+    step_keys = manifest["step_keys"]
+    metadata = manifest.get("metadata", {})
+
+    # Load all timesteps and layers
+    timesteps = {}
+    layer_names = set()
+
+    for step_key in step_keys:
+        npz_path = ts_dir / f"step_{step_key}.npz"
+        index_path = ts_dir / f"step_{step_key}_index.json"
+
+        with open(index_path) as f:
+            index = json.load(f)
+
+        timesteps[step_key] = index
+        layer_names.update(index.keys())
+
+    return timesteps, sorted(layer_names), metadata
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stats", type=Path, required=True,
@@ -359,46 +392,110 @@ def main():
                         help="Output quant_config.json path")
     parser.add_argument("--outlier-threshold", type=float, default=OUTLIER_RATIO_THRESHOLD)
     parser.add_argument("--absmax-threshold", type=float, default=ABSMAX_A8_THRESHOLD)
+    parser.add_argument("--use-hist-p999", action="store_true", default=False,
+                        help="Use hist_p999 (percentile clipping) instead of tensor_absmax for scales")
     args = parser.parse_args()
 
     output_path = args.output or (args.stats.parent / "quant_config.json")
 
     print(f"Loading {args.stats}")
-    with open(args.stats) as f:
-        data = json.load(f)
-
-    buckets = data["buckets"]
-    metadata = data.get("metadata", {})
+    timesteps, layer_names, metadata = load_stats_v2(args.stats)
 
     print(f"Calibration: {metadata.get('num_images',0)} images  "
           f"× {metadata.get('num_timesteps',0)} timesteps  "
           f"= {metadata.get('total_processed',0)} forward passes")
+    print(f"Timesteps collected: {len(timesteps)}  Layers: {len(layer_names)}")
+    print(f"Using {'hist_p999 (percentile)' if args.use_hist_p999 else 'tensor_absmax'} for scale computation")
 
-    # Analyze
-    print("\n=== Per-Layer Analysis ===")
-    analysis = {}
-    for bucket_name, layers in buckets.items():
-        analysis[bucket_name] = analyze_bucket(
-            layers, args.absmax_threshold, args.outlier_threshold)
+    # Compute per-layer statistics averaged across all timesteps
+    print("\n=== Computing Per-Layer Statistics ===")
+    layer_stats = {}
+    for layer_name in layer_names:
+        # Gather stats across all timesteps for this layer
+        absmax_vals = []
+        hist_p999_vals = []
+        for step_key, layers in timesteps.items():
+            if layer_name in layers:
+                s = layers[layer_name]
+                absmax_vals.append(s.get("tensor_absmax", 0))
+                if "hist_p999" in s:
+                    hist_p999_vals.append(s["hist_p999"])
 
-    print_summary(analysis)
+        layer_stats[layer_name] = {
+            "mean_absmax": float(np.mean(absmax_vals)) if absmax_vals else 0,
+            "max_absmax": float(np.max(absmax_vals)) if absmax_vals else 0,
+            "mean_hist_p999": float(np.mean(hist_p999_vals)) if hist_p999_vals else 0,
+            "max_hist_p999": float(np.max(hist_p999_vals)) if hist_p999_vals else 0,
+            "is_post_gelu": layer_name.endswith(".mlp.fc2"),
+        }
+
+    # Decide A4 vs A8 for each layer
+    print("\n=== Per-Layer Quantization Decision ===")
+    a4_layers = []
+    a8_layers = []
+    smoothquant_candidates = []
+
+    for layer_name in sorted(layer_names):
+        stats = layer_stats[layer_name]
+        # Use hist_p999 for clipping if available and requested
+        scale_val = stats["max_hist_p999"] if (args.use_hist_p999 and stats["max_hist_p999"] > 0) else stats["max_absmax"]
+
+        if stats["is_post_gelu"]:
+            # Post-GELU: use 8.0 threshold on shifted values
+            if scale_val > SHIFTED_ABSMAX_A8_THRESHOLD:
+                a8_layers.append((layer_name, scale_val, "post-GELU > threshold"))
+            else:
+                a4_layers.append((layer_name, scale_val, "post-GELU low"))
+        else:
+            # Non-post-GELU: check threshold
+            if scale_val > args.absmax_threshold:
+                a8_layers.append((layer_name, scale_val, f"absmax > {args.absmax_threshold}"))
+            else:
+                a4_layers.append((layer_name, scale_val, "safe for A4"))
+
+    print(f"A4 candidates: {len(a4_layers)}")
+    print(f"A8 required: {len(a8_layers)}")
+    for name, scale, reason in a8_layers[:5]:
+        print(f"  {name}: {scale:.2f}  ({reason})")
+    if len(a8_layers) > 5:
+        print(f"  ... and {len(a8_layers) - 5} more")
 
     # Build and save config
     print(f"\n=== Quantization Config ===")
-    quant_config = build_quant_config(analysis, buckets, metadata)
-    s = quant_config["summary"]
+    phase1_a4 = len(a4_layers)
+    phase1_total = len(a4_layers) + len(a8_layers)
+    phase1_pct = int(100 * phase1_a4 / phase1_total) if phase1_total > 0 else 0
 
     print(f"\nPhase 1 (steps 0-{LATE_STEP_START-1}, W4A? mixed):")
-    print(f"  {s['phase1_a4']}/{s['phase1_total']} layers -> A4 ({s['phase1_a4_pct']}%)")
-    print(f"    of which {s['phase1_smoothquant_candidates']} use SmoothQuant per-channel scaling")
-    print(f"  {s['phase1_a8']}/{s['phase1_total']} layers -> A8")
+    print(f"  {phase1_a4}/{phase1_total} layers -> A4 ({phase1_pct}%)")
+    print(f"  {len(a8_layers)}/{phase1_total} layers -> A8")
     print(f"\nPhase 2 (steps {LATE_STEP_START}-50):")
-    print(f"  All {s['phase2_total']} layers -> A8 (refinement, max quality)")
+    print(f"  All {phase1_total} layers -> A8 (refinement, max quality)")
+
+    # Build quant config
+    quant_config = {
+        "format": "per_timestep_quant_config",
+        "phase_split": LATE_STEP_START,
+        "phase1": {"a4": [n for n, _, _ in a4_layers], "a8": [n for n, _, _ in a8_layers]},
+        "phase2": {"a8": sorted(layer_names)},
+        "summary": {
+            "phase1_a4": phase1_a4,
+            "phase1_a8": len(a8_layers),
+            "phase1_total": phase1_total,
+            "phase1_a4_pct": phase1_pct,
+            "phase2_total": len(layer_names),
+        },
+        "metadata": metadata,
+    }
 
     with open(output_path, "w") as f:
         json.dump(quant_config, f, indent=2)
     print(f"\n✓ Quant config -> {output_path}")
 
+    # Save detailed layer analysis
+    analysis = {}
+    for layer_name in sorted(layer_names):
+        analysis[layer_name] = layer_stats[layer_name]
     analysis_path = args.stats.parent / "layer_analysis.json"
     with open(analysis_path, "w") as f:
         json.dump(analysis, f, indent=2)
