@@ -406,16 +406,6 @@ def main():
     print("✓ Pipeline loaded")
 
     # ------------------------------------------------------------------
-    # Install block hooks
-    # ------------------------------------------------------------------
-    print("\n=== Installing Block Hooks ===")
-    hooks = install_block_hooks(pipeline)
-    n_mm = sum(1 for h in hooks if h.is_mm)
-    n_uni = sum(1 for h in hooks if not h.is_mm)
-    block_names = [h.block_name for h in hooks]
-    print(f"  {len(hooks)} hooks installed ({n_mm} multimodal, {n_uni} unified)")
-
-    # ------------------------------------------------------------------
     # Collection loop
     # ------------------------------------------------------------------
     print("\n=== Collecting Samples ===")
@@ -423,6 +413,9 @@ def main():
 
     collected: List[Dict] = []
     shape_info: Dict[str, Dict] = {}
+    block_names: List[str] = []
+    n_mm = 0
+    n_uni = 0
     errors = 0
     start_time = time.time()
 
@@ -461,7 +454,25 @@ def main():
             img_pbar.update(1)
             continue
 
-        # Cache modulation params
+        # Clear stale modulation param dicts (best-effort — not critical if it
+        # fails; FinalLayer edge case in some DiffusionKit builds raises here).
+        try:
+            pipeline.mmdit.clear_modulation_params_cache()
+        except Exception:
+            pass
+
+        # Reload adaLN weights zeroed by the previous image's
+        # cache_modulation_params call.  Must run independently of the
+        # cache-clearing above so that one failure cannot swallow the other.
+        try:
+            pipeline.mmdit.load_weights(
+                pipeline.load_mmdit(only_modulation_dict=True), strict=False
+            )
+        except Exception as e:
+            tqdm.write(f"  WARNING reload adaLN weights: {e}")
+
+        # Cache modulation params — blocks are real here, not hook proxies,
+        # so load_weights can properly restore them for the next image.
         try:
             denoiser = CFGDenoiser(pipeline)
             ts_mx = mx.array(all_timesteps).astype(pipeline.activation_dtype)
@@ -472,6 +483,15 @@ def main():
             step_pbar.update(len(key_timesteps))
             img_pbar.update(1)
             continue
+
+        # Install hooks only for the forward passes so that remove_block_hooks
+        # restores real blocks before the next clear_cache / load_weights call.
+        hooks = install_block_hooks(pipeline)
+        if not block_names:
+            n_mm = sum(1 for h in hooks if h.is_mm)
+            n_uni = sum(1 for h in hooks if not h.is_mm)
+            block_names = [h.block_name for h in hooks]
+            tqdm.write(f"  {len(hooks)} hooks installed ({n_mm} multimodal, {n_uni} unified)")
 
         tqdm.write(f"  Collecting {len(key_timesteps)} timesteps...")
 
@@ -521,20 +541,13 @@ def main():
 
             step_pbar.update(1)
 
-        try:
-            denoiser.clear_cache()
-        except Exception:
-            pass
+        # Remove hooks before clear_cache so load_weights sees real blocks.
+        remove_block_hooks(pipeline, hooks)
 
         img_pbar.update(1)
 
     step_pbar.close()
     img_pbar.close()
-
-    # ------------------------------------------------------------------
-    # Restore original blocks
-    # ------------------------------------------------------------------
-    remove_block_hooks(pipeline, hooks)
 
     elapsed = time.time() - start_time
     print(f"\n=== Collection Complete ===")

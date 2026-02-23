@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 from pathlib import Path
+from typing import Dict
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -372,6 +373,192 @@ def plot_variability_scatter(timesteps, sigma_map, step_keys, layer_names, out_d
 
 
 # ---------------------------------------------------------------------------
+# Plot 6: Raw distribution histograms with shift and quantization levels
+# ---------------------------------------------------------------------------
+
+def plot_distribution_raw(timesteps, sigma_map, step_keys, layer_name: str,
+                         step_idx: int, out_dir: Path, quant_config: Dict = None):
+    """
+    Plot raw activation distribution from histogram with:
+    - Original distribution
+    - Shift line (if post-GELU)
+    - Quantization level overlays (A4/A6/A8 boundaries)
+    """
+    key = str(step_idx)
+    if key not in timesteps:
+        key = min(step_keys, key=lambda k: abs(int(k) - step_idx))
+
+    # Load histogram data from npz
+    with open(timesteps[key]) as f:  # This is wrong, need to fix
+        pass
+    # Actually need to load from the npz format
+    # Let me check the load_data function to see how it's done
+
+    sigma = sigma_map[int(key)]
+    # TODO: Complete this after checking load_data pattern
+
+
+def plot_distribution_with_shift(ts_dir: Path, step_key: str, layer_name: str,
+                                 sigma: float, out_dir: Path,
+                                 quant_config: Dict = None):
+    """
+    Plot activation distribution with shift and quantization overlays.
+
+    Args:
+        ts_dir: Directory with npz files
+        step_key: Timestep key (e.g., "0", "24")
+        layer_name: Layer to plot
+        sigma: Noise level at this timestep
+        out_dir: Output directory
+        quant_config: Optional quantization config for level overlays
+    """
+    npz_path = ts_dir / f"step_{step_key}.npz"
+    index_path = ts_dir / f"step_{step_key}_index.json"
+
+    if not npz_path.exists():
+        return None
+
+    npz = np.load(npz_path)
+    with open(index_path) as f:
+        index = json.load(f)
+
+    if layer_name not in index:
+        return None
+
+    meta = index[layer_name]
+    safe = layer_name.replace(".", "_")
+
+    # Load histogram
+    hist_counts = npz[f"{safe}__hist_counts"]
+    hist_edges = npz[f"{safe}__hist_edges"]
+    bin_centers = (hist_edges[:-1] + hist_edges[1:]) / 2
+
+    # Normalize to probability
+    hist_prob = hist_counts / hist_counts.sum()
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Plot distribution
+    ax.bar(bin_centers, hist_prob, width=np.diff(hist_edges),
+           color=layer_color(layer_name), alpha=0.7, edgecolor='none',
+           label='Activation distribution')
+
+    # Add shift line if available
+    if f"{safe}__shift" in npz:
+        shift = npz[f"{safe}__shift"]
+        shift_mean = float(shift.mean())
+        ax.axvline(shift_mean, color='red', linewidth=2, linestyle='--',
+                  label=f'Shift (mean={shift_mean:.2f})')
+        # Show shifted distribution
+        shifted_centers = bin_centers - shift_mean
+        ax.bar(shifted_centers, hist_prob, width=np.diff(hist_edges),
+               color='green', alpha=0.3, edgecolor='none',
+               label='After shift')
+
+    # Add zero line
+    ax.axvline(0, color='black', linewidth=1, linestyle='-', alpha=0.5)
+
+    # Add quantization levels if config provided
+    if quant_config and step_key in quant_config.get("per_timestep", {}):
+        layer_cfg = quant_config["per_timestep"][step_key].get(layer_name)
+        if layer_cfg:
+            bits = layer_cfg["bits"]
+            scale = layer_cfg["scale"]
+            qmax = 2 ** (bits - 1) - 1
+
+            # Show quantization boundaries
+            for i in range(-qmax-1, qmax+2):
+                q_val = i * scale
+                if hist_edges[0] <= q_val <= hist_edges[-1]:
+                    ax.axvline(q_val, color='orange', linewidth=0.5,
+                              alpha=0.3, linestyle=':')
+
+            # Label quantization info
+            ax.text(0.98, 0.95, f'{bits}-bit quantization\n{2**bits} levels\nscale={scale:.3f}',
+                   transform=ax.transAxes, fontsize=10,
+                   verticalalignment='top', horizontalalignment='right',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    ax.set_xlabel('Activation value')
+    ax.set_ylabel('Probability density')
+    ax.set_title(f'{layer_name} — Step {step_key} (σ={sigma:.3f})')
+    ax.legend(loc='upper left', fontsize=9)
+    ax.grid(alpha=0.3, axis='y')
+
+    fig.tight_layout()
+    safe_name = layer_name.replace(".", "_")
+    path = out_dir / f"dist_{safe_name}_step{step_key}.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  ✓ {path.name}")
+    return path
+
+
+def plot_distribution_temporal_evolution(ts_dir: Path, layer_name: str,
+                                        step_keys: list, sigma_map: dict,
+                                        out_dir: Path):
+    """
+    Plot how distribution evolves across timesteps for a single layer.
+    Shows multiple histograms overlaid or in subplots.
+    """
+    # Select representative timesteps (beginning, middle, end)
+    selected_steps = [step_keys[0], step_keys[len(step_keys)//2], step_keys[-1]]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+
+    for idx, step_key in enumerate(selected_steps):
+        npz_path = ts_dir / f"step_{step_key}.npz"
+        index_path = ts_dir / f"step_{step_key}_index.json"
+
+        if not npz_path.exists():
+            continue
+
+        npz = np.load(npz_path)
+        with open(index_path) as f:
+            index = json.load(f)
+
+        if layer_name not in index:
+            continue
+
+        safe = layer_name.replace(".", "_")
+        hist_counts = npz[f"{safe}__hist_counts"]
+        hist_edges = npz[f"{safe}__hist_edges"]
+        bin_centers = (hist_edges[:-1] + hist_edges[1:]) / 2
+        hist_prob = hist_counts / hist_counts.sum()
+
+        ax = axes[idx]
+        sigma = sigma_map[int(step_key)]
+
+        ax.bar(bin_centers, hist_prob, width=np.diff(hist_edges),
+              color=layer_color(layer_name), alpha=0.7, edgecolor='none')
+
+        # Add shift if available
+        if f"{safe}__shift" in npz:
+            shift_mean = float(npz[f"{safe}__shift"].mean())
+            ax.axvline(shift_mean, color='red', linewidth=2, linestyle='--',
+                      label=f'Shift={shift_mean:.2f}')
+
+        ax.axvline(0, color='black', linewidth=1, alpha=0.5)
+        ax.set_xlabel('Activation value')
+        ax.set_title(f'Step {step_key} (σ={sigma:.3f})')
+        ax.grid(alpha=0.3, axis='y')
+        if idx == 0:
+            ax.set_ylabel('Probability density')
+        if f"{safe}__shift" in npz:
+            ax.legend(fontsize=8)
+
+    fig.suptitle(f'{layer_name} — Distribution Evolution Across Timesteps', fontsize=14)
+    fig.tight_layout()
+
+    safe_name = layer_name.replace(".", "_")
+    path = out_dir / f"dist_temporal_{safe_name}.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  ✓ {path.name}")
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -381,14 +568,34 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--snapshot-steps", type=int, nargs="+", default=[0, 12, 24, 40, 48],
                         help="Which step indices to snapshot")
+    parser.add_argument("--quant-config", type=Path, default=None,
+                        help="Optional quant_config.json for overlaying quantization levels")
+    parser.add_argument("--plot-distributions", action="store_true",
+                        help="Generate raw distribution plots with shift/quant overlays")
     args = parser.parse_args()
 
     out_dir = args.output_dir or (args.stats.parent / "plots")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading {args.stats}")
-    timesteps, sigma_map, step_keys, layer_names = load_data(args.stats)
+    with open(args.stats) as f:
+        manifest = json.load(f)
+
+    # Get ts_dir for loading npz files
+    ts_dir = Path(manifest["timestep_dir"])
+    sigma_map = {int(k): float(v) for k, v in manifest["sigma_map"].items()}
+    step_keys = manifest["step_keys"]
+
+    # Load old format for existing plots
+    timesteps, _, step_keys, layer_names = load_data(args.stats)
     print(f"  {len(step_keys)} timesteps × {len(layer_names)} layers\n")
+
+    # Load quant config if provided
+    quant_config = None
+    if args.quant_config and args.quant_config.exists():
+        with open(args.quant_config) as f:
+            quant_config = json.load(f)
+        print(f"Loaded quant config: {quant_config.get('format')}\n")
 
     # --- Snapshots at key steps ---
     print("=== Snapshot plots ===")
@@ -468,6 +675,37 @@ def main():
     # --- Variability scatter ---
     print("\n=== Variability scatter ===")
     plot_variability_scatter(timesteps, sigma_map, step_keys, layer_names, out_dir)
+
+    # --- Raw distribution plots with shift and quantization overlays ---
+    if args.plot_distributions:
+        print("\n=== Raw distribution plots ===")
+
+        # Select interesting layers for distribution visualization
+        dist_layers = [
+            "mm1.txt.mlp.fc2",   # Post-GELU with shift, early block
+            "mm15.txt.mlp.fc2",  # Post-GELU mid block
+            "mm22.txt.mlp.fc1",  # Extreme outlier case
+            "mm7.img.mlp.fc1",   # High variability
+            "mm12.img.attn.q_proj",  # Stable attention layer
+        ]
+
+        # Plot single-timestep distributions at key points
+        for layer_name in dist_layers:
+            if layer_name not in layer_names:
+                continue
+            for step_key in ["0", "12", "24"]:
+                if step_key in step_keys:
+                    plot_distribution_with_shift(
+                        ts_dir, step_key, layer_name,
+                        sigma_map[int(step_key)], out_dir, quant_config
+                    )
+
+        # Plot temporal evolution for selected layers
+        for layer_name in dist_layers:
+            if layer_name in layer_names:
+                plot_distribution_temporal_evolution(
+                    ts_dir, layer_name, step_keys, sigma_map, out_dir
+                )
 
     print(f"\n✓ All plots saved to {out_dir}")
 

@@ -28,10 +28,10 @@ Which layers get shift treatment:
   - all others      →  roughly symmetric, shift = 0
 
 Usage:
-    conda run -n diffusionkit python -m src.collect_layer_activations \\
-        --calib-dir /Users/davidholt/ai_projects/mlxproject/calibration_data \\
-        --num-images 5 \\
-        --output-dir /Users/davidholt/ai_projects/mlxproject/calibration_data/activations \\
+    conda run -n diffusionkit python -m src.collect_layer_activations \
+        --calib-dir /Users/davidholt/ai_projects/mlxproject/calibration_data \
+        --num-images 5 \
+        --output-dir /Users/davidholt/ai_projects/mlxproject/calibration_data/activations \
         --force
 
 two separate steps:
@@ -161,14 +161,6 @@ class ChannelStats:
         self._global_max: float = float("-inf")
         # Pending raw values from batch 0 to retroactively histogram
         self._first_batch_vals: Optional[np.ndarray] = None
-        # Per-token absmax histogram (distribution of max(abs(x)) per token row)
-        self.token_absmax_hist_counts: Optional[np.ndarray] = None
-        self.token_absmax_hist_edges: Optional[np.ndarray] = None
-        self._token_absmax_global_min: float = float("inf")
-        self._token_absmax_global_max: float = float("-inf")
-        self._first_token_absmax_vals: Optional[np.ndarray] = None
-        self._token_absmax_sum: float = 0.0
-        self._token_absmax_count: int = 0
 
     def update(self, x: mx.array):
         """
@@ -194,14 +186,12 @@ class ChannelStats:
             self.avg_max = self.avg_max + (batch_max - self.avg_max) / (self.n_batches + 1)
 
         if self.is_post_gelu:
-            # TaQ-DiT uses (min+max)/2 midpoint per channel for shift.
-            # batch_min/batch_max are already computed above as numpy (C,).
-            batch_midpoint = (batch_min + batch_max) / 2  # (C,)
+            batch_shift = (batch_min + batch_max) / 2.0
             if self.shift is None:
-                self.shift = batch_midpoint
+                self.shift = batch_shift
             else:
-                # Momentum update: shift = 0.95 * shift + 0.05 * midpoint
-                self.shift = SHIFT_MOMENTUM * self.shift + (1 - SHIFT_MOMENTUM) * batch_midpoint
+                # Momentum update: shift = 0.95 * shift + 0.05 * batch_shift
+                self.shift = SHIFT_MOMENTUM * self.shift + (1 - SHIFT_MOMENTUM) * batch_shift
 
         # --- Histogram accumulation ---
         # Sample rows from x_2d IN MLX before converting to numpy.
@@ -250,68 +240,20 @@ class ChannelStats:
             c, _ = np.histogram(vals_clamped, bins=self.hist_edges)
             self.hist_counts += c
 
-        # --- Per-token absmax accumulation ---
-        # token_absmax[i] = max(abs(x_2d[i, :])) — one value per token row.
-        # Computed in MLX then converted; x_2d is already evaluated at this point.
-        token_absmax = np.array(mx.max(mx.abs(x_2d), axis=1))  # (N,)
-        self._token_absmax_sum += float(token_absmax.sum())
-        self._token_absmax_count += len(token_absmax)
-
-        t_vmin = float(token_absmax.min())
-        t_vmax = float(token_absmax.max())
-
-        if self.n_batches == 0:
-            self._first_token_absmax_vals = token_absmax
-            self._token_absmax_global_min = t_vmin
-            self._token_absmax_global_max = t_vmax
-        else:
-            self._token_absmax_global_min = min(self._token_absmax_global_min, t_vmin)
-            self._token_absmax_global_max = max(self._token_absmax_global_max, t_vmax)
-
-            if self.token_absmax_hist_edges is None:
-                span = self._token_absmax_global_max - self._token_absmax_global_min
-                pad = max(span * 0.05, 1e-6)
-                lo = self._token_absmax_global_min - pad
-                hi = self._token_absmax_global_max + pad
-                self.token_absmax_hist_edges = np.linspace(lo, hi, HIST_BINS + 1)
-                self.token_absmax_hist_counts = np.zeros(HIST_BINS, dtype=np.int64)
-                if self._first_token_absmax_vals is not None:
-                    c0, _ = np.histogram(self._first_token_absmax_vals,
-                                         bins=self.token_absmax_hist_edges)
-                    self.token_absmax_hist_counts += c0
-                    self._first_token_absmax_vals = None
-
-            ta_clamped = np.clip(token_absmax,
-                                 self.token_absmax_hist_edges[0],
-                                 self.token_absmax_hist_edges[-1])
-            c, _ = np.histogram(ta_clamped, bins=self.token_absmax_hist_edges)
-            self.token_absmax_hist_counts += c
-
         self.n_batches += 1
 
     def percentile(self, p: float) -> float:
-        """Estimate percentile from activation histogram. p in [0, 100]."""
+        """Estimate percentile from histogram. p in [0, 100]."""
         if self.hist_counts is None or self.hist_counts.sum() == 0:
             return 0.0
-        return self._percentile_from_hist(self.hist_counts, self.hist_edges, p)
-
-    def _token_absmax_percentile(self, p: float) -> float:
-        """Estimate percentile from per-token absmax histogram. p in [0, 100]."""
-        if self.token_absmax_hist_counts is None or self.token_absmax_hist_counts.sum() == 0:
-            return 0.0
-        return self._percentile_from_hist(
-            self.token_absmax_hist_counts, self.token_absmax_hist_edges, p
-        )
-
-    @staticmethod
-    def _percentile_from_hist(counts: np.ndarray, edges: np.ndarray, p: float) -> float:
-        cdf = np.cumsum(counts).astype(float)
+        cdf = np.cumsum(self.hist_counts).astype(float)
         cdf /= cdf[-1]
         target = p / 100.0
         idx = np.searchsorted(cdf, target)
-        idx = min(idx, len(counts) - 1)
-        lo = edges[idx]
-        hi = edges[idx + 1]
+        idx = min(idx, HIST_BINS - 1)
+        # Linear interpolation within bin
+        lo = self.hist_edges[idx]
+        hi = self.hist_edges[idx + 1]
         if idx == 0:
             frac = 0.0
         else:
@@ -341,18 +283,6 @@ class ChannelStats:
             result["hist_p99"]  = self.percentile(99.0)
             result["hist_p01"]  = self.percentile(1.0)
             result["hist_p001"] = self.percentile(0.1)
-        # Per-token absmax stats (for per-token PTQ analysis)
-        if self.token_absmax_hist_counts is not None:
-            result["token_absmax_mean"] = (
-                self._token_absmax_sum / self._token_absmax_count
-                if self._token_absmax_count > 0 else 0.0
-            )
-            result["token_absmax_p50"]  = self._token_absmax_percentile(50.0)
-            result["token_absmax_p99"]  = self._token_absmax_percentile(99.0)
-            result["token_absmax_p999"] = self._token_absmax_percentile(99.9)
-            result["token_absmax_max"]  = self._token_absmax_global_max
-            result["_token_absmax_hist_counts"] = self.token_absmax_hist_counts
-            result["_token_absmax_hist_edges"]  = self.token_absmax_hist_edges
         return result
 
 
@@ -731,9 +661,6 @@ def main():
             if "_hist_counts" in s:
                 npz_data[f"{safe}__hist_counts"] = s["_hist_counts"]
                 npz_data[f"{safe}__hist_edges"]  = s["_hist_edges"]
-            if "_token_absmax_hist_counts" in s:
-                npz_data[f"{safe}__ta_hist_counts"] = s["_token_absmax_hist_counts"]
-                npz_data[f"{safe}__ta_hist_edges"]  = s["_token_absmax_hist_edges"]
             layer_index[layer_name] = {
                 "n_batches": s["n_batches"],
                 "tensor_absmax": s["tensor_absmax"],
@@ -741,16 +668,11 @@ def main():
                 "tensor_max": s["tensor_max"],
                 "has_shift": "shift" in s,
                 "has_hist": "_hist_counts" in s,
-                "has_token_hist": "_token_absmax_hist_counts" in s,
             }
             if "shift_absmax" in s:
                 layer_index[layer_name]["shift_absmax"] = s["shift_absmax"]
             # Store percentile clipping stats in index for fast access
             for pk in ("hist_p999", "hist_p99", "hist_p01", "hist_p001"):
-                if pk in s:
-                    layer_index[layer_name][pk] = s[pk]
-            for pk in ("token_absmax_mean", "token_absmax_p50",
-                       "token_absmax_p99", "token_absmax_p999", "token_absmax_max"):
                 if pk in s:
                     layer_index[layer_name][pk] = s[pk]
         np.savez_compressed(ts_dir / f"step_{step_key}.npz", **npz_data)
@@ -759,7 +681,7 @@ def main():
 
     # Write compact top-level manifest
     manifest_out = {
-        "format": "per_timestep_npz_v3",   # v3: shift uses (min+max)/2 midpoint; adds token_absmax hist
+        "format": "per_timestep_npz_v2",   # v2 adds per-layer histograms
         "hist_bins": HIST_BINS,
         "timestep_dir": str(ts_dir),
         "sigma_map": sigma_map_str,
