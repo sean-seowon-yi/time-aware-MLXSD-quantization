@@ -59,11 +59,10 @@ The dataset consists of `(x_t, t)` pairs — noisy latent inputs and their corre
 
 | File | Role |
 |------|------|
-| `calibration_config.py` | Central constants: steps, samples, timesteps, model version, latent size, CFG weight, prompt file path |
-| `calibration_collector.py` | Euler sampling loop with per-step `(x_t, t)` collection. Uses `CFGDenoiser` + `cache_modulation_params` for efficient modulation. |
-| `sample_cali_data.py` | Main orchestration script: loads pipeline, encodes prompts, runs 256 trajectories, selects 25 steps, flattens, shuffles, saves `.npz` |
-| `sample_prompts.txt` | 20 diverse text prompts covering different visual domains |
-| `__init__.py` | Package marker |
+| `src/calibration_sample_generation/calibration_config.py` | Central constants: steps, samples, timesteps, model version, latent size, CFG weight, prompt file path |
+| `src/calibration_sample_generation/calibration_collector.py` | Euler sampling loop with per-step `(x_t, t)` collection. Uses `CFGDenoiser` + `cache_modulation_params` for efficient modulation. |
+| `src/calibration_sample_generation/sample_cali_data.py` | Main orchestration script: loads pipeline, encodes prompts, runs 256 trajectories, selects 25 steps, flattens, shuffles, saves `.npz` |
+| `src/calibration_sample_generation/sample_prompts.txt` | 20 diverse text prompts covering different visual domains |
 
 ---
 
@@ -154,3 +153,4 @@ For 100 steps and 25 selections, this picks indices `[0, 4, 8, ..., 96, 99]`, ev
 ### Shuffle
 
 All 6,400 points are shuffled with a deterministic `numpy.random.default_rng(seed)` permutation, applied consistently to `xs`, `ts`, and `prompt_indices`.
+

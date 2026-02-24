@@ -72,10 +72,9 @@ The paper demonstrates on DiT-XL/2 (ImageNet class-conditional):
 
 | File | Role |
 |------|------|
-| `activation_tracer.py` | Core instrumentation: `ActivationTracer` dataclass, `PerLayerTimeStats`, monkey-patching machinery (`install_tracing` / `remove_tracing`). Records count, sum, sq_sum, min, max, and histogram per (layer, timestep) pair. |
-| `profile_postgelu.py` | Main profiling script: loads Phase 1 calibration data, instantiates the pipeline, groups points by prompt, runs forward passes with tracing active, serializes results to `.npz`. |
-| `visualize_postgelu.py` | Visualization: loads the `.npz` and generates all diagnostic plots + a console summary table. |
-| `__init__.py` | Package marker |
+| `src/activation_diagnostics/activation_tracer.py` | Core instrumentation: `ActivationTracer` dataclass, `PerLayerTimeStats`, monkey-patching machinery (`install_tracing` / `remove_tracing`). Records count, sum, sq_sum, min, max, and histogram per (layer, timestep) pair. |
+| `src/activation_diagnostics/profile_postgelu.py` | Main profiling script: loads Phase 1 calibration data, instantiates the pipeline, groups points by prompt, runs forward passes with tracing active, serializes results to `.npz`. |
+| `src/activation_diagnostics/visualize_postgelu.py` | Visualization: loads the `.npz` and generates all diagnostic plots + a console summary table. |
 
 ---
 
@@ -219,3 +218,4 @@ If the diagnostics confirm:
 - **High asymmetry** → justifies the paper's ASymQ (Asymmetry-aware Quantization) approach for post-GELU outputs.
 - **Temporal drift** → justifies Time-Grouping Quantization (TGQ), where quantization parameters vary by timestep group.
 - **Channel outliers** → justifies Saliency-Weighted Quantization (SWQ), protecting high-range channels from aggressive quantization.
+
