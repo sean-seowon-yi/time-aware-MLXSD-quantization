@@ -1,0 +1,74 @@
+.venv/
+
+# ----------------------------------------------------------------------
+# Python
+# ----------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# Virtualenvs
+.env/
+env/
+venv/
+.venv/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Caches / tooling
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+.cache/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editors / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# ----------------------------------------------------------------------
+# ML / model artifacts
+# ----------------------------------------------------------------------
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.mlmodel
+*.tflite
+*.pb
+
+# HuggingFace / DiffusionKit downloads & caches
+**/checkpoints/
+**/models/
+**/weights/
+**/artifacts/
+
+# ----------------------------------------------------------------------
+# Project-specific large / generated files
+# ----------------------------------------------------------------------
+
+# Calibration and diagnostics data
+*.npz
+
+# Plots and diagnostics output
+activation_plots/
+dry_run_activation_plots/
+
+# Local logs / scratch
+logs/
+*.log
+tmp/
+temp/
