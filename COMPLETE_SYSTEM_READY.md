@@ -25,8 +25,8 @@ the same calibration latents from Step 1 and feed into the final quantized model
                │ (~1-2h)           │    │ (<1 min)                │
                │        │          │    │         │               │
                │ weights/mm*.npz   │    │ quant_config.json       │
-               │ (int8 W4 scales)  │    │ (A4/A6/A8 per layer,    │
-               │                   │    │  shifts, SmoothQuant)   │
+               │ (int8 W4 scales)  │    │ (A8 per layer, shifts,  │
+               │                   │    │  outlier_config)        │
                └──────────┬────────┘    └─────────┬───────────────┘
                           │                       │
                     ┌─────▼───────────────────────▼─────┐
@@ -198,34 +198,44 @@ calibration_data/activations/
 ### Step 3A — Analyze and generate quantization config
 
 ```bash
+# Baseline: W4A8 (faithful TaQ-DiT)
 conda run -n diffusionkit python -m src.analyze_activations \
     --stats /path/to/calibration_data/activations/layer_statistics.json \
     --output /path/to/calibration_data/activations/quant_config.json
+
+# Experimental: multi-tier A4/A6/A8 (not faithful TaQ-DiT)
+conda run -n diffusionkit python -m src.analyze_activations_multitier \
+    --stats /path/to/calibration_data/activations/layer_statistics.json \
+    --output /path/to/calibration_data/activations/quant_config_multitier.json
 ```
 
 **Why:** Converts raw per-channel statistics into per-layer, per-timestep quantization
-decisions (A4/A6/A8) and computes the final activation scales, shift vectors, and
-SmoothQuant weight-scaling factors that will be applied at inference time.
+scales and shift vectors that will be applied at inference time.
 
-Three-tier decision logic:
-- **A4** (16 levels): scale < 6.0 (or shifted scale < 5.0 for post-GELU)
-- **A6** (64 levels, MLX int6): 6.0–10.0 range
-- **A8** (256 levels): scale ≥ 10.0, or high p99/p50 outlier ratio
-- **SmoothQuant downgrade:** isolated spike layers get one tier improvement
+`analyze_activations.py` (faithful TaQ-DiT baseline):
+- Fixed **A8** everywhere — `bits = 8` for all layers and timesteps
+- Scale: `tensor_absmax` per layer per timestep
+- Post-GELU layers (`mlp.fc2`): per-channel `shift` vectors for centering
+- **Two-scale outlier handling:** `identify_outlier_channels()` flags channels where
+  `range_c > 2.5 × median(range)` and stores a `multiplier_vector` in `outlier_config`
 
-This produces the per-timestep config that enables TaQ-DiT's adaptive quantization:
-early steps (high σ, large activations) get A8, late steps (low σ) can use A4.
+`analyze_activations_multitier.py` (experimental, preserved for future work):
+- Dynamic A4/A6/A8 per-timestep bit selection based on scale thresholds
+- SmoothQuant detection for isolated spike channels
+- Also computes `outlier_config` using the same logic
 
 **Output:**
 ```
 calibration_data/activations/
-  quant_config.json              # per_timestep: {step → layer → {bits, scale, shift}}
-  layer_temporal_analysis.json   # variability stats, switcher layers, always-A8 list
+  quant_config.json              # per_timestep + outlier_config + sigma_map
+  layer_temporal_analysis.json   # per-layer scale variability, shift magnitudes
 ```
 
 ---
 
-## Step 4 — Validate (current V1: weights only)
+## Step 4 — Inference
+
+### V1 — Weights only (FP16 activations)
 
 ```bash
 conda run -n diffusionkit python -m src.load_adaround_model \
@@ -236,15 +246,33 @@ conda run -n diffusionkit python -m src.load_adaround_model \
     --diff-stats
 ```
 
-**V1 limitation:** Currently dequantizes INT4 weights back to FP16 at load time and
-runs with FP16 activations. This validates weight quantization quality (AdaRound
-rounding decisions are correct) but does not apply the activation quantization scales
-from the activation track.
+Dequantizes INT4 weights to FP16 at load time and runs inference with the standard
+`pipeline.generate_image()`. Validates AdaRound rounding quality; activations remain
+full-precision.
 
-**V2 target:** Apply `quant_config.json` at inference — use static INT8/INT4/INT6
-activation scales per-layer per-timestep, apply post-GELU shift, and apply SmoothQuant
-weight pre-scaling. This requires a `QuantizedLinear` layer that holds int8 weights and
-executes `(W_int8 * scale).T @ x_quantized + bias`.
+### V2 — Fake-quantized activations
+
+```bash
+conda run -n diffusionkit python -m src.load_adaround_model \
+    --adaround-output /path/to/adaround_output \
+    --quant-config /path/to/calibration_data/activations/quant_config.json \
+    --prompt "a tabby cat sitting on a wooden table" \
+    --output-image quant_w4a8_actquant.png \
+    --compare
+```
+
+Wraps each `nn.Linear` with `_ActQuantLayer` and runs a custom Euler inference loop
+that threads the current step_key into proxies before each denoising step.
+Per-(layer, timestep) fake activation quantization with:
+- Per-channel shift (post-GELU `mlp.fc2` inputs only)
+- Two-scale outlier handling via `multiplier_vector` from `outlier_config`
+- Fake-quantize: round → clip → dequant (stays float; no memory savings)
+
+This measures the combined W4A8 quality impact and validates that `quant_config.json`
+is correct before implementing true INT8 activation kernels.
+
+**V3 target (future):** Custom `QuantizedLinear` holding int8 weights and executing
+`(W_int8 * scale).T @ x_quantized` — true memory savings + exact AdaRound rounding.
 
 ---
 
@@ -257,7 +285,8 @@ executes `(W_int8 * scale).T @ x_quantized + bias`.
 | 3W. AdaRound optimize | `adaround_optimize.py` | ~1–2h (24 blocks) | `weights/mm*.npz` |
 | 2A. Activation stats | `collect_layer_activations.py` | ~30 min | `timestep_stats/` |
 | 3A. Quant config | `analyze_activations.py` | <1 min | `quant_config.json` |
-| 4. Validate (V1) | `load_adaround_model.py` | ~5 min | comparison PNGs |
+| 4a. Validate (V1, FP16 acts) | `load_adaround_model.py` | ~5 min | comparison PNGs |
+| 4b. Validate (V2, fake-quant acts) | `load_adaround_model.py --quant-config` | ~5 min | comparison PNGs |
 
 Steps 2W/3W and 2A/3A can run in parallel (both read from Step 1 output).
 
@@ -276,13 +305,14 @@ Steps 2W/3W and 2A/3A can run in parallel (both read from Step 1 output).
 ## Tests
 
 ```bash
-# All pure-logic tests (no model required, ~3s)
+# All pure-logic tests (no model required, ~3s, 212 tests)
 conda run -n diffusionkit python -m pytest tests/ -v
 
 # Per-script
 conda run -n diffusionkit python -m pytest tests/test_cache_adaround_data.py -v
 conda run -n diffusionkit python -m pytest tests/test_adaround_optimize.py -v
 conda run -n diffusionkit python -m pytest tests/test_load_adaround_model.py -v
+conda run -n diffusionkit python -m pytest tests/test_analyze_activations.py -v
 ```
 
 ---
@@ -298,6 +328,9 @@ conda run -n diffusionkit python -m pytest tests/test_load_adaround_model.py -v
 Hooks are installed only for the forward passes — never during `cache_modulation_params`
 or `load_weights` calls — so MLX's module-tree walk reaches the real adaLN parameters.
 
-**V1 activation quantization:**
-`load_adaround_model.py` currently runs FP16 activations. The `quant_config.json` from
-`analyze_activations.py` is the calibration input for a V2 W4A8 inference path.
+**V2 activation quantization (`load_adaround_model.py --quant-config`):**
+`_ActQuantLayer` proxies wrap every `nn.Linear` in the MMDiT. A custom Euler loop
+(matching `generate_calibration_data.py`) threads the current step_key into proxies
+before each denoising step, enabling per-(layer, timestep) fake quantization.
+`apply_act_quant_hooks()` / `remove_act_quant_hooks()` install and restore the proxies;
+they do NOT interfere with AdaRound weight injection since weight injection runs first.

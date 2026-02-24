@@ -89,9 +89,10 @@ calibration_data/
 - All layers: `bits = 8`
 - Scale: `tensor_absmax` per layer per timestep (or `hist_p999` with `--use-hist-p999`)
 - Post-GELU layers (`mlp.fc2`): per-channel `shift` vectors passed through for centering
+- **Outlier config**: `identify_outlier_channels()` flags channels where `range_c > 2.5 × median(range)` and stores a per-channel `multiplier_vector` in a top-level `outlier_config` dict (keyed by layer name). Used by V2 inference for two-scale quantization.
 - Output format: `per_timestep_quant_config_v4`
 
-`analyze_activations_multitier.py` is the experimental A4/A6/A8 dynamic-switching variant (not faithful TaQ-DiT). It reads the same collected data and outputs a separate config.
+`analyze_activations_multitier.py` is the experimental A4/A6/A8 dynamic-switching variant (not faithful TaQ-DiT). It reads the same collected data, also computes `outlier_config`, and outputs a separate config.
 
 ## Time and Storage Estimates (M4 Max)
 

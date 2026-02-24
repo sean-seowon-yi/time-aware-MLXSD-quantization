@@ -39,11 +39,18 @@ conda run -n diffusionkit python -m src.analyze_activations_multitier \
 
 # --- INFERENCE ---
 
-# 4. Run inference with quantized weights
+# 4a. V1: FP16 activations (validate AdaRound weight quality)
 conda run -n diffusionkit python -m src.load_adaround_model \
     --adaround-output quantized_weights \
     --prompt "a tabby cat on a table" \
     --output-image quant_test.png [--compare] [--diff-stats]
+
+# 4b. V2: fake-quantized W4A8 activations (requires quant_config.json from Step 3A)
+conda run -n diffusionkit python -m src.load_adaround_model \
+    --adaround-output quantized_weights \
+    --quant-config calibration_data/activations/quant_config.json \
+    --prompt "a tabby cat on a table" \
+    --output-image quant_w4a8_actquant.png [--compare]
 ```
 
 ## Quick Test (10 images, ~6 min)

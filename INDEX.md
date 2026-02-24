@@ -33,15 +33,15 @@ Archived/historical docs: `docs/archived/`
 |--------|---------|------|
 | `cache_adaround_data.py` | Cache block-level FP16 I/O for AdaRound | ~30 min/5 images |
 | `adaround_optimize.py` | Optimize AdaRound W4A8 weights | varies |
-| `load_adaround_model.py` | Load quantized weights and run inference | — |
+| `load_adaround_model.py` | Load quantized weights and run inference (V1: FP16 acts; V2: `--quant-config` fake-quant) | — |
 
 ### Activation Track (Steps 2A–3A)
 
 | Script | Purpose | Time |
 |--------|---------|------|
 | `collect_layer_activations.py` | Collect per-channel activation stats | ~30 min/5 images |
-| `analyze_activations.py` | W4A8 baseline config (faithful TaQ-DiT) | <1 min |
-| `analyze_activations_multitier.py` | Experimental A4/A6/A8 config | <1 min |
+| `analyze_activations.py` | W4A8 baseline config + outlier_config (faithful TaQ-DiT) | <1 min |
+| `analyze_activations_multitier.py` | Experimental A4/A6/A8 config + outlier_config | <1 min |
 | `visualize_activations.py` | Optional: plot activation statistics | — |
 
 ---

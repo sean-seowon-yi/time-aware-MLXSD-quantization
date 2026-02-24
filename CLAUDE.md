@@ -83,11 +83,18 @@ conda run -n diffusionkit python -m src.visualize_activations \
 
 # --- INFERENCE ---
 
-# 4. Load quantized model and run inference
+# 4a. V1: dequantize weights to FP16, run standard inference
 conda run -n diffusionkit python -m src.load_adaround_model \
     --adaround-output quantized_weights \
     --prompt "a tabby cat on a table" \
     --output-image quant_test.png [--compare] [--diff-stats]
+
+# 4b. V2: fake-quantized activations (requires quant_config.json from Step 3A)
+conda run -n diffusionkit python -m src.load_adaround_model \
+    --adaround-output quantized_weights \
+    --quant-config calibration_data/activations/quant_config.json \
+    --prompt "a tabby cat on a table" \
+    --output-image quant_w4a8_actquant.png [--compare]
 ```
 
 ## Architecture
@@ -120,7 +127,8 @@ adaround_optimize.py    (loads block_data via load_block_data, trains AdaRoundPa
     → quantized_weights/config.json
 
 load_adaround_model.py  (dequantizes: W_fp16 = weight_int * scale, injects into model)
-    → inference with quantized weights
+    → V1: inference with FP16 activations (standard pipeline.generate_image)
+    → V2: inference with fake-quantized activations (--quant-config, custom Euler loop)
 
 ── ACTIVATION TRACK ──────────────────────────────────────────────────────────
 
@@ -133,12 +141,14 @@ collect_layer_activations.py  (hooks _HookedLayer proxies on every nn.Linear)
 
 analyze_activations.py  (W4A8 baseline — faithful TaQ-DiT)
     → calibration_data/activations/quant_config.json         (per_timestep_quant_config_v4)
+      top-level: per_timestep, sigma_map, outlier_config (per-layer multiplier vectors)
       per-timestep: step → layer → {bits: 8, scale, shift[]}  (shift on post-GELU only)
+      outlier_config: layer → {outlier_indices, multiplier_vector, scale_normal, scale_outlier}
     → calibration_data/activations/layer_temporal_analysis.json
       (per-layer mean/min/max scale across timesteps, shift magnitude summary)
 
 analyze_activations_multitier.py  (experimental A4/A6/A8 — NOT faithful TaQ-DiT)
-    → same output paths as above (run separately for experimental configs)
+    → same output paths as above, also includes outlier_config (run separately)
 ```
 
 ### Key Implementation Details
@@ -149,11 +159,11 @@ analyze_activations_multitier.py  (experimental A4/A6/A8 — NOT faithful TaQ-Di
 
 **AdaRound** (`adaround_optimize.py`): `AdaRoundParams` holds learnable `alphas` (weight rounding) and `a_scales` (activation scaling) as MLX arrays. `_QuantProxy` temporarily replaces linear layers during the forward pass. Two separate Adam optimizers are used: `w_lr=1e-3` for alphas, `a_lr=4e-5` with cosine schedule for activation scales. B-annealing decays from 20→2 after 20% warmup.
 
-**Weight injection** (`load_adaround_model.py`): V1 dequantizes int8 → float16 and assigns to `layer.weight`. This validates rounding quality with zero memory savings. The `quant_paths` list in `config.json` is authoritative for reversing the safe-encoded NPZ key names (dots → underscores).
+**Weight injection** (`load_adaround_model.py`): V1 dequantizes int8 → float16 and assigns to `layer.weight`. This validates rounding quality with zero memory savings. The `quant_paths` list in `config.json` is authoritative for reversing the safe-encoded NPZ key names (dots → underscores). V2 (enabled by `--quant-config`) wraps each `nn.Linear` with `_ActQuantLayer` and runs a custom Euler loop (same pattern as `generate_calibration_data.py`) that threads the current step_key into proxies before each denoising step, enabling per-(layer, timestep) fake activation quantization with shift + two-scale outlier handling.
 
 **Activation collection** (`collect_layer_activations.py`): `_HookedLayer` proxies replace `nn.Linear` layers (same deferred-eval pattern as `BlockHook`). `ChannelStats` accumulates per-channel min/max as a **running average** (AvgMinMax), not running max — outliers do not dominate. Post-GELU shift momentum: `shift = 0.95 * shift + 0.05 * (min + max) / 2` applied only to `mlp.fc2` inputs. 256-bin histograms: edges are fixed after batch 1 using the observed range; batch 0 is retroactively re-histogrammed. adaLN reload between images uses the same pattern as `cache_adaround_data.py`.
 
-**W4A8 activation quantization** (`analyze_activations.py`): Fixed A8 everywhere — faithful TaQ-DiT baseline. Scale is `tensor_absmax` per layer per timestep (or `hist_p999` with `--use-hist-p999`). Post-GELU layers (`mlp.fc2`) carry per-channel `shift` vectors (momentum 0.95 from collection) for centering before quantization. Output format `per_timestep_quant_config_v4`. The resulting `quant_config.json` is the calibration input for a W4A8 inference path (`load_adaround_model.py` currently uses FP16 activations). For experimental A4/A6/A8 dynamic switching, see `analyze_activations_multitier.py`.
+**W4A8 activation quantization** (`analyze_activations.py`): Fixed A8 everywhere — faithful TaQ-DiT baseline. Scale is `tensor_absmax` per layer per timestep (or `hist_p999` with `--use-hist-p999`). Post-GELU layers (`mlp.fc2`) carry per-channel `shift` vectors (momentum 0.95 from collection) for centering before quantization. `identify_outlier_channels()` detects channels where `range_c > 2.5 × median(range)` and computes a per-channel `multiplier_vector` for two-scale quantization (TaQ-DiT §3.3); stored in `outlier_config` keyed by layer name. Output format `per_timestep_quant_config_v4`. The `quant_config.json` is consumed by `load_adaround_model.py --quant-config` for V2 fake-quantized inference. For experimental A4/A6/A8 dynamic switching, see `analyze_activations_multitier.py`.
 
 **Visualization** (`visualize_activations.py`): Optional analysis tool, not in the critical path. Reads `layer_statistics.json` + per-timestep NPZ + optional `quant_config.json`. Six plot types: snapshot bar chart (all layers at one timestep), temporal line plots, heatmap (layers × timesteps), variability scatter, per-channel distribution, and histogram with shift/quantization overlays. The σ axis is inverted (1.0 → 0.0, high noise → clean image).
 

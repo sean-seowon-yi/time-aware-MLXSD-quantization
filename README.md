@@ -87,7 +87,7 @@ conda run -n diffusionkit python -m src.analyze_activations \
     --output calibration_data/activations/quant_config.json
 ```
 
-Fixed A8 everywhere. Scale from `tensor_absmax` per layer per timestep; post-GELU layers carry per-channel shift vectors for centering before quantization. Use `--use-hist-p999` to clip scale at the 99.9th percentile instead.
+Fixed A8 everywhere. Scale from `tensor_absmax` per layer per timestep; post-GELU layers carry per-channel shift vectors for centering before quantization. Outlier channels (range > 2.5× median) get a per-channel `multiplier_vector` for two-scale quantization — stored in `outlier_config` in the output JSON. Use `--use-hist-p999` to clip scale at the 99.9th percentile instead.
 
 **Experimental: multi-tier A4/A6/A8**
 
@@ -116,12 +116,26 @@ conda run -n diffusionkit python -m src.visualize_activations \
 
 ### Step 4 — Inference with quantized weights
 
+**V1 — weights only (FP16 activations):**
+
 ```bash
 conda run -n diffusionkit python -m src.load_adaround_model \
     --adaround-output quantized_weights \
     --prompt "a tabby cat on a table" \
     --output-image quant_test.png [--compare] [--diff-stats]
 ```
+
+**V2 — fake-quantized activations (requires Step 3A output):**
+
+```bash
+conda run -n diffusionkit python -m src.load_adaround_model \
+    --adaround-output quantized_weights \
+    --quant-config calibration_data/activations/quant_config.json \
+    --prompt "a tabby cat on a table" \
+    --output-image quant_w4a8_actquant.png [--compare]
+```
+
+V2 applies per-(layer, timestep) fake activation quantization with shift and two-scale outlier handling via a custom Euler inference loop.
 
 ---
 
