@@ -18,15 +18,14 @@ Later phases (actual quantization schemes and ablations) can build directly on t
   - `calibration_collector.py` – Euler sampler wrapper that collects `(x_t, t)` at each denoising step using `CFGDenoiser`.
   - `sample_cali_data.py` – Main entrypoint for Phase 1 calibration dataset generation.
   - `sample_prompts.txt` – 20 diverse text prompts used for calibration.
-  - `PHASE1.md` – Detailed design doc: how Phase 1 maps the TaQ-DiT spec to SD3, plus usage.
 
 - `src/activation_diagnostics/`
   - `activation_tracer.py` – Monkey-patches SD3’s MMDiT to trace **post-GELU FFN** activations per layer and timestep.
   - `profile_postgelu.py` – Main entrypoint for Phase 2 diagnostic profiling (reads Phase 1 `.npz`, records stats/histograms).
   - `visualize_postgelu.py` – Generates TaQ-DiT-style plots and a summary table from the profiling output.
-  - `PHASE2.md` – Detailed design doc: alignment/differences vs. TaQ-DiT, plus usage.
 
-For more detail on each phase, see the corresponding `PHASE1.md` and `PHASE2.md` documents.
+- `src/PHASE1.md` – Detailed Phase 1 design doc: how it maps the TaQ-DiT spec to SD3, plus usage.
+- `src/PHASE2.md` – Detailed Phase 2 design doc: alignment/differences vs. TaQ-DiT, plus usage.
 
 ---
 
@@ -102,13 +101,13 @@ python -m src.calibration_sample_generation.sample_cali_data \
 
 This produces a small calibration set suitable for functional testing.
 
-For detailed shapes, rationale, and exact mapping to the paper, see `src/calibration_sample_generation/PHASE1.md`.
+For detailed shapes, rationale, and exact mapping to the paper, see `src/PHASE1.md`.
 
 ---
 
 ## Phase 2 – Activation diagnostics (post-GELU FFN)
 
-Phase 2 verifies whether SD3’s **post-GELU FFN activations** exhibit the same issues TaQ-DiT observed for DiT’s post-SwiGLU activations (asymmetry, temporal drift, channel outliers).
+Phase 2 verifies whether SD3’s **post-GELU FFN activations** exhibit the same issues TaQ-DiT observed for DiT’s post-GELU activations (asymmetry, temporal drift, channel outliers).
 
 ### Profiling (statistics + histograms)
 
@@ -157,7 +156,7 @@ python -m src.activation_diagnostics.visualize_postgelu \
     --layers mm_00_img mm_12_img mm_23_img
 ```
 
-For design details and how this maps to TaQ-DiT’s figures/tables, see `src/activation_diagnostics/PHASE2.md`.
+For design details and how this maps to TaQ-DiT’s figures/tables, see `src/PHASE2.md`.
 
 ---
 
@@ -165,5 +164,5 @@ For design details and how this maps to TaQ-DiT’s figures/tables, see `src/act
 
 - ✅ **Phase 1** (Calibration data generation) implemented and tested with both full and dry runs.
 - ✅ **Phase 2** (Activation diagnostics + visualizations) implemented and tested on dry-run data.
-- 🔜 **Next phases** (actual quantization schemes like TGQ/SWQ and evaluation on SD3) are not yet implemented in this repo, but the calibration + diagnostic infrastructure is ready for them.
+- 🔜 **Next phases** (joint reconstruction, momentum-based shifting, reconstruction-driven migration, and evaluation on SD3) are not yet implemented in this repo, but the calibration + diagnostic infrastructure is ready for them.
 

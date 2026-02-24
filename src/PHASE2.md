@@ -16,7 +16,7 @@ Specifically, we measure:
 2. **Temporal shift** — Do activation mean and variance change significantly across denoising timesteps?
 3. **Channel outliers** — Are there specific channels with disproportionately large dynamic ranges?
 
-These diagnostics directly determine whether the paper's proposed Time-Grouping Quantization (TGQ) and Saliency-Weighted Quantization (SWQ) techniques are applicable to SD3.
+These diagnostics directly determine whether the paper's proposed **Time-Variance-Aware Static Transformations** — specifically momentum-based shifting (for asymmetry) and reconstruction-driven migration (for channel outliers) — are applicable to SD3.
 
 ---
 
@@ -24,15 +24,15 @@ These diagnostics directly determine whether the paper's proposed Time-Grouping 
 
 The paper demonstrates on DiT-XL/2 (ImageNet class-conditional):
 
-- **Post-SwiGLU activations show extreme asymmetry**: ~79.7% of values are concentrated in a single small bin near zero (Fig 3a).
+- **Post-GELU activations show extreme asymmetry**: ~79.7% of values are negative (mapped near zero by GELU), yet when quantized to 8-bit those negative values receive only ~1.6% of the quantization bins (Fig 3a).
 - **Heavy-tailed positive channel**: A few channels have values spanning thousands while most are near zero.
 - **Temporal drift**: Activation distributions shift substantially between early timesteps (high noise) and late timesteps (low noise), meaning a single static quantization grid is suboptimal.
 - **Channel-wise outliers**: The top ~2% of channels by dynamic range dominate the quantization error.
 
 | Diagnostic | Paper's DiT finding |
 |-----------|-------------------|
-| Negative fraction | ~79.7% of post-SwiGLU values < 0 |
-| Activation range | Varies 10–1000× across timesteps |
+| Negative fraction | ~79.7% of post-GELU values < 0 |
+| Activation range | Varies significantly across timesteps (Fig 2d) |
 | Channel outliers | Top 2% dominate quantization error |
 | Temporal shift | Mean and variance drift significantly |
 
@@ -44,7 +44,7 @@ The paper demonstrates on DiT-XL/2 (ImageNet class-conditional):
 
 | Diagnostic | Paper | Ours | Matches? |
 |-----------|-------|------|----------|
-| Activation location | Post-SwiGLU in FFN | Post-GELU in FFN | See note below |
+| Activation location | Post-GELU in FFN | Post-GELU in FFN | Yes |
 | Per-layer statistics | mean, std, min, max | mean, std, min, max per channel | Yes |
 | Histograms | Distribution over activation values | 512-bin histogram in [-8, 8] | Yes |
 | Per-timestep analysis | Statistics at each denoising step | Keyed by exact timestep value | Yes |
@@ -52,7 +52,7 @@ The paper demonstrates on DiT-XL/2 (ImageNet class-conditional):
 | Negative fraction | Reported as percentage | Computed from histogram | Yes |
 | Outlier identification | Top 2% channels by range | Highlighted in red in plots | Yes |
 
-**Note on GELU vs. SwiGLU**: The paper targets DiT which uses SwiGLU activations. DiffusionKit's SD3 MMDiT uses `nn.GELU()` in its FFN blocks (verified by inspecting `DiffusionKit/python/src/diffusionkit/mlx/mmdit.py`). The diagnostic approach is identical — we capture the output of the activation function between `fc1` and `fc2` — but we refer to it as "post-GELU" rather than "post-SwiGLU" throughout.
+**Note on activations**: Both the TaQ-DiT DiT backbone and DiffusionKit's SD3 MMDiT use GELU-based FFNs. In both cases we target the same tensor: the output of the GELU nonlinearity between `fc1` and `fc2` (\"post-GELU\").
 
 ### Deliberate adaptations for SD3 / MLX
 
@@ -215,7 +215,7 @@ DiffusionKit's `cache_modulation_params` pre-computes modulation parameters for 
 ### How results connect to later phases
 
 If the diagnostics confirm:
-- **High asymmetry** → justifies the paper's ASymQ (Asymmetry-aware Quantization) approach for post-GELU outputs.
-- **Temporal drift** → justifies Time-Grouping Quantization (TGQ), where quantization parameters vary by timestep group.
-- **Channel outliers** → justifies Saliency-Weighted Quantization (SWQ), protecting high-range channels from aggressive quantization.
+- **High asymmetry** → justifies the paper's **Momentum-Based Shifting** (Method 1, Sec III-B), which applies channel-wise shifting to symmetrize post-GELU distributions before quantization.
+- **Temporal drift** → justifies the paper's **time-variance-aware** approach overall, where momentum-based aggregation across timesteps produces static shift/migration parameters that accommodate temporal variability without per-step online computation.
+- **Channel outliers** → justifies the paper's **Reconstruction-Driven Migration** (Method 2, Sec III-B), which identifies the top-k outlier channels and migrates their magnitude into the subsequent weight matrix to reduce activation dynamic range.
 
