@@ -13,10 +13,19 @@ forward pass — no custom layer types needed.
 
 No memory savings vs baseline FP16, but directly validates quantization quality.
 
-Future work (see Notes in README):
-  V2 — nn.quantize(mmdit, bits=4) after injection for ~4× memory reduction
-       (re-rounds from float16, slight quality loss vs exact AdaRound)
-  V3 — custom QuantizedLinear storing int8 + scale for exact AdaRound + 2× savings
+Strategy (V2 — fake-quantized activations)
+------------------------------------------
+When --quant-config is provided, wraps each nn.Linear with _ActQuantLayer which
+applies per-(layer, timestep) fake activation quantization:
+
+  1. Shift  (post-GELU fc2 inputs only): x = x - shift
+  2. Outlier scaling (two-scale TaQ-DiT): x = x / multiplier_vector
+  3. Fake-quantize: round → clip → dequant (stays float)
+  4. Restore: x = x * multiplier_vector, x = x + shift
+  5. Forward through the original nn.Linear
+
+Uses a custom Euler inference loop so step_key can be threaded into proxies
+before each denoising step.
 
 Usage
 -----
@@ -25,6 +34,13 @@ Usage
         --prompt "a tabby cat sitting on a sofa" \\
         --output-image quant_test.png \\
         --compare
+
+    # V2: fake activation quantization
+    conda run -n diffusionkit python -m src.load_adaround_model \\
+        --adaround-output /path/to/quantized_weights \\
+        --quant-config calibration_data/activations/quant_config.json \\
+        --prompt "a tabby cat sitting on a sofa" \\
+        --output-image quant_w4a8_actquant.png --compare
 
 With --compare a second baseline image is generated with the unmodified FP16 model
 for side-by-side quality inspection.
@@ -45,7 +61,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 
@@ -57,6 +73,246 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from src.adaround_optimize import _get_nested, _set_nested
+
+
+# ---------------------------------------------------------------------------
+# Euler sampling helpers (mirrors generate_calibration_data.py)
+# ---------------------------------------------------------------------------
+
+def _append_dims(x: mx.array, target_dims: int) -> mx.array:
+    """Append dimensions to the end of x until it has target_dims dimensions."""
+    dims_to_append = target_dims - x.ndim
+    return x.reshape(x.shape + (1,) * dims_to_append)
+
+
+def _to_d(x: mx.array, sigma: mx.array, denoised: mx.array) -> mx.array:
+    """Converts a denoiser output to a Karras ODE derivative."""
+    return (x - denoised) / _append_dims(sigma, x.ndim)
+
+
+# ---------------------------------------------------------------------------
+# Fake quantization helper
+# ---------------------------------------------------------------------------
+
+def fake_quant_int(x: mx.array, scale: float, bits: int) -> mx.array:
+    """Round-clip-dequantize (fake quantization, stays float)."""
+    qmax = 2 ** (bits - 1) - 1
+    x_int = mx.round(x / scale)
+    x_int = mx.clip(x_int, -qmax, qmax)
+    return x_int * scale
+
+
+# ---------------------------------------------------------------------------
+# Activation quantization proxy
+# ---------------------------------------------------------------------------
+
+class _ActQuantLayer:
+    """
+    Wraps an nn.Linear and applies per-(layer, timestep) fake activation
+    quantization to its input before the linear transform.
+
+    Two-scale TaQ-DiT approach for post-GELU layers with outlier channels:
+      1. Shift (fc2 inputs only)
+      2. Divide outlier channels by multiplier_vector
+      3. Fake-quantize with scale_normal
+      4. Restore outlier channels
+      5. Un-shift
+    """
+
+    def __init__(
+        self,
+        layer,
+        layer_name: str,
+        per_timestep: Dict,
+        outlier_cfg: Dict,
+    ):
+        self.layer = layer
+        self.layer_name = layer_name
+        self.per_timestep = per_timestep   # step_key (str) → {bits, scale, shift?}
+        self.outlier_cfg = outlier_cfg     # {multiplier_vector, ...} or {}
+        self.current_step_key: Optional[int] = None
+
+    def __call__(self, x: mx.array) -> mx.array:
+        cfg = self.per_timestep.get(str(self.current_step_key))
+        if cfg is None:
+            return self.layer(x)
+
+        bits = cfg["bits"]
+        scale = cfg["scale"]
+        if scale < 1e-8:
+            return self.layer(x)
+
+        # 1. Shift (post-GELU layers only)
+        shift = None
+        if "shift" in cfg:
+            shift = mx.array(cfg["shift"], dtype=x.dtype)
+            x = x - shift
+
+        # 2. Normalize outlier channels
+        multiplier = None
+        if self.outlier_cfg:
+            multiplier = mx.array(self.outlier_cfg["multiplier_vector"], dtype=x.dtype)
+            x = x / multiplier
+
+        # 3. Fake-quantize
+        x = fake_quant_int(x, scale, bits)
+
+        # 4. Restore outlier channels
+        if multiplier is not None:
+            x = x * multiplier
+
+        # 5. Un-shift
+        if shift is not None:
+            x = x + shift
+
+        return self.layer(x)
+
+    def __getattr__(self, name: str):
+        # Forward attribute access (e.g. .weight) to the wrapped layer.
+        # __getattr__ is only called when normal lookup fails, so self.layer
+        # itself is found normally and does not recurse.
+        return getattr(self.layer, name)
+
+
+# ---------------------------------------------------------------------------
+# Apply / remove activation quantization hooks
+# ---------------------------------------------------------------------------
+
+def apply_act_quant_hooks(
+    mmdit,
+    per_timestep: Dict,
+    outlier_config: Dict,
+) -> Tuple[List, List]:
+    """
+    Walk the MMDiT block hierarchy and wrap each nn.Linear whose name appears
+    in per_timestep with an _ActQuantLayer proxy.
+
+    Layer naming convention (matches collect_layer_activations.py):
+      mm{i}.img.{attn|mlp}.{q,k,v,o}_proj / fc1 / fc2
+      mm{i}.txt.{attn|mlp}.{q,k,v,o}_proj / fc1 / fc2
+      uni{i}.{attn|mlp}.{q,k,v,o}_proj / fc1 / fc2
+
+    Returns
+    -------
+    proxies : list of _ActQuantLayer
+        Set proxy.current_step_key before each denoising step.
+    patches : list of (parent_obj, attr_name, original_layer)
+        Pass to remove_act_quant_hooks() to restore originals.
+    """
+    # Build set of all layer names that appear in at least one timestep
+    quant_layer_names: set = set()
+    for step_layers in per_timestep.values():
+        quant_layer_names.update(step_layers.keys())
+
+    proxies: List[_ActQuantLayer] = []
+    patches: List[Tuple] = []
+
+    def _patch_sub(sub, attr: str, full_name: str):
+        layer = getattr(sub, attr, None)
+        if layer is None or full_name not in quant_layer_names:
+            return
+        per_ts = {sk: per_timestep[sk][full_name]
+                  for sk in per_timestep if full_name in per_timestep[sk]}
+        outlier_cfg = outlier_config.get(full_name, {})
+        proxy = _ActQuantLayer(layer, full_name, per_ts, outlier_cfg)
+        setattr(sub, attr, proxy)
+        patches.append((sub, attr, layer))
+        proxies.append(proxy)
+
+    def _patch_transformer_block(tb, prefix: str):
+        for lin in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            _patch_sub(tb.attn, lin, f"{prefix}.attn.{lin}")
+        if hasattr(tb, "mlp"):
+            _patch_sub(tb.mlp, "fc1", f"{prefix}.mlp.fc1")
+            _patch_sub(tb.mlp, "fc2", f"{prefix}.mlp.fc2")
+
+    if hasattr(mmdit, "multimodal_transformer_blocks"):
+        for i, block in enumerate(mmdit.multimodal_transformer_blocks):
+            _patch_transformer_block(block.image_transformer_block, f"mm{i}.img")
+            _patch_transformer_block(block.text_transformer_block, f"mm{i}.txt")
+
+    if hasattr(mmdit, "unified_transformer_blocks"):
+        for i, block in enumerate(mmdit.unified_transformer_blocks):
+            _patch_transformer_block(block.transformer_block, f"uni{i}")
+
+    return proxies, patches
+
+
+def remove_act_quant_hooks(patches: List) -> None:
+    """Restore original nn.Linear layers replaced by _ActQuantLayer proxies."""
+    for parent, attr, original in patches:
+        setattr(parent, attr, original)
+
+
+# ---------------------------------------------------------------------------
+# Custom inference loop for V2 (fake activation quantization)
+# ---------------------------------------------------------------------------
+
+def run_act_quant_inference(
+    pipeline,
+    prompt: str,
+    negative_prompt: str,
+    cfg_scale: float,
+    num_steps: int,
+    seed: int,
+    proxies: List[_ActQuantLayer],
+    step_keys_sorted: List[int],
+):
+    """
+    Custom Euler inference loop that threads step_key into activation proxies
+    before each denoising step.  Matches the DiffusionKit pipeline exactly
+    (same pattern as generate_calibration_data.py).
+
+    Returns a PIL.Image.
+    """
+    from PIL import Image as _PILImage
+    from diffusionkit.mlx import CFGDenoiser
+
+    mx.random.seed(seed)
+
+    conditioning, pooled = pipeline.encode_text(prompt, cfg_scale, negative_prompt)
+    mx.eval(conditioning, pooled)
+    conditioning = conditioning.astype(pipeline.activation_dtype)
+    pooled = pooled.astype(pipeline.activation_dtype)
+
+    x_T = pipeline.get_empty_latent(64, 64)
+    noise = pipeline.get_noise(seed, x_T)
+    sigmas = pipeline.get_sigmas(pipeline.sampler, num_steps)
+
+    model = CFGDenoiser(pipeline)
+    timesteps = model.model.sampler.timestep(sigmas).astype(pipeline.activation_dtype)
+    model.cache_modulation_params(pooled, timesteps)
+
+    noise_scaled = pipeline.sampler.noise_scaling(
+        sigmas[0], noise, x_T, pipeline.max_denoise(sigmas)
+    )
+    x = noise_scaled
+
+    extra_args = {"conditioning": conditioning, "cfg_weight": cfg_scale}
+
+    for i in range(len(sigmas) - 1):
+        # Find nearest collected step_key for this step index
+        nearest_key = min(step_keys_sorted, key=lambda k: abs(k - i))
+        for proxy in proxies:
+            proxy.current_step_key = nearest_key
+
+        denoised = model(x, timesteps[i], sigmas[i], **extra_args)
+        d = _to_d(x, sigmas[i], denoised)
+        dt = sigmas[i + 1] - sigmas[i]
+        x = x + d * dt
+        mx.eval(x)
+
+    model.clear_cache()
+
+    latent = pipeline.latent_format.process_out(x)
+    mx.eval(latent)
+    latent = latent.astype(pipeline.activation_dtype)
+    decoded = pipeline.decode_latents_to_image(latent)
+    mx.eval(decoded)
+
+    x_img = mx.concatenate([decoded], axis=0)
+    x_img = (x_img * 255).astype(mx.uint8)
+    return _PILImage.fromarray(np.array(x_img[0]))
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +570,9 @@ def main() -> None:
                         help="Comma-separated block names to inject (default: all)")
     parser.add_argument("--diff-stats", action="store_true",
                         help="Print weight diff stats before injection")
+    parser.add_argument("--quant-config", type=Path, default=None,
+                        help="quant_config.json from analyze_activations.py; "
+                             "enables V2 fake activation quantization")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -391,20 +650,78 @@ def main() -> None:
     print(f"  {n_injected} layers injected in {time.time() - t0:.1f}s")
 
     # ------------------------------------------------------------------
+    # V2: Load quant config and apply activation quantization hooks
+    # ------------------------------------------------------------------
+    proxies: List[_ActQuantLayer] = []
+    act_quant_patches: List = []
+    step_keys_sorted: List[int] = []
+
+    if args.quant_config is not None:
+        print(f"\n=== Loading Activation Quant Config: {args.quant_config} ===")
+        with open(args.quant_config) as f:
+            quant_cfg = json.load(f)
+
+        per_timestep = quant_cfg.get("per_timestep", {})
+        outlier_config = quant_cfg.get("outlier_config", {})
+        step_keys_sorted = sorted(int(k) for k in per_timestep.keys())
+
+        proxies, act_quant_patches = apply_act_quant_hooks(
+            pipeline.mmdit, per_timestep, outlier_config
+        )
+
+        # Count bits distribution
+        n_a8 = n_a4 = n_other = 0
+        for step_layers in per_timestep.values():
+            for layer_cfg in step_layers.values():
+                b = layer_cfg.get("bits", 8)
+                if b == 8:
+                    n_a8 += 1
+                elif b == 4:
+                    n_a4 += 1
+                else:
+                    n_other += 1
+        total_dec = n_a8 + n_a4 + n_other
+        print(f"  Activation quantization enabled: {len(proxies)} layers")
+        if total_dec > 0:
+            print(f"    A8: {100*n_a8//total_dec}%  A4: {100*n_a4//total_dec}%  "
+                  f"other: {n_other}")
+        print(f"    Outlier handling: {len(outlier_config)} layers")
+
+    # ------------------------------------------------------------------
     # Generate test image
     # ------------------------------------------------------------------
     print(f"\n=== Generating Quantised Image → {args.output_image} ===")
     t0 = time.time()
-    images, _ = pipeline.generate_image(
-        args.prompt,
-        cfg_weight=args.cfg_scale,
-        num_steps=args.num_steps,
-        seed=args.seed,
-        negative_text=args.negative_prompt,
-    )
-    images[0].save(args.output_image)
+    if proxies:
+        # V2 path: custom Euler loop threads step_key into proxies
+        image = run_act_quant_inference(
+            pipeline=pipeline,
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            cfg_scale=args.cfg_scale,
+            num_steps=args.num_steps,
+            seed=args.seed,
+            proxies=proxies,
+            step_keys_sorted=step_keys_sorted,
+        )
+        image.save(args.output_image)
+    else:
+        # V1 path: standard pipeline.generate_image
+        images, _ = pipeline.generate_image(
+            args.prompt,
+            cfg_weight=args.cfg_scale,
+            num_steps=args.num_steps,
+            seed=args.seed,
+            negative_text=args.negative_prompt,
+        )
+        images[0].save(args.output_image)
+
     elapsed = time.time() - t0
     print(f"  Done in {elapsed:.1f}s  →  {args.output_image}")
+
+    # Remove activation quant hooks before cleanup
+    if act_quant_patches:
+        remove_act_quant_hooks(act_quant_patches)
 
     if args.compare:
         print(f"\n  Baseline: {baseline_path}")

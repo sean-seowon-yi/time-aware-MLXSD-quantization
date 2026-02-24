@@ -51,6 +51,10 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
+# Import shared outlier detection from the baseline analyzer
+# (defined here too for standalone use, kept in sync)
+from src.analyze_activations import identify_outlier_channels
+
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
@@ -671,6 +675,29 @@ def main():
     print(f"Always A6: {len(always_a6)} layers")
     print(f"Always A4: {len(always_a4)} layers")
 
+    # ------------------------------------------------------------------
+    # Outlier channel detection (per-layer, not per-timestep)
+    # ------------------------------------------------------------------
+    ref_step = step_keys_sorted[len(step_keys_sorted) // 2]
+    outlier_config: Dict = {}
+    for layer_name in layer_names:
+        data = per_step_full.get(ref_step, {}).get(layer_name, {})
+        avg_min_arr = data.get("avg_min")
+        avg_max_arr = data.get("avg_max")
+        if avg_min_arr is not None and avg_max_arr is not None:
+            result = identify_outlier_channels(avg_min_arr, avg_max_arr, bits=8)
+            if result:
+                outlier_config[layer_name] = result
+
+    n_outlier_layers = len(outlier_config)
+    if n_outlier_layers:
+        total_ch_flagged = sum(len(v["outlier_indices"]) for v in outlier_config.values())
+        total_ch = sum(len(v["multiplier_vector"]) for v in outlier_config.values())
+        print(f"\n{n_outlier_layers} layers have outlier channels "
+              f"(mean {100.0 * total_ch_flagged / max(1, total_ch):.1f}% flagged)")
+    else:
+        print("\nNo outlier channels detected (threshold_multiplier=2.5)")
+
     # Build and save per-timestep config
     print(f"\n=== Generating Quantization Config ===")
 
@@ -702,6 +729,7 @@ def main():
         "per_timestep": per_timestep_config,
         "sigma_map": {str(k): v for k, v in sigma_map.items()},
         "shift_analysis": shift_analysis,
+        "outlier_config": outlier_config,
         "summary": {
             "total_timesteps": len(step_keys_sorted),
             "total_layers": len(layer_names),
@@ -718,6 +746,7 @@ def main():
             "always_a8": len(always_a8),
             "always_a6": len(always_a6),
             "always_a4": len(always_a4),
+            "layers_with_outlier_channels": n_outlier_layers,
         },
         "thresholds": {
             "a4_threshold": args.a4_threshold,
