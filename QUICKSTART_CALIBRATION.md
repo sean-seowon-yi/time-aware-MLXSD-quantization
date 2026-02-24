@@ -1,139 +1,130 @@
-# Calibration Data Collection - Quick Reference
+# Quantization Pipeline — Quick Reference
+
+All commands require the `diffusionkit` conda environment.
 
 ## Complete Workflow
 
 ```bash
-# 1. Generate calibration data (1000 images, ~11 hours)
-python -m src.generate_calibration_data \
-    --num-images 1000 \
-    --num-steps 50 \
-    --calib-dir calibration_data \
-    --prompt-csv all_prompts.csv
+# 1. Generate calibration latents (~6 min for 10 images, ~11h for 1000)
+conda run -n diffusionkit python -m src.generate_calibration_data \
+    --num-images 1000 --num-steps 50 --calib-dir calibration_data [--resume]
 
-# 2. Verify calibration data
-python -m src.verify_calibration --calib-dir calibration_data
+# --- WEIGHT TRACK ---
 
-# 3. Collect layer activations (100 images, ~30 min)
-python -m src.collect_layer_activations \
-    --calib-dir calibration_data \
-    --num-images 100
+# 2W. Cache block-level FP16 I/O for AdaRound (~30 min for 5 images)
+conda run -n diffusionkit python -m src.cache_adaround_data \
+    --calib-dir calibration_data --num-images 5 --stride 5 [--force]
 
-# 4. Analyze activation statistics
-python -m src.analyze_activations \
+# 3W. Optimize AdaRound W4A8 weights
+conda run -n diffusionkit python -m src.adaround_optimize \
+    --adaround-cache calibration_data/adaround_cache \
+    --output quantized_weights \
+    [--iters 20000] [--batch-size 16] [--bits-w 4] [--bits-a 8]
+
+# --- ACTIVATION TRACK ---
+
+# 2A. Collect per-layer activation statistics (~30 min for 5 images)
+conda run -n diffusionkit python -m src.collect_layer_activations \
+    --calib-dir calibration_data --num-images 5 --stride 2 [--force]
+
+# 3A. W4A8 baseline config (faithful TaQ-DiT)
+conda run -n diffusionkit python -m src.analyze_activations \
     --stats calibration_data/activations/layer_statistics.json \
-    --export-config quantization_config.json
+    --output calibration_data/activations/quant_config.json
 
-# 5. Verify everything
-python -m src.verify_calibration --calib-dir calibration_data
+# 3A-alt. Experimental multi-tier A4/A6/A8 config
+conda run -n diffusionkit python -m src.analyze_activations_multitier \
+    --stats calibration_data/activations/layer_statistics.json \
+    --output calibration_data/activations/quant_config_multitier.json
+
+# --- INFERENCE ---
+
+# 4. Run inference with quantized weights
+conda run -n diffusionkit python -m src.load_adaround_model \
+    --adaround-output quantized_weights \
+    --prompt "a tabby cat on a table" \
+    --output-image quant_test.png [--compare] [--diff-stats]
 ```
 
-## Quick Test (10 images)
+## Quick Test (10 images, ~6 min)
 
 ```bash
-# Generate small test set
-python -m src.generate_calibration_data \
-    --num-images 10 \
-    --num-steps 50 \
-    --calib-dir test_calibration
+conda run -n diffusionkit python -m src.generate_calibration_data \
+    --num-images 10 --num-steps 50 --calib-dir calibration_data
 
-# Collect activations
-python -m src.collect_layer_activations \
-    --calib-dir test_calibration \
-    --num-images 10
+conda run -n diffusionkit python -m src.collect_layer_activations \
+    --calib-dir calibration_data --num-images 5 --stride 2
 
-# Analyze
-python -m src.analyze_activations \
-    --stats test_calibration/activations/layer_statistics.json
+conda run -n diffusionkit python -m src.analyze_activations \
+    --stats calibration_data/activations/layer_statistics.json
 ```
 
 ## Resume Interrupted Generation
 
 ```bash
-# If generation was interrupted, resume:
-python -m src.generate_calibration_data \
-    --num-images 1000 \
-    --num-steps 50 \
-    --resume
+conda run -n diffusionkit python -m src.generate_calibration_data \
+    --num-images 1000 --num-steps 50 --resume
 ```
 
-## Regenerate Activations
+## Force Regenerate Activations
 
 ```bash
-# Force overwrite existing activation statistics
-python -m src.collect_layer_activations \
-    --calib-dir calibration_data \
-    --num-images 100 \
-    --force
+conda run -n diffusionkit python -m src.collect_layer_activations \
+    --calib-dir calibration_data --num-images 5 --force
+```
+
+## Optional: Visualize Activation Statistics
+
+```bash
+conda run -n diffusionkit python -m src.visualize_activations \
+    --stats calibration_data/activations/layer_statistics.json \
+    --output-dir calibration_data/activations/plots \
+    [--snapshot-steps 0 12 24 40 48] \
+    [--quant-config calibration_data/activations/quant_config.json] \
+    [--plot-distributions]
 ```
 
 ## Common Issues
 
-### Issue: Model state corruption
-**Symptom**: Second image fails with shape mismatch
-**Fix**: Already handled by script (reloads pipeline per image)
+**Second image fails with shape mismatch**
+Handled automatically — adaLN weights are reloaded between images with a targeted
+modulation-only reload. See TROUBLESHOOTING_GUIDE.md Issue 4.
 
-### Issue: Out of memory during activation collection
-**Fix**: Reduce number of images
+**Out of memory during activation collection**
 ```bash
-python -m src.collect_layer_activations --num-images 50
+conda run -n diffusionkit python -m src.collect_layer_activations --num-images 5
 ```
 
-### Issue: Missing samples
-**Check**:
+**Missing samples / interrupted generation**
 ```bash
-python -m src.verify_calibration --calib-dir calibration_data
+conda run -n diffusionkit python -m src.generate_calibration_data \
+    --num-images 1000 --resume
 ```
 
 ## File Locations
 
 ```
 calibration_data/
-├── samples/                 # Per-step latents (1.2 GB)
-├── latents/                 # Final latents (65 MB)
-├── images/                  # Decoded images (2 GB)
-├── activations/             # Layer statistics (varies)
-│   ├── layer_statistics.json
-│   └── collection_metadata.json
-└── manifest.json            # All prompts and metadata
+├── manifest.json
+├── samples/                         # per-step latents
+├── adaround_cache/                  # weight track cache
+└── activations/
+    ├── layer_statistics.json        # collected stats
+    ├── quant_config.json            # W4A8 baseline
+    ├── quant_config_multitier.json  # experimental A4/A6/A8
+    └── timestep_stats/
+
+quantized_weights/                   # AdaRound output
+    ├── config.json
+    └── weights/{block_name}.npz
 ```
 
 ## Time Estimates (M4 Max)
 
 | Task | Time |
 |------|------|
+| Generate 10 images | ~6 min |
 | Generate 1000 images | ~11 hours |
-| Generate 100 images | ~1 hour |
-| Generate 10 images | ~6 minutes |
-| Collect activations (100 images) | ~30 minutes |
-| Analyze statistics | <1 minute |
-
-## Storage Estimates
-
-| Dataset | Storage |
-|---------|---------|
-| 10 images (with activations) | ~200 MB |
-| 100 images (with activations) | ~1.5 GB |
-| 1000 images (no activations) | ~3.3 GB |
-| 1000 images (with activations) | ~8 GB |
-
-## Next Steps
-
-After collecting calibration data and activation statistics:
-
-1. **Implement TaQ-DiT quantization**
-2. **Use `quantization_config.json` for layer-specific settings**
-3. **Evaluate quantized model with FID using generated images**
-4. **Iterate on quantization strategy based on results**
-
-## Helper Scripts
-
-```bash
-# Rebuild manifest if corrupted
-python -m src.rebuild_manifest --calib-dir calibration_data
-
-# Decode latents to images (if decode failed during generation)
-python -m src.decode_latents --calib-dir calibration_data
-
-# Verify data integrity
-python -m src.verify_calibration --calib-dir calibration_data
-```
+| Cache AdaRound data (5 images) | ~30 min |
+| Collect activations (5 images) | ~30 min |
+| Analyze (either variant) | <1 min |
