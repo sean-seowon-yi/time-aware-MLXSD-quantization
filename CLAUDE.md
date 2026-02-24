@@ -36,22 +36,45 @@ Tests use synthetic small tensors and mock DiffusionKit — they do not load the
 
 ## Full Quantization Pipeline
 
-Run these four scripts in order:
+Two tracks run in parallel from the same calibration latents. Steps 2W/3W and 2A/3A are independent.
 
 ```bash
 # 1. Generate calibration latents (~11h for 1000 images, ~6min for 10)
 conda run -n diffusionkit python -m src.generate_calibration_data \
     --num-images 10 --num-steps 50 --calib-dir calibration_data [--resume]
 
-# 2. Cache block-level FP16 I/O for AdaRound (~30min for 100 images)
+# --- WEIGHT TRACK ---
+
+# 2W. Cache block-level FP16 I/O for AdaRound (~30min for 5 images)
 conda run -n diffusionkit python -m src.cache_adaround_data \
     --calib-dir calibration_data --num-images 5 --stride 5 [--force]
 
-# 3. Optimize AdaRound W4A8 weights
+# 3W. Optimize AdaRound W4A8 weights
 conda run -n diffusionkit python -m src.adaround_optimize \
     --adaround-cache calibration_data/adaround_cache \
     --output quantized_weights \
     [--iters 20000] [--batch-size 16] [--bits-w 4] [--bits-a 8] [--blocks mm0,mm1]
+
+# --- ACTIVATION TRACK ---
+
+# 2A. Collect per-layer activation statistics (~30min for 5 images)
+conda run -n diffusionkit python -m src.collect_layer_activations \
+    --calib-dir calibration_data --num-images 5 --stride 2 [--force]
+
+# 3A. Analyze statistics and generate quantization config (<1 min)
+conda run -n diffusionkit python -m src.analyze_activations \
+    --stats calibration_data/activations/layer_statistics.json \
+    --output calibration_data/activations/quant_config.json
+
+# Optional: visualize activation statistics
+conda run -n diffusionkit python -m src.visualize_activations \
+    --stats calibration_data/activations/layer_statistics.json \
+    --output-dir calibration_data/activations/plots \
+    [--snapshot-steps 0 12 24 40 48] \
+    [--quant-config calibration_data/activations/quant_config.json] \
+    [--plot-distributions]
+
+# --- INFERENCE ---
 
 # 4. Load quantized model and run inference
 conda run -n diffusionkit python -m src.load_adaround_model \
@@ -77,6 +100,8 @@ generate_calibration_data.py
     → calibration_data/samples/{img:04d}_{step:03d}.npz   (latent x per step)
     → calibration_data/manifest.json
 
+── WEIGHT TRACK ──────────────────────────────────────────────────────────────
+
 cache_adaround_data.py  (installs BlockHook proxies, runs forward passes)
     → calibration_data/adaround_cache/samples/{img:04d}_{step:03d}.npz
       keys: {block_name}__arg{i}, {block_name}__kw_{name}, {block_name}__out{i}
@@ -89,6 +114,21 @@ adaround_optimize.py    (loads block_data via load_block_data, trains AdaRoundPa
 
 load_adaround_model.py  (dequantizes: W_fp16 = weight_int * scale, injects into model)
     → inference with quantized weights
+
+── ACTIVATION TRACK ──────────────────────────────────────────────────────────
+
+collect_layer_activations.py  (hooks _HookedLayer proxies on every nn.Linear)
+    → calibration_data/activations/layer_statistics.json   (manifest + sigma_map + step_keys)
+    → calibration_data/activations/timestep_stats/step_{key}.npz
+      keys per layer: avg_min, avg_max, shift, hist_counts, hist_edges  (all per-channel)
+    → calibration_data/activations/timestep_stats/step_{key}_index.json
+      (scalar summary per layer: tensor_absmax, hist_p999, ...)
+
+analyze_activations.py
+    → calibration_data/activations/quant_config.json         (per_timestep_quant_config_v3)
+      per-timestep: step → layer → {bits: 4|6|8, scale, shift[], smoothquant_scale[]}
+    → calibration_data/activations/layer_temporal_analysis.json
+      (switcher layers, always-A8/A4/A6 lists, shift effectiveness metrics)
 ```
 
 ### Key Implementation Details
@@ -100,6 +140,12 @@ load_adaround_model.py  (dequantizes: W_fp16 = weight_int * scale, injects into 
 **AdaRound** (`adaround_optimize.py`): `AdaRoundParams` holds learnable `alphas` (weight rounding) and `a_scales` (activation scaling) as MLX arrays. `_QuantProxy` temporarily replaces linear layers during the forward pass. Two separate Adam optimizers are used: `w_lr=1e-3` for alphas, `a_lr=4e-5` with cosine schedule for activation scales. B-annealing decays from 20→2 after 20% warmup.
 
 **Weight injection** (`load_adaround_model.py`): V1 dequantizes int8 → float16 and assigns to `layer.weight`. This validates rounding quality with zero memory savings. The `quant_paths` list in `config.json` is authoritative for reversing the safe-encoded NPZ key names (dots → underscores).
+
+**Activation collection** (`collect_layer_activations.py`): `_HookedLayer` proxies replace `nn.Linear` layers (same deferred-eval pattern as `BlockHook`). `ChannelStats` accumulates per-channel min/max as a **running average** (AvgMinMax), not running max — outliers do not dominate. Post-GELU shift momentum: `shift = 0.95 * shift + 0.05 * (min + max) / 2` applied only to `mlp.fc2` inputs. 256-bin histograms: edges are fixed after batch 1 using the observed range; batch 0 is retroactively re-histogrammed. adaLN reload between images uses the same pattern as `cache_adaround_data.py`.
+
+**Three-tier activation quantization** (`analyze_activations.py`): A4 (shifted absmax < 5.0 for post-GELU, or tensor absmax < 6.0 otherwise) → A6 (5.0–8.0 / 6.0–10.0) → A8 (above thresholds or high p99/p50 outlier ratio). SmoothQuant candidates — layers with <5% outlier channels but >5× spike ratio — get per-channel weight scaling (α=0.5) that can drop one tier. The resulting `quant_config.json` is the calibration input for a V2 W4A8 inference path (`load_adaround_model.py` currently uses FP16 activations).
+
+**Visualization** (`visualize_activations.py`): Optional analysis tool, not in the critical path. Reads `layer_statistics.json` + per-timestep NPZ + optional `quant_config.json`. Six plot types: snapshot bar chart (all layers at one timestep), temporal line plots, heatmap (layers × timesteps), variability scatter, per-channel distribution, and histogram with shift/quantization overlays. The σ axis is inverted (1.0 → 0.0, high noise → clean image).
 
 ### adaLN Reload Bug (fixed)
 
