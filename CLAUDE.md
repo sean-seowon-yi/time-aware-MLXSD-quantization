@@ -61,10 +61,17 @@ conda run -n diffusionkit python -m src.adaround_optimize \
 conda run -n diffusionkit python -m src.collect_layer_activations \
     --calib-dir calibration_data --num-images 5 --stride 2 [--force]
 
-# 3A. Analyze statistics and generate quantization config (<1 min)
+# 3A. Analyze statistics — W4A8 baseline (faithful TaQ-DiT, <1 min)
 conda run -n diffusionkit python -m src.analyze_activations \
     --stats calibration_data/activations/layer_statistics.json \
     --output calibration_data/activations/quant_config.json
+
+# 3A-alt. Experimental multi-tier A4/A6/A8 config (same collected data, different output)
+conda run -n diffusionkit python -m src.analyze_activations_multitier \
+    --stats calibration_data/activations/layer_statistics.json \
+    --output calibration_data/activations/quant_config_multitier.json \
+    [--a4-threshold 6.0] [--a6-threshold 10.0] \
+    [--shifted-a4-threshold 5.0] [--shifted-a6-threshold 8.0]
 
 # Optional: visualize activation statistics
 conda run -n diffusionkit python -m src.visualize_activations \
@@ -124,11 +131,14 @@ collect_layer_activations.py  (hooks _HookedLayer proxies on every nn.Linear)
     → calibration_data/activations/timestep_stats/step_{key}_index.json
       (scalar summary per layer: tensor_absmax, hist_p999, ...)
 
-analyze_activations.py
-    → calibration_data/activations/quant_config.json         (per_timestep_quant_config_v3)
-      per-timestep: step → layer → {bits: 4|6|8, scale, shift[], smoothquant_scale[]}
+analyze_activations.py  (W4A8 baseline — faithful TaQ-DiT)
+    → calibration_data/activations/quant_config.json         (per_timestep_quant_config_v4)
+      per-timestep: step → layer → {bits: 8, scale, shift[]}  (shift on post-GELU only)
     → calibration_data/activations/layer_temporal_analysis.json
-      (switcher layers, always-A8/A4/A6 lists, shift effectiveness metrics)
+      (per-layer mean/min/max scale across timesteps, shift magnitude summary)
+
+analyze_activations_multitier.py  (experimental A4/A6/A8 — NOT faithful TaQ-DiT)
+    → same output paths as above (run separately for experimental configs)
 ```
 
 ### Key Implementation Details
@@ -143,7 +153,7 @@ analyze_activations.py
 
 **Activation collection** (`collect_layer_activations.py`): `_HookedLayer` proxies replace `nn.Linear` layers (same deferred-eval pattern as `BlockHook`). `ChannelStats` accumulates per-channel min/max as a **running average** (AvgMinMax), not running max — outliers do not dominate. Post-GELU shift momentum: `shift = 0.95 * shift + 0.05 * (min + max) / 2` applied only to `mlp.fc2` inputs. 256-bin histograms: edges are fixed after batch 1 using the observed range; batch 0 is retroactively re-histogrammed. adaLN reload between images uses the same pattern as `cache_adaround_data.py`.
 
-**Three-tier activation quantization** (`analyze_activations.py`): A4 (shifted absmax < 5.0 for post-GELU, or tensor absmax < 6.0 otherwise) → A6 (5.0–8.0 / 6.0–10.0) → A8 (above thresholds or high p99/p50 outlier ratio). SmoothQuant candidates — layers with <5% outlier channels but >5× spike ratio — get per-channel weight scaling (α=0.5) that can drop one tier. The resulting `quant_config.json` is the calibration input for a V2 W4A8 inference path (`load_adaround_model.py` currently uses FP16 activations).
+**W4A8 activation quantization** (`analyze_activations.py`): Fixed A8 everywhere — faithful TaQ-DiT baseline. Scale is `tensor_absmax` per layer per timestep (or `hist_p999` with `--use-hist-p999`). Post-GELU layers (`mlp.fc2`) carry per-channel `shift` vectors (momentum 0.95 from collection) for centering before quantization. Output format `per_timestep_quant_config_v4`. The resulting `quant_config.json` is the calibration input for a W4A8 inference path (`load_adaround_model.py` currently uses FP16 activations). For experimental A4/A6/A8 dynamic switching, see `analyze_activations_multitier.py`.
 
 **Visualization** (`visualize_activations.py`): Optional analysis tool, not in the critical path. Reads `layer_statistics.json` + per-timestep NPZ + optional `quant_config.json`. Six plot types: snapshot bar chart (all layers at one timestep), temporal line plots, heatmap (layers × timesteps), variability scatter, per-channel distribution, and histogram with shift/quantization overlays. The σ axis is inverted (1.0 → 0.0, high noise → clean image).
 
