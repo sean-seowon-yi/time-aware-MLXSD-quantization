@@ -451,8 +451,8 @@ def main():
     parser.add_argument("--calib-dir", type=Path, required=True)
     parser.add_argument("--num-images", type=int, default=5)
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--stride", type=int, default=2,
-                        help="Collect every Nth timestep (default 2 → ~25 steps)")
+    parser.add_argument("--stride", type=int, default=4,
+                        help="Collect every Nth timestep (default 4 → 25 steps for 100-step)")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 

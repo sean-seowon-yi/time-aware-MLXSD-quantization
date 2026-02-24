@@ -39,15 +39,15 @@ Tests use synthetic small tensors and mock DiffusionKit — they do not load the
 Two tracks run in parallel from the same calibration latents. Steps 2W/3W and 2A/3A are independent.
 
 ```bash
-# 1. Generate calibration latents (~11h for 1000 images, ~6min for 10)
+# 1. Generate calibration latents (~11h for 1000 images, ~12min for 10)
 conda run -n diffusionkit python -m src.generate_calibration_data \
-    --num-images 10 --num-steps 50 --calib-dir calibration_data [--resume]
+    --num-images 10 --num-steps 100 --calib-dir calibration_data [--resume]
 
 # --- WEIGHT TRACK ---
 
-# 2W. Cache block-level FP16 I/O for AdaRound (~30min for 5 images)
+# 2W. Cache block-level FP16 I/O for AdaRound (~60min for 5 images)
 conda run -n diffusionkit python -m src.cache_adaround_data \
-    --calib-dir calibration_data --num-images 5 --stride 5 [--force]
+    --calib-dir calibration_data --num-images 5 --stride 4 [--force]
 
 # 3W. Optimize AdaRound W4A8 weights
 conda run -n diffusionkit python -m src.adaround_optimize \
@@ -57,9 +57,9 @@ conda run -n diffusionkit python -m src.adaround_optimize \
 
 # --- ACTIVATION TRACK ---
 
-# 2A. Collect per-layer activation statistics (~30min for 5 images)
+# 2A. Collect per-layer activation statistics (~60min for 5 images)
 conda run -n diffusionkit python -m src.collect_layer_activations \
-    --calib-dir calibration_data --num-images 5 --stride 2 [--force]
+    --calib-dir calibration_data --num-images 5 --stride 4 [--force]
 
 # 3A. Analyze statistics — W4A8 baseline (faithful TaQ-DiT, <1 min)
 conda run -n diffusionkit python -m src.analyze_activations \

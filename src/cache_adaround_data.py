@@ -346,8 +346,8 @@ def main():
                         help="Where to write the cache (default: <calib-dir>/adaround_cache)")
     parser.add_argument("--num-images", type=int, default=5,
                         help="Number of images to use (evenly spaced from manifest)")
-    parser.add_argument("--stride", type=int, default=5,
-                        help="Use every Nth denoising step (default 5 → 10 steps for 50-step)")
+    parser.add_argument("--stride", type=int, default=4,
+                        help="Use every Nth denoising step (default 4 → 25 steps for 100-step)")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite existing cache")
     args = parser.parse_args()

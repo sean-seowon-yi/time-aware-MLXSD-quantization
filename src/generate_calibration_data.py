@@ -202,7 +202,7 @@ def generate_with_calibration(pipeline, prompt: str, seed: int, num_steps: int,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-images", type=int, default=10)
-    parser.add_argument("--num-steps", type=int, default=50)
+    parser.add_argument("--num-steps", type=int, default=100)
     parser.add_argument("--cfg-weight", type=float, default=7.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--calib-dir", type=Path, default=None)

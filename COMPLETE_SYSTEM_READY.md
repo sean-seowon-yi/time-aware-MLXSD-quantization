@@ -44,7 +44,7 @@ the same calibration latents from Step 1 and feed into the final quantized model
 ```bash
 conda run -n diffusionkit python -m src.generate_calibration_data \
     --num-images 50 \
-    --num-steps 50 \
+    --num-steps 100 \
     --cfg-weight 7.5 \
     --calib-dir /path/to/calibration_data
 ```
