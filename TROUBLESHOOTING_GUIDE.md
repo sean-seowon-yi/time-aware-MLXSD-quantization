@@ -9,13 +9,14 @@ Complete reference for all issues encountered and their solutions.
 1. [Storage Explosion from Conditioning Data](#issue-1-storage-explosion)
 2. [MLX Missing PyTorch Hooks](#issue-2-mlx-hooks)
 3. [MLX Missing no_grad](#issue-3-mlx-no-grad)
-4. [Model State Corruption](#issue-4-model-corruption)
+4. [Model State Corruption (adaLN Overwrite)](#issue-4-model-corruption)
 5. [VAE Decode Method Discovery](#issue-5-vae-decode)
 6. [All Images Are Noise](#issue-6-images-noise)
 7. [Wrong Euler Formula](#issue-7-euler-formula)
 8. [Missing append_dims](#issue-8-append-dims)
 9. [Manifest Not Recording All Images](#issue-9-manifest-incomplete)
 10. [Out of Memory During Collection](#issue-10-out-of-memory)
+11. [Block Hooks Corrupt adaLN Weights on Reload](#issue-11-hook-corruption)
 
 ---
 
@@ -98,7 +99,7 @@ Simply remove `no_grad()` - not needed in MLX.
 ---
 
 <a name="issue-4-model-corruption"></a>
-## Issue 4: Model State Corruption
+## Issue 4: Model State Corruption (adaLN Overwrite)
 
 ### Symptom
 ```
@@ -108,24 +109,27 @@ Simply remove `no_grad()` - not needed in MLX.
 ```
 
 ### Cause
-DiffusionKit's cached AdaLN parameters corrupt between images.
+`CFGDenoiser.cache_modulation_params()` overwrites the adaLN weights in the live
+model. When a second image starts, those weights are stale/zeroed.
 
 ### Solution
-Reload pipeline for each image:
+After each image's forward passes, reload only the adaLN (modulation) weights —
+do **not** reload the entire pipeline:
 
 ```python
 for img_idx in range(num_images):
-    # Load fresh pipeline
-    pipeline = initialize_pipeline()
-    
-    # Generate
-    image = generate(pipeline, ...)
-    
-    # Clean up
-    del pipeline
+    # ... run forward passes for this image ...
+
+    # Reload adaLN weights before next image
+    pipeline.mmdit.load_weights(
+        pipeline.load_mmdit(only_modulation_dict=True), strict=False
+    )
 ```
 
-**Trade-off**: Slower (~10s overhead) but reliable.
+This takes milliseconds vs ~10s for a full pipeline reload.
+
+> **Note**: The earlier workaround of reloading the whole pipeline per image also
+> works but is unnecessary. The targeted reload above is the correct fix.
 
 ---
 
@@ -281,7 +285,46 @@ Modify `select_key_timesteps()` to return fewer steps.
 
 ---
 
-## Quick Fixes
+<a name="issue-11-hook-corruption"></a>
+## Issue 11: Block Hooks Corrupt adaLN Weights on Reload
+
+### Symptom
+Same dimension mismatch as Issue 4, but occurs even after adding the adaLN
+reload, or adaLN weights silently reset to zero on the second image.
+
+### Cause
+`BlockHook` / `_HookedLayer` proxy objects hold references into the model's
+module list. Calling `pipeline.mmdit.load_weights(...)` or `mx.metal.clear_cache()`
+while hooks are still installed overwrites the adaLN parameters through those
+stale references, corrupting the weights the reload just wrote.
+
+### Solution
+Always remove hooks **before** any `load_weights` or `clear_cache` call:
+
+```python
+# cache_adaround_data.py pattern
+remove_block_hooks(pipeline.mmdit, hooks)   # ← remove first
+mx.metal.clear_cache()
+pipeline.mmdit.load_weights(
+    pipeline.load_mmdit(only_modulation_dict=True), strict=False
+)
+```
+
+```python
+# collect_layer_activations.py pattern
+remove_layer_hooks(pipeline.mmdit, hooks)   # ← remove first
+pipeline.mmdit.load_weights(
+    pipeline.load_mmdit(only_modulation_dict=True), strict=False
+)
+```
+
+### Rule of thumb
+**Install hooks → forward passes → flush → remove hooks → reload weights.**
+Never reload weights with hooks still live.
+
+---
+
+
 
 ### Verification Failed
 
