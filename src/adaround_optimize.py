@@ -1,23 +1,40 @@
 """
-AdaRound block-level W4A8 PTQ for SD3-Medium DiT.
+AdaRound block-level W4A8 PTQ for SD3-Medium DiT (AdaRound baseline).
 
-Faithful implementation of TaQ-DiT adaptive rounding:
+This module implements the **AdaRound baseline** for the AdaRound-vs-TaQ-DiT
+comparison study.  It differs from TaQ-DiT joint reconstruction (see
+``src/taqdit_optimize.py``) in one key respect:
+
+  AdaRound (this file):
+    One global activation scale per linear layer — learned once, applied at
+    every diffusion timestep regardless of the current noise level.
+
+  TaQ-DiT joint reconstruction (taqdit_optimize.py):
+    A separate activation scale per (linear layer, timestep) — captures the
+    empirical observation that diffusion activations vary significantly across
+    the noise schedule (σ→1 high-noise vs σ→0 low-noise regimes).
+
+Both use the same block-level reconstruction loss structure (rec_loss +
+ROUND_WEIGHT * round_loss) and AdaRound weight rounding (learnable alpha).
+The distinction is *activation scale granularity*: global-per-layer vs
+per-layer-per-timestep.
+
+Details:
   - Per-channel W4 AdaRound: learned alpha initialised from rounding residuals
-  - Per-tensor A8 LSQ: learned activation scale per linear
-  - Block-level reconstruction: full transformer block output vs FP cache
-  - B-annealing: round_loss coefficient b decays 20→2 after 20% warmup (20000 iters)
+  - Per-tensor A8 LSQ: one learned activation scale per linear (global)
+  - Block-level reconstruction: full transformer block output vs FP16 cache
+  - B-annealing: round_loss coefficient b decays 20→2 after 20% warmup
   - Loss: rec_loss + 0.01 * round_loss  (lp_loss with p=2, sum over channels)
 
-Intentional V1 simplifications vs TaQ-DiT:
+Simplifications vs full TaQ-DiT:
   - No input mixing (drop_prob=1.0, always use FP block inputs from cache)
-  - Single Adam lr=1e-3 for alpha; separate Adam lr=4e-5 + cosine for a_scale
   - adaLN_modulation layers not quantized (attn + MLP only)
   - W4 applied to all blocks (TaQ-DiT uses W8 for first/last few)
 
 Usage:
     conda run -n diffusionkit python -m src.adaround_optimize \\
         --adaround-cache /path/to/adaround_cache \\
-        --output /path/to/quantized_weights \\
+        --output /path/to/quantized_weights_adaround \\
         [--iters 20000] [--batch-size 16] [--bits-w 4] [--bits-a 8]
 
 Output layout:
