@@ -19,6 +19,7 @@ from src.load_adaround_model import (
     load_adaround_weights,
     dequantize,
     inject_weights,
+    inject_weights_mlx_int4,
     weight_diff_stats,
 )
 
@@ -504,3 +505,212 @@ class TestPartialInjection:
         config, _ = load_adaround_weights(out_dir)
         assert config["iters"] == 20000
         assert config["format"] == "adaround_v1"
+
+
+# ---------------------------------------------------------------------------
+# TestInjectWeightsMlxInt4
+# ---------------------------------------------------------------------------
+
+# MLX requires in_dims >= 256 for 4-bit quantization (Apple Metal kernel constraint).
+# Also needs in_dims divisible by group_size (default 64).  Use 256 throughout.
+_INT4_INP = 256
+_INT4_OUT = 8
+
+
+def _make_mock_linear_int4(out=_INT4_OUT, inp=_INT4_INP):
+    """_MockLinear with dimensions suited for group_size=64 int4 quantization."""
+    m = _MockLinear(out=out, inp=inp)
+    return m
+
+
+def _simple_quant_weights_int4(block_name, linear_path, out=_INT4_OUT, inp=_INT4_INP):
+    """quant_weights dict for inject_weights_mlx_int4()."""
+    return {
+        block_name: {
+            linear_path: {
+                "weight_int": np.ones((out, inp), dtype=np.int8),
+                "scale": np.full((out, 1), 0.5, dtype=np.float32),
+                "a_scale": 1.0,
+                "bits_w": 4,
+                "bits_a": 8,
+            }
+        }
+    }
+
+
+class TestInjectWeightsMlxInt4:
+
+    def _pipeline_with_layer(self, linear_path: str, out=_INT4_OUT, inp=_INT4_INP):
+        """Pipeline whose mm0.image_transformer_block.<linear_path> is an int4-sized mock."""
+        pipeline = _make_mock_pipeline(n_mm=1, n_uni=0)
+        parts = linear_path.split(".")
+        obj = pipeline.mmdit.multimodal_transformer_blocks[0].image_transformer_block
+        for part in parts[:-1]:
+            obj = getattr(obj, part)
+        setattr(obj, parts[-1], _make_mock_linear_int4(out=out, inp=inp))
+        return pipeline
+
+    def test_returns_tuple_count_and_mem_stats(self):
+        pipeline = self._pipeline_with_layer("attn.q_proj")
+        qw = _simple_quant_weights_int4("mm0", "image_transformer_block.attn.q_proj")
+        result = inject_weights_mlx_int4(pipeline, qw)
+        assert isinstance(result, tuple) and len(result) == 2
+        n, mem = result
+        assert isinstance(n, int)
+        assert set(mem.keys()) >= {"fp16_mb", "int4_mb", "ratio"}
+
+    def test_n_injected_correct_single_layer(self):
+        pipeline = self._pipeline_with_layer("attn.q_proj")
+        qw = _simple_quant_weights_int4("mm0", "image_transformer_block.attn.q_proj")
+        n, _ = inject_weights_mlx_int4(pipeline, qw)
+        assert n == 1
+
+    def test_layer_replaced_with_quantized_linear(self):
+        pipeline = self._pipeline_with_layer("attn.q_proj")
+        qw = _simple_quant_weights_int4("mm0", "image_transformer_block.attn.q_proj")
+        inject_weights_mlx_int4(pipeline, qw)
+        layer = pipeline.mmdit.multimodal_transformer_blocks[0] \
+            .image_transformer_block.attn.q_proj
+        assert isinstance(layer, nn.QuantizedLinear)
+
+    def test_weight_stored_as_uint32(self):
+        """Packed int4 storage uses uint32 (8 nibbles per word)."""
+        pipeline = self._pipeline_with_layer("attn.q_proj")
+        qw = _simple_quant_weights_int4("mm0", "image_transformer_block.attn.q_proj")
+        inject_weights_mlx_int4(pipeline, qw)
+        layer = pipeline.mmdit.multimodal_transformer_blocks[0] \
+            .image_transformer_block.attn.q_proj
+        assert layer.weight.dtype == mx.uint32
+
+    def test_scales_present_on_quantized_linear(self):
+        pipeline = self._pipeline_with_layer("attn.q_proj")
+        qw = _simple_quant_weights_int4("mm0", "image_transformer_block.attn.q_proj")
+        inject_weights_mlx_int4(pipeline, qw)
+        layer = pipeline.mmdit.multimodal_transformer_blocks[0] \
+            .image_transformer_block.attn.q_proj
+        assert hasattr(layer, "scales")
+
+    def test_mem_stats_ratio_greater_than_one(self):
+        """int4 storage should be smaller than the equivalent FP16 footprint."""
+        pipeline = self._pipeline_with_layer("attn.q_proj", out=_INT4_OUT, inp=_INT4_INP)
+        qw = _simple_quant_weights_int4("mm0", "image_transformer_block.attn.q_proj",
+                                        out=_INT4_OUT, inp=_INT4_INP)
+        _, mem = inject_weights_mlx_int4(pipeline, qw)
+        assert mem["ratio"] > 1.0
+
+    def test_multiple_layers_all_injected(self):
+        pipeline = _make_mock_pipeline(n_mm=1, n_uni=0)
+        tb = pipeline.mmdit.multimodal_transformer_blocks[0].image_transformer_block
+        tb.attn.q_proj = _make_mock_linear_int4()
+        tb.attn.k_proj = _make_mock_linear_int4()
+        qw = {
+            "mm0": {
+                "image_transformer_block.attn.q_proj": {
+                    "weight_int": np.ones((_INT4_OUT, _INT4_INP), dtype=np.int8),
+                    "scale": np.ones((_INT4_OUT, 1), dtype=np.float32),
+                    "a_scale": 1.0, "bits_w": 4, "bits_a": 8,
+                },
+                "image_transformer_block.attn.k_proj": {
+                    "weight_int": np.ones((_INT4_OUT, _INT4_INP), dtype=np.int8),
+                    "scale": np.ones((_INT4_OUT, 1), dtype=np.float32),
+                    "a_scale": 1.0, "bits_w": 4, "bits_a": 8,
+                },
+            }
+        }
+        n, _ = inject_weights_mlx_int4(pipeline, qw)
+        assert n == 2
+        # Both layers should now be QuantizedLinear
+        assert isinstance(tb.attn.q_proj, nn.QuantizedLinear)
+        assert isinstance(tb.attn.k_proj, nn.QuantizedLinear)
+
+    def test_unknown_block_skipped_gracefully(self):
+        pipeline = _make_mock_pipeline(n_mm=1, n_uni=0)
+        qw = _simple_quant_weights_int4("mm99", "image_transformer_block.attn.q_proj")
+        n, _ = inject_weights_mlx_int4(pipeline, qw)
+        assert n == 0
+
+    def test_unknown_linear_path_skipped_gracefully(self):
+        pipeline = _make_mock_pipeline(n_mm=1, n_uni=0)
+        qw = _simple_quant_weights_int4("mm0", "image_transformer_block.attn.no_such")
+        n, _ = inject_weights_mlx_int4(pipeline, qw)
+        assert n == 0
+
+    def test_empty_quant_weights_returns_zero(self):
+        pipeline = _make_mock_pipeline()
+        n, mem = inject_weights_mlx_int4(pipeline, {})
+        assert n == 0
+        assert mem["fp16_mb"] == pytest.approx(0.0)
+        assert mem["int4_mb"] == pytest.approx(0.0)
+
+    def test_custom_group_size_32(self):
+        """group_size=32 accepted; inp must be divisible by 32 and >= 256."""
+        pipeline = _make_mock_pipeline(n_mm=1, n_uni=0)
+        pipeline.mmdit.multimodal_transformer_blocks[0].image_transformer_block \
+            .attn.q_proj = _make_mock_linear_int4(out=8, inp=_INT4_INP)
+        qw = {
+            "mm0": {
+                "image_transformer_block.attn.q_proj": {
+                    "weight_int": np.ones((8, _INT4_INP), dtype=np.int8),
+                    "scale": np.full((8, 1), 0.5, dtype=np.float32),
+                    "a_scale": 1.0, "bits_w": 4, "bits_a": 8,
+                }
+            }
+        }
+        n, _ = inject_weights_mlx_int4(pipeline, qw, group_size=32)
+        assert n == 1
+
+    def test_uni_block_injected(self):
+        pipeline = _make_mock_pipeline(n_mm=0, n_uni=1)
+        pipeline.mmdit.unified_transformer_blocks[0].transformer_block \
+            .attn.q_proj = _make_mock_linear_int4()
+        qw = {
+            "uni0": {
+                "transformer_block.attn.q_proj": {
+                    "weight_int": np.ones((_INT4_OUT, _INT4_INP), dtype=np.int8),
+                    "scale": np.ones((_INT4_OUT, 1), dtype=np.float32),
+                    "a_scale": 1.0, "bits_w": 4, "bits_a": 8,
+                }
+            }
+        }
+        n, _ = inject_weights_mlx_int4(pipeline, qw)
+        assert n == 1
+        layer = pipeline.mmdit.unified_transformer_blocks[0] \
+            .transformer_block.attn.q_proj
+        assert isinstance(layer, nn.QuantizedLinear)
+
+    def test_rounding_decisions_preserved(self):
+        """
+        After V1 dequant then V3 re-quant, the reconstructed FP16 weight should
+        be close to the original dequantized value (within one re-quant step).
+        We verify this by dequantizing the resulting QuantizedLinear weight back
+        to float and checking proximity.
+        """
+        pipeline = self._pipeline_with_layer("attn.q_proj")
+        # Use a non-trivial weight pattern
+        w_int = np.arange(_INT4_OUT * _INT4_INP, dtype=np.int8).reshape(_INT4_OUT, _INT4_INP) % 15 - 7
+        scale = np.full((_INT4_OUT, 1), 0.1, dtype=np.float32)
+        qw = {
+            "mm0": {
+                "image_transformer_block.attn.q_proj": {
+                    "weight_int": w_int,
+                    "scale": scale,
+                    "a_scale": 1.0, "bits_w": 4, "bits_a": 8,
+                }
+            }
+        }
+        inject_weights_mlx_int4(pipeline, qw)
+        layer = pipeline.mmdit.multimodal_transformer_blocks[0] \
+            .image_transformer_block.attn.q_proj
+        # Dequantize result back to float
+        W_reconstructed = np.array(mx.dequantize(
+            layer.weight,
+            layer.scales,
+            layer.biases,
+            group_size=layer.group_size,
+            bits=layer.bits,
+        ))
+        W_expected = dequantize(w_int, scale).astype(np.float32)
+        # Two quantization steps (AdaRound int8 → float16 → MLX int4) introduce
+        # compounded rounding error.  Tolerance is set to cover the worst case
+        # while confirming the re-quant is in the right ballpark.
+        np.testing.assert_allclose(W_reconstructed, W_expected, atol=0.15)

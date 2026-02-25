@@ -27,23 +27,52 @@ applies per-(layer, timestep) fake activation quantization:
 Uses a custom Euler inference loop so step_key can be threaded into proxies
 before each denoising step.
 
+Strategy (V3 — MLX native int4)
+--------------------------------
+When --mlx-int4 is provided, uses MLX's native packed int4 format instead of
+dequantizing to FP16.  Pipeline:
+
+  1. Dequantize AdaRound int8 → float16  (preserves exact rounding decisions)
+  2. Re-quantize with mx.quantize(w, group_size, bits=4) → packed uint32
+     + per-group scales/biases
+  3. Build nn.QuantizedLinear and replace nn.Linear in the block
+
+The nn.QuantizedLinear forward pass calls mx.quantized_matmul, which uses
+Apple's Metal kernel to multiply directly from packed int4 — no dequantization
+step at inference time.  Memory savings vs FP16: ~4× for weights.
+
+V2 activation quantization is compatible with V3: _ActQuantLayer wraps the
+QuantizedLinear just as it wraps Linear, so --mlx-int4 and --quant-config
+can be combined.
+
 Usage
 -----
+    # V1: dequantize to FP16 (no memory savings, validates quality)
     conda run -n diffusionkit python -m src.load_adaround_model \\
         --adaround-output /path/to/quantized_weights \\
         --prompt "a tabby cat sitting on a sofa" \\
-        --output-image quant_test.png \\
-        --compare
+        --output-image quant_v1.png --compare
 
-    # V2: fake activation quantization
+    # V2: FP16 weights + fake activation quantization
     conda run -n diffusionkit python -m src.load_adaround_model \\
         --adaround-output /path/to/quantized_weights \\
         --quant-config calibration_data/activations/quant_config.json \\
         --prompt "a tabby cat sitting on a sofa" \\
-        --output-image quant_w4a8_actquant.png --compare
+        --output-image quant_v2.png --compare
 
-With --compare a second baseline image is generated with the unmodified FP16 model
-for side-by-side quality inspection.
+    # V3: native MLX int4 (true memory savings, ~4x smaller weights)
+    conda run -n diffusionkit python -m src.load_adaround_model \\
+        --adaround-output /path/to/quantized_weights \\
+        --mlx-int4 --group-size 64 \\
+        --prompt "a tabby cat sitting on a sofa" \\
+        --output-image quant_v3.png --compare
+
+    # V3 + V2: native int4 weights + fake activation quantization
+    conda run -n diffusionkit python -m src.load_adaround_model \\
+        --adaround-output /path/to/quantized_weights \\
+        --mlx-int4 --quant-config calibration_data/activations/quant_config.json \\
+        --prompt "a tabby cat sitting on a sofa" \\
+        --output-image quant_v3a8.png --compare
 
 Output layout of adaround_optimize.py (required input)
 -------------------------------------------------------
@@ -488,6 +517,116 @@ def inject_weights(
     return injected
 
 
+def inject_weights_mlx_int4(
+    pipeline,
+    quant_weights: Dict[str, Dict[str, Dict]],
+    group_size: int = 64,
+) -> Tuple[int, Dict]:
+    """
+    Inject AdaRound weights as native MLX packed int4 (``nn.QuantizedLinear``).
+
+    Steps for each linear layer:
+      1. Dequantize AdaRound int8 → float16  (preserves rounding decisions)
+      2. Re-quantize with ``mx.quantize(w, group_size, bits=4)``
+         → packed uint32 weight + per-group float16 scales + biases
+      3. Construct ``nn.QuantizedLinear`` and replace the ``nn.Linear`` in the block
+
+    The resulting ``nn.QuantizedLinear`` uses ``mx.quantized_matmul`` at inference
+    time — Apple Metal kernel that multiplies directly from packed int4, with no
+    dequantization step.  This gives ~4× weight memory reduction vs FP16.
+
+    Parameters
+    ----------
+    pipeline    : DiffusionPipeline with loaded MMDiT
+    quant_weights : output of :func:`load_adaround_weights`
+    group_size  : int4 group size for MLX quantization (32, 64, or 128).
+                  Smaller = finer scale granularity = better quality.
+                  Default: 64.
+
+    Returns
+    -------
+    n_injected : int  — number of layers replaced
+    mem_stats  : dict — memory comparison (fp16_mb, int4_mb, ratio)
+    """
+    mmdit = pipeline.mmdit
+    injected = 0
+    fp16_bytes = 0
+    int4_bytes = 0
+    pending: List[mx.array] = []
+
+    for block_name, linears in quant_weights.items():
+        is_mm = block_name.startswith("mm")
+        idx = int(block_name[2:] if is_mm else block_name[3:])
+
+        try:
+            block = (
+                mmdit.multimodal_transformer_blocks[idx]
+                if is_mm
+                else mmdit.unified_transformer_blocks[idx]
+            )
+        except (AttributeError, IndexError) as e:
+            print(f"  WARNING: could not locate block {block_name}: {e}")
+            continue
+
+        for linear_path, data in linears.items():
+            try:
+                orig_layer = _get_nested(block, linear_path)
+            except (AttributeError, IndexError) as e:
+                print(f"  WARNING: {block_name}.{linear_path}: {e}")
+                continue
+
+            # Step 1: dequantize AdaRound int8 → float16
+            W_fp16 = dequantize(data["weight_int"], data["scale"])
+            out_dims, in_dims = W_fp16.shape
+
+            # Track FP16 memory
+            fp16_bytes += W_fp16.nbytes
+
+            # Step 2: re-quantize with MLX native format (affine int4)
+            W_mx = mx.array(W_fp16)
+            w_q, scales, biases = mx.quantize(W_mx, group_size=group_size, bits=4)
+            mx.eval(w_q, scales, biases)
+
+            # Track packed int4 memory (uint32 weights + float16 scales/biases)
+            int4_bytes += (
+                w_q.nbytes          # packed uint32 weights
+                + scales.nbytes     # per-group scales
+                + biases.nbytes     # per-group zero points
+            )
+
+            # Step 3: build nn.QuantizedLinear and populate it
+            has_bias = getattr(orig_layer, "bias", None) is not None
+            ql = nn.QuantizedLinear(
+                input_dims=in_dims,
+                output_dims=out_dims,
+                bias=has_bias,
+                group_size=group_size,
+                bits=4,
+            )
+            # Overwrite the randomly-initialized weight with our AdaRound weights
+            ql.weight = w_q
+            ql.scales = scales
+            ql.biases = biases
+            if has_bias:
+                ql.bias = orig_layer.bias
+
+            pending.extend([ql.weight, ql.scales, ql.biases])
+
+            # Step 4: replace Linear with QuantizedLinear in the block
+            _set_nested(block, linear_path, ql)
+            injected += 1
+
+    if pending:
+        mx.eval(*pending)
+
+    mem_stats = {
+        "fp16_mb": fp16_bytes / 1e6,
+        "int4_mb": int4_bytes / 1e6,
+        "ratio": fp16_bytes / max(int4_bytes, 1),
+    }
+    return injected, mem_stats
+
+
 # ---------------------------------------------------------------------------
 # Summary helpers
 # ---------------------------------------------------------------------------
@@ -573,6 +712,10 @@ def main() -> None:
     parser.add_argument("--quant-config", type=Path, default=None,
                         help="quant_config.json from analyze_activations.py; "
                              "enables V2 fake activation quantization")
+    parser.add_argument("--mlx-int4", action="store_true",
+                        help="Inject weights as native MLX packed int4 (V3, ~4x memory savings)")
+    parser.add_argument("--group-size", type=int, default=64,
+                        help="Group size for MLX int4 quantization (32, 64, or 128). Default: 64")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -642,12 +785,21 @@ def main() -> None:
         print(f"  Done in {time.time() - t0:.1f}s  →  {baseline_path}")
 
     # ------------------------------------------------------------------
-    # Inject quantised weights
+    # Inject quantised weights (V1: FP16 dequantize  |  V3: MLX int4)
     # ------------------------------------------------------------------
     print("\n=== Injecting AdaRound Weights ===")
     t0 = time.time()
-    n_injected = inject_weights(pipeline, quant_weights)
-    print(f"  {n_injected} layers injected in {time.time() - t0:.1f}s")
+    if args.mlx_int4:
+        n_injected, mem_stats = inject_weights_mlx_int4(
+            pipeline, quant_weights, group_size=args.group_size
+        )
+        print(f"  {n_injected} layers injected as MLX int4 in {time.time() - t0:.1f}s")
+        print(f"  Memory: FP16={mem_stats['fp16_mb']:.1f} MB"
+              f"  →  int4={mem_stats['int4_mb']:.1f} MB"
+              f"  ({mem_stats['ratio']:.2f}× reduction)")
+    else:
+        n_injected = inject_weights(pipeline, quant_weights)
+        print(f"  {n_injected} layers injected in {time.time() - t0:.1f}s")
 
     # ------------------------------------------------------------------
     # V2: Load quant config and apply activation quantization hooks
