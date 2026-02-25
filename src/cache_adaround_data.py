@@ -350,6 +350,8 @@ def main():
                         help="Use every Nth denoising step (default 4 → 25 steps for 100-step)")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite existing cache")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip (image, step) pairs whose .npz already exists in the cache")
     args = parser.parse_args()
 
     output_dir = args.output_dir or (args.calib_dir / "adaround_cache")
@@ -358,9 +360,25 @@ def main():
     samples_out.mkdir(exist_ok=True)
 
     metadata_path = output_dir / "metadata.json"
-    if metadata_path.exists() and not args.force:
+    if metadata_path.exists() and not args.force and not args.resume:
         print(f"Cache already exists at {output_dir}. Use --force to regenerate.")
         return
+
+    # Resume: scan for already-written sample files
+    done_samples: set[tuple[int, int]] = set()
+    if args.resume:
+        for p in samples_out.glob("*.npz"):
+            parts = p.stem.split("_")
+            if len(parts) == 2:
+                done_samples.add((int(parts[0]), int(parts[1])))
+        if done_samples:
+            print(f"Resume mode: {len(done_samples)} samples already cached")
+
+    # Seed shape_info from prior metadata if resuming
+    shape_info_seed: dict = {}
+    if args.resume and metadata_path.exists():
+        with open(metadata_path) as f:
+            shape_info_seed = json.load(f).get("block_shapes", {})
 
     # ------------------------------------------------------------------
     # Load manifest
@@ -412,7 +430,8 @@ def main():
     calib_samples_dir = args.calib_dir / "samples"
 
     collected: List[Dict] = []
-    shape_info: Dict[str, Dict] = {}
+    skip_count = 0
+    shape_info: Dict[str, Dict] = shape_info_seed
     block_names: List[str] = []
     n_mm = 0
     n_uni = 0
@@ -428,6 +447,22 @@ def main():
         img_meta = manifest["images"][img_idx]
         prompt = img_meta["prompt"]
         tqdm.write(f"\n[img {img_idx}] {prompt[:70]}...")
+
+        # Resume: skip entire image if all steps are already cached
+        if args.resume:
+            remaining_steps = [s for s in key_timesteps if (img_idx, s) not in done_samples]
+            if not remaining_steps:
+                for step_idx in key_timesteps:
+                    out_path = samples_out / f"{img_idx:04d}_{step_idx:03d}.npz"
+                    collected.append({
+                        "img_idx": img_idx,
+                        "step_idx": step_idx,
+                        "file": out_path.name,
+                    })
+                    step_pbar.update(1)
+                img_pbar.update(1)
+                skip_count += len(key_timesteps)
+                continue
 
         # Encode text
         try:
@@ -505,6 +540,16 @@ def main():
 
             out_path = samples_out / f"{img_idx:04d}_{step_idx:03d}.npz"
 
+            if args.resume and (img_idx, step_idx) in done_samples:
+                collected.append({
+                    "img_idx": img_idx,
+                    "step_idx": step_idx,
+                    "file": out_path.name,
+                })
+                step_pbar.update(1)
+                skip_count += 1
+                continue
+
             try:
                 data = np.load(sf)
                 x = mx.array(data["x"])
@@ -553,6 +598,8 @@ def main():
     print(f"\n=== Collection Complete ===")
     print(f"  {len(collected)}/{total_samples} samples collected")
     print(f"  {errors} errors")
+    if skip_count:
+        print(f"  Skipped (already cached): {skip_count}")
     print(f"  {elapsed / 60:.1f} min")
 
     # ------------------------------------------------------------------

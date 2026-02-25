@@ -7,7 +7,9 @@ executed at the module level for the CLI path; we test the functions directly
 and mock the pipeline with lightweight Python objects.
 """
 
+import json
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -674,3 +676,81 @@ class TestEndToEnd:
             np.testing.assert_array_equal(np.array(out_plain), np.array(out_hooked))
 
         remove_block_hooks(pipeline_hooked, hooks)
+
+
+# ---------------------------------------------------------------------------
+# Resume logic
+# ---------------------------------------------------------------------------
+
+class TestResumeLogic:
+    """
+    Verifies --resume behaviour at the file-system / condition level.
+    No DiffusionPipeline or model weights required.
+    """
+
+    def test_resume_skips_existing_npz(self, tmp_path):
+        """Pre-existing NPZ files are detected in done_samples via the glob scan."""
+        samples_dir = tmp_path / "samples"
+        samples_dir.mkdir()
+        np.savez_compressed(samples_dir / "0000_000.npz", x=np.array([1.0]))
+        np.savez_compressed(samples_dir / "0000_004.npz", x=np.array([2.0]))
+        np.savez_compressed(samples_dir / "0009_096.npz", x=np.array([3.0]))
+
+        # Replicate the pre-scan logic from cache_adaround_data.py
+        done_samples: set = set()
+        for p in samples_dir.glob("*.npz"):
+            parts = p.stem.split("_")
+            if len(parts) == 2:
+                done_samples.add((int(parts[0]), int(parts[1])))
+
+        assert (0, 0) in done_samples
+        assert (0, 4) in done_samples
+        assert (9, 96) in done_samples
+        assert len(done_samples) == 3
+        assert (0, 1) not in done_samples   # non-existent step
+
+    def test_resume_allows_past_metadata(self, tmp_path):
+        """The early-exit condition is False when --resume is set even if metadata exists."""
+        metadata_path = tmp_path / "metadata.json"
+        metadata_path.write_text("{}")
+
+        args_plain  = types.SimpleNamespace(force=False, resume=False)
+        args_resume = types.SimpleNamespace(force=False, resume=True)
+
+        def early_exit(a):
+            return metadata_path.exists() and not a.force and not a.resume
+
+        # Without --resume: should trigger early exit
+        assert early_exit(args_plain)
+        # With --resume: should NOT trigger early exit
+        assert not early_exit(args_resume)
+
+    def test_resume_seeds_block_shapes(self, tmp_path):
+        """block_shapes from prior metadata.json are loaded into shape_info_seed."""
+        prior_shapes = {
+            "mm0": {"arg_shapes": [[2, 10, 1, 16]], "output_shapes": [[2, 10, 1, 16]], "kwarg_shapes": {}},
+            "mm1": {"arg_shapes": [[2, 10, 1, 16]], "output_shapes": [[2, 10, 1, 16]], "kwarg_shapes": {}},
+        }
+        metadata_path = tmp_path / "metadata.json"
+        metadata_path.write_text(json.dumps({"block_shapes": prior_shapes}))
+
+        args = types.SimpleNamespace(resume=True)
+
+        # Replicate the seeding logic from cache_adaround_data.py
+        shape_info_seed: dict = {}
+        if args.resume and metadata_path.exists():
+            with open(metadata_path) as f:
+                shape_info_seed = json.load(f).get("block_shapes", {})
+
+        assert set(shape_info_seed.keys()) == {"mm0", "mm1"}
+        assert shape_info_seed["mm0"]["arg_shapes"] == [[2, 10, 1, 16]]
+
+    def test_force_overrides_resume(self, tmp_path):
+        """--force alone still bypasses the metadata existence check."""
+        metadata_path = tmp_path / "metadata.json"
+        metadata_path.write_text("{}")
+
+        args = types.SimpleNamespace(force=True, resume=False)
+
+        early_exit = metadata_path.exists() and not args.force and not args.resume
+        assert not early_exit

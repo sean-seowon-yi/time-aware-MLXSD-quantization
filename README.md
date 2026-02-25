@@ -53,7 +53,7 @@ Writes one `.npz` per (image, step) under `calibration_data_100/samples/` and a 
 ```bash
 # ~60 min for 5 images (100-step schedule)
 conda run -n diffusionkit python -m src.cache_adaround_data \
-    --calib-dir calibration_data_100 --num-images 5 --stride 4 [--force]
+    --calib-dir calibration_data_100 --num-images 5 --stride 4 [--force] [--resume]
 ```
 
 #### Step 3W — Optimize AdaRound W4A8 weights
