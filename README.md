@@ -37,12 +37,12 @@ Step 1: Generate calibration latents
 ### Step 1 — Generate calibration latents
 
 ```bash
-# ~6 min for 10 images, ~11h for 1000
+# ~52s/image; 100 images ≈ 87 min
 conda run -n diffusionkit python -m src.generate_calibration_data \
-    --num-images 10 --num-steps 50 --calib-dir calibration_data [--resume]
+    --num-images 100 --num-steps 100 --calib-dir calibration_data_100 [--resume]
 ```
 
-Writes one `.npz` per (image, step) under `calibration_data/samples/` and a `manifest.json`.
+Writes one `.npz` per (image, step) under `calibration_data_100/samples/` and a `manifest.json`.
 
 ---
 
@@ -51,16 +51,16 @@ Writes one `.npz` per (image, step) under `calibration_data/samples/` and a `man
 #### Step 2W — Cache block-level FP16 I/O for AdaRound
 
 ```bash
-# ~30 min for 5 images
+# ~60 min for 5 images (100-step schedule)
 conda run -n diffusionkit python -m src.cache_adaround_data \
-    --calib-dir calibration_data --num-images 5 --stride 5 [--force]
+    --calib-dir calibration_data_100 --num-images 5 --stride 4 [--force]
 ```
 
 #### Step 3W — Optimize AdaRound W4A8 weights
 
 ```bash
 conda run -n diffusionkit python -m src.adaround_optimize \
-    --adaround-cache calibration_data/adaround_cache \
+    --adaround-cache calibration_data_100/adaround_cache \
     --output quantized_weights \
     [--iters 20000] [--batch-size 16] [--bits-w 4] [--bits-a 8] [--blocks mm0,mm1]
 ```
@@ -72,9 +72,9 @@ conda run -n diffusionkit python -m src.adaround_optimize \
 #### Step 2A — Collect per-layer activation statistics
 
 ```bash
-# ~30 min for 5 images
+# ~60 min for 5 images (100-step schedule)
 conda run -n diffusionkit python -m src.collect_layer_activations \
-    --calib-dir calibration_data --num-images 5 --stride 2 [--force]
+    --calib-dir calibration_data_100 --num-images 5 --stride 4 [--force]
 ```
 
 #### Step 3A — Analyze statistics and generate quantization config
@@ -83,8 +83,8 @@ conda run -n diffusionkit python -m src.collect_layer_activations \
 
 ```bash
 conda run -n diffusionkit python -m src.analyze_activations \
-    --stats calibration_data/activations/layer_statistics.json \
-    --output calibration_data/activations/quant_config.json
+    --stats calibration_data_100/activations/layer_statistics.json \
+    --output calibration_data_100/activations/quant_config.json
 ```
 
 Fixed A8 everywhere. Scale from `tensor_absmax` per layer per timestep; post-GELU layers carry per-channel shift vectors for centering before quantization. Outlier channels (range > 2.5× median) get a per-channel `multiplier_vector` for two-scale quantization — stored in `outlier_config` in the output JSON. Use `--use-hist-p999` to clip scale at the 99.9th percentile instead.
@@ -93,8 +93,8 @@ Fixed A8 everywhere. Scale from `tensor_absmax` per layer per timestep; post-GEL
 
 ```bash
 conda run -n diffusionkit python -m src.analyze_activations_multitier \
-    --stats calibration_data/activations/layer_statistics.json \
-    --output calibration_data/activations/quant_config_multitier.json \
+    --stats calibration_data_100/activations/layer_statistics.json \
+    --output calibration_data_100/activations/quant_config_multitier.json \
     [--a4-threshold 6.0] [--a6-threshold 10.0] \
     [--shifted-a4-threshold 5.0] [--shifted-a6-threshold 8.0]
 ```
@@ -105,10 +105,10 @@ Dynamic per-timestep bit selection (A4/A6/A8) with SmoothQuant detection. Runs o
 
 ```bash
 conda run -n diffusionkit python -m src.visualize_activations \
-    --stats calibration_data/activations/layer_statistics.json \
-    --output-dir calibration_data/activations/plots \
-    [--snapshot-steps 0 12 24 40 48] \
-    [--quant-config calibration_data/activations/quant_config.json] \
+    --stats calibration_data_100/activations/layer_statistics.json \
+    --output-dir calibration_data_100/activations/plots \
+    [--snapshot-steps 0 24 48 72 96] \
+    [--quant-config calibration_data_100/activations/quant_config.json] \
     [--plot-distributions]
 ```
 
@@ -130,12 +130,24 @@ conda run -n diffusionkit python -m src.load_adaround_model \
 ```bash
 conda run -n diffusionkit python -m src.load_adaround_model \
     --adaround-output quantized_weights \
-    --quant-config calibration_data/activations/quant_config.json \
+    --quant-config calibration_data_100/activations/quant_config.json \
     --prompt "a tabby cat on a table" \
     --output-image quant_w4a8_actquant.png [--compare]
 ```
 
 V2 applies per-(layer, timestep) fake activation quantization with shift and two-scale outlier handling via a custom Euler inference loop.
+
+**V3 — native MLX int4 weights (~4x memory savings):**
+
+```bash
+conda run -n diffusionkit python -m src.load_adaround_model \
+    --adaround-output quantized_weights \
+    --mlx-int4 --group-size 64 \
+    --prompt "a tabby cat on a table" \
+    --output-image quant_v3.png [--compare]
+```
+
+Note: MLX requires `in_dims ≥ 256` for 4-bit quantization (Metal kernel constraint).
 
 ---
 
@@ -153,10 +165,10 @@ Tests use synthetic tensors and mocked DiffusionKit.
 
 ## Calibration Data Layout
 
-`calibration_data/` (created by `generate_calibration_data.py`):
+`calibration_data_100/` (created by `generate_calibration_data.py`):
 
 ```
-calibration_data/
+calibration_data_100/
 ├── manifest.json
 ├── samples/
 │   └── {img:04d}_{step:03d}.npz       # keys: x, timestep, sigma, step_index, image_id, is_final
