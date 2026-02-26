@@ -167,13 +167,20 @@ def compute_fidelity_metrics(
               "Install with: pip install torch-fidelity")
         return None
 
+    n_gen = len(list(Path(generated_dir).glob("*.png")))
+    n_ref = len(list(Path(reference_dir).glob("*.png")))
+    kid_subset_size = min(n_gen, n_ref, 1000)
+
     metrics = calculate_metrics(
         input1=str(generated_dir),
         input2=str(reference_dir),
         fid=True,
         isc=True,
         kid=True,
+        kid_subset_size=kid_subset_size,
         verbose=False,
+        cuda=False,
+        save_cpu_ram=True,  # forces num_workers=0, avoids shm_manager on macOS
     )
     return {
         "fid": float(metrics.get("frechet_inception_distance", float("nan"))),
