@@ -217,6 +217,147 @@ def load_prompts(csv_path: Path, max_count: int) -> List[str]:
 # Section 1 — Image generation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Naive int8 quantization helpers
+# ---------------------------------------------------------------------------
+
+def _walk_mmdit_linears(mmdit):
+    """
+    Generator yielding (parent_obj, attr_name, full_name) for every
+    nn.Linear / nn.QuantizedLinear in the DiT transformer blocks.
+
+    Skips adaLN_modulation and any identity projections.
+    Works on both pre- and post-quantization models.
+    """
+    import mlx.nn as nn
+
+    def _walk_block(tb, prefix):
+        for attr in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            layer = getattr(tb.attn, attr, None)
+            if isinstance(layer, (nn.Linear, nn.QuantizedLinear)):
+                yield (tb.attn, attr, f"{prefix}.attn.{attr}")
+        if hasattr(tb, "mlp"):
+            for attr in ("fc1", "fc2"):
+                layer = getattr(tb.mlp, attr, None)
+                if isinstance(layer, (nn.Linear, nn.QuantizedLinear)):
+                    yield (tb.mlp, attr, f"{prefix}.mlp.{attr}")
+
+    if hasattr(mmdit, "multimodal_transformer_blocks"):
+        for i, block in enumerate(mmdit.multimodal_transformer_blocks):
+            yield from _walk_block(block.image_transformer_block, f"mm{i}.img")
+            yield from _walk_block(block.text_transformer_block, f"mm{i}.txt")
+
+    if hasattr(mmdit, "unified_transformer_blocks"):
+        for i, block in enumerate(mmdit.unified_transformer_blocks):
+            yield from _walk_block(block.transformer_block, f"uni{i}")
+
+
+def inject_weights_naive_int8(
+    pipeline,
+    group_size: int = 64,
+    bits: int = 8,
+) -> int:
+    """
+    Quantize all eligible nn.Linear weights in the DiT to int8 using
+    mlx.quantize and replace them with nn.QuantizedLinear in-place.
+
+    Layers with in_features < max(128, group_size) are skipped (MLX
+    minimum-column constraint).
+
+    Returns the count of injected layers.
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    mmdit = pipeline.mmdit
+    min_cols = max(128, group_size)
+    pending = []
+    count = 0
+
+    for parent, attr, full_name in _walk_mmdit_linears(mmdit):
+        layer = getattr(parent, attr)
+        w = layer.weight
+        in_features = w.shape[1]
+        out_features = w.shape[0]
+
+        if in_features < min_cols:
+            print(f"WARNING: Skipping {full_name} "
+                  f"(in_features={in_features} < {min_cols})")
+            continue
+
+        w_q, scales, biases = mx.quantize(w, group_size=group_size, bits=bits)
+        has_bias = getattr(layer, "bias", None) is not None
+
+        ql = nn.QuantizedLinear(
+            in_features, out_features,
+            bias=has_bias, group_size=group_size, bits=bits,
+        )
+        ql.weight = w_q
+        ql.scales = scales
+        ql.biases = biases
+        if has_bias:
+            ql.bias = layer.bias
+
+        setattr(parent, attr, ql)
+        pending.extend([ql.weight, ql.scales, ql.biases])
+        count += 1
+
+    if pending:
+        mx.eval(*pending)
+
+    return count
+
+
+class _DynamicInt8ActLayer:
+    """
+    Proxy that applies dynamic per-tensor symmetric int8 fake-quantization
+    to the input activation before forwarding to the wrapped layer.
+
+    scale = max(|x|) / 127
+    x_q   = round(x / scale).clip(-127, 127) * scale
+    """
+
+    def __init__(self, layer):
+        self.layer = layer
+
+    def __call__(self, x):
+        import mlx.core as mx
+        scale = float(mx.max(mx.abs(x)).item()) / 127.0
+        if scale < 1e-8:
+            return self.layer(x)
+        x = mx.clip(mx.round(x / scale), -127, 127) * scale
+        return self.layer(x)
+
+    def __getattr__(self, name):
+        return getattr(self.layer, name)
+
+
+def apply_dynamic_int8_act_hooks(mmdit):
+    """
+    Wrap every walked linear layer with _DynamicInt8ActLayer.
+
+    Returns (proxies, patches) where patches is a list of
+    (parent, attr, original_layer) tuples used for cleanup.
+    """
+    proxies = []
+    patches = []
+
+    for parent, attr, _ in _walk_mmdit_linears(mmdit):
+        layer = getattr(parent, attr)
+        proxy = _DynamicInt8ActLayer(layer)
+        setattr(parent, attr, proxy)
+        proxies.append(proxy)
+        patches.append((parent, attr, layer))
+
+    return proxies, patches
+
+
+def remove_dynamic_int8_act_hooks(patches) -> None:
+    """Restore original layers from (parent, attr, original) patch tuples."""
+    for parent, attr, original in patches:
+        setattr(parent, attr, original)
+
+
 def _load_pipeline(
     config: str,
     adaround_output: Optional[Path],
@@ -243,9 +384,21 @@ def _load_pipeline(
     )
     pipeline.check_and_load_models()
 
-    quant_ctx = {"proxies": [], "act_quant_patches": [], "step_keys_sorted": []}
+    quant_ctx = {
+        "proxies": [],
+        "act_quant_patches": [],
+        "step_keys_sorted": [],
+        "remove_act_fn": None,
+    }
 
     if config == "fp16":
+        return pipeline, quant_ctx
+
+    if config == "naive_int8":
+        inject_weights_naive_int8(pipeline, group_size=group_size)
+        _, patches = apply_dynamic_int8_act_hooks(pipeline.mmdit)
+        quant_ctx["act_quant_patches"] = patches
+        quant_ctx["remove_act_fn"] = remove_dynamic_int8_act_hooks
         return pipeline, quant_ctx
 
     # Weight injection (adaround_w4 / adaround_w4a8 / taqdit_w4a8 / mlx_int4)
@@ -378,8 +531,12 @@ def generate_images(
 
         # Remove hooks before pipeline goes out of scope
         if quant_ctx["act_quant_patches"]:
-            from src.load_adaround_model import remove_act_quant_hooks
-            remove_act_quant_hooks(quant_ctx["act_quant_patches"])
+            remove_fn = quant_ctx.get("remove_act_fn")
+            if remove_fn is not None:
+                remove_fn(quant_ctx["act_quant_patches"])
+            else:
+                from src.load_adaround_model import remove_act_quant_hooks
+                remove_act_quant_hooks(quant_ctx["act_quant_patches"])
 
         image.save(img_path)
         timings.append(elapsed)
@@ -446,7 +603,7 @@ def main() -> None:
     # Config
     parser.add_argument(
         "--config", type=str, default="fp16",
-        choices=["fp16", "adaround_w4", "adaround_w4a8", "taqdit_w4a8", "mlx_int4"],
+        choices=["fp16", "naive_int8", "adaround_w4", "adaround_w4a8", "taqdit_w4a8", "mlx_int4"],
         help="Quantization config to benchmark",
     )
     parser.add_argument("--adaround-output", type=Path, default=None,

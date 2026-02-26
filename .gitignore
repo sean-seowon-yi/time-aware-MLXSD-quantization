@@ -1,6 +1,7 @@
 # Ignore everything at root except what we list
 /*
 !/src/
+!/tests/
 !README.md
 !.gitignore
 !requirements.txt

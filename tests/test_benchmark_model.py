@@ -23,6 +23,10 @@ from src.benchmark_model import (
     load_prompts,
     generate_images,
     _print_results,
+    inject_weights_naive_int8,
+    _DynamicInt8ActLayer,
+    apply_dynamic_int8_act_hooks,
+    remove_dynamic_int8_act_hooks,
 )
 
 
@@ -346,3 +350,198 @@ class TestPrintResults:
         _print_results("fp16", lat, mem, None)
         captured = capsys.readouterr()
         assert "fp16" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by naive-int8 tests
+# ---------------------------------------------------------------------------
+
+def _make_mock_pipeline(dim=256):
+    """
+    Build a minimal pipeline-like object with the MMDiT block structure
+    required by _walk_mmdit_linears, using real mlx.nn.Linear instances.
+    """
+    import mlx.nn as nn
+
+    class _Attn:
+        pass
+
+    class _Mlp:
+        pass
+
+    class _TransformerBlock:
+        pass
+
+    class _MMBlock:
+        pass
+
+    class _MMDiT:
+        pass
+
+    class _Pipeline:
+        pass
+
+    def _make_attn(d):
+        a = _Attn()
+        a.q_proj = nn.Linear(d, d, bias=False)
+        a.k_proj = nn.Linear(d, d, bias=False)
+        a.v_proj = nn.Linear(d, d, bias=False)
+        a.o_proj = nn.Linear(d, d, bias=False)
+        return a
+
+    def _make_mlp(d):
+        m = _Mlp()
+        m.fc1 = nn.Linear(d, d * 4)
+        m.fc2 = nn.Linear(d * 4, d)
+        return m
+
+    def _make_tb(d):
+        tb = _TransformerBlock()
+        tb.attn = _make_attn(d)
+        tb.mlp = _make_mlp(d)
+        return tb
+
+    mmdit = _MMDiT()
+    mm_block = _MMBlock()
+    mm_block.image_transformer_block = _make_tb(dim)
+    mm_block.text_transformer_block = _make_tb(dim)
+    mmdit.multimodal_transformer_blocks = [mm_block]
+    mmdit.unified_transformer_blocks = []
+
+    pipeline = _Pipeline()
+    pipeline.mmdit = mmdit
+    return pipeline
+
+
+# ---------------------------------------------------------------------------
+# TestInjectWeightsNaiveInt8
+# ---------------------------------------------------------------------------
+
+class TestInjectWeightsNaiveInt8:
+    """Tests for inject_weights_naive_int8 using a mock pipeline."""
+
+    def test_layers_replaced_with_quantized_linear(self):
+        import mlx.nn as nn
+        pipeline = _make_mock_pipeline(dim=256)
+        inject_weights_naive_int8(pipeline, group_size=64, bits=8)
+        block = pipeline.mmdit.multimodal_transformer_blocks[0]
+        assert isinstance(block.image_transformer_block.attn.q_proj, nn.QuantizedLinear)
+        assert isinstance(block.image_transformer_block.attn.k_proj, nn.QuantizedLinear)
+        assert isinstance(block.image_transformer_block.mlp.fc1, nn.QuantizedLinear)
+        assert isinstance(block.text_transformer_block.attn.q_proj, nn.QuantizedLinear)
+        assert isinstance(block.text_transformer_block.mlp.fc2, nn.QuantizedLinear)
+
+    def test_count_is_correct_for_one_mm_block(self):
+        # 1 mm block: img (4 attn + 2 mlp) + txt (4 attn + 2 mlp) = 12 layers
+        pipeline = _make_mock_pipeline(dim=256)
+        count = inject_weights_naive_int8(pipeline, group_size=64, bits=8)
+        assert count == 12
+
+    def test_small_attn_layers_skipped(self):
+        """Layers with in_features < max(128, group_size) are not quantized."""
+        import mlx.nn as nn
+        # dim=32: attn layers have in_features=32 < 128 → skipped
+        # fc1 has in_features=32 < 128 → skipped
+        # fc2 has in_features=128, 128 < 128 = False → injected
+        pipeline = _make_mock_pipeline(dim=32)
+        count = inject_weights_naive_int8(pipeline, group_size=64, bits=8)
+        block = pipeline.mmdit.multimodal_transformer_blocks[0]
+        # attn layers not quantized (in_features=32)
+        assert isinstance(block.image_transformer_block.attn.q_proj, nn.Linear)
+        # fc2 (in_features=128) should be quantized
+        assert isinstance(block.image_transformer_block.mlp.fc2, nn.QuantizedLinear)
+        # count < full 12 since most layers were skipped
+        assert count < 12
+
+    def test_returns_nonzero_count(self):
+        pipeline = _make_mock_pipeline(dim=256)
+        count = inject_weights_naive_int8(pipeline, group_size=64, bits=8)
+        assert count > 0
+
+    def test_quantized_linear_has_expected_group_size_and_bits(self):
+        import mlx.nn as nn
+        pipeline = _make_mock_pipeline(dim=256)
+        inject_weights_naive_int8(pipeline, group_size=64, bits=8)
+        ql = pipeline.mmdit.multimodal_transformer_blocks[0].image_transformer_block.attn.q_proj
+        assert isinstance(ql, nn.QuantizedLinear)
+        assert ql.group_size == 64
+        assert ql.bits == 8
+
+
+# ---------------------------------------------------------------------------
+# TestDynamicInt8ActLayer
+# ---------------------------------------------------------------------------
+
+class TestDynamicInt8ActLayer:
+    """Tests for _DynamicInt8ActLayer proxy class."""
+
+    def test_output_shape_preserved(self):
+        import mlx.core as mx
+        import mlx.nn as nn
+        linear = nn.Linear(8, 16, bias=False)
+        proxy = _DynamicInt8ActLayer(linear)
+        x = mx.random.normal((3, 8))
+        out = proxy(x)
+        mx.eval(out)
+        assert out.shape == (3, 16)
+
+    def test_near_zero_input_passes_through_unchanged(self):
+        """When scale < 1e-8, output must be identical to direct layer call."""
+        import mlx.core as mx
+        import mlx.nn as nn
+        linear = nn.Linear(4, 4, bias=False)
+        proxy = _DynamicInt8ActLayer(linear)
+        x = mx.zeros((1, 4))
+        out_proxy = proxy(x)
+        out_direct = linear(x)
+        mx.eval(out_proxy, out_direct)
+        assert mx.allclose(out_proxy, out_direct, atol=1e-6).item()
+
+    def test_quantization_rounds_activations(self):
+        """With non-zero input, the quantized path produces different output
+        from the raw float path for a weight matrix that magnifies differences."""
+        import mlx.core as mx
+        import mlx.nn as nn
+        # Use a large weight to amplify rounding errors
+        linear = nn.Linear(4, 1, bias=False)
+        # Set weight to large values so rounding changes are visible
+        import numpy as np
+        w = np.ones((1, 4), dtype=np.float16) * 100.0
+        linear.weight = mx.array(w)
+        proxy = _DynamicInt8ActLayer(linear)
+        # Input designed to have fractional values after /scale
+        # scale = max(|x|)/127; with x=[1.5, 2.3, -0.7, 1.1]:
+        # scale ≈ 2.3/127 ≈ 0.0181; rounded values differ from originals
+        x = mx.array([[1.5, 2.3, -0.7, 1.1]])
+        out_proxy = proxy(x)
+        out_direct = linear(x)
+        mx.eval(out_proxy, out_direct)
+        # The outputs should differ due to int8 rounding
+        diff = float(mx.abs(out_proxy - out_direct).item())
+        assert diff > 0.0
+
+    def test_getattr_forwards_to_inner_layer(self):
+        """__getattr__ should forward attribute access to the wrapped layer."""
+        import mlx.core as mx
+        import mlx.nn as nn
+        linear = nn.Linear(4, 4, bias=False)
+        proxy = _DynamicInt8ActLayer(linear)
+        # weight should be accessible via proxy and match the inner layer's
+        assert proxy.weight is linear.weight
+
+    def test_apply_and_remove_hooks_restores_original(self):
+        """apply/remove_dynamic_int8_act_hooks round-trip."""
+        import mlx.nn as nn
+        pipeline = _make_mock_pipeline(dim=256)
+        # First inject weights so the walk finds QuantizedLinear
+        inject_weights_naive_int8(pipeline, group_size=64, bits=8)
+        # Capture one layer before hooking
+        attn = pipeline.mmdit.multimodal_transformer_blocks[0].image_transformer_block.attn
+        original_q = attn.q_proj
+        proxies, patches = apply_dynamic_int8_act_hooks(pipeline.mmdit)
+        # After hooks: should be wrapped
+        assert isinstance(attn.q_proj, _DynamicInt8ActLayer)
+        # Remove
+        remove_dynamic_int8_act_hooks(patches)
+        # After removal: should be original QuantizedLinear
+        assert attn.q_proj is original_q
