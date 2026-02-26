@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Planning Rule
+
+**Before implementing any non-trivial feature or modification, write a plan file to `plans/`.**
+The plan must include: goal, method, key design decisions, files to change, and output format.
+Use snake_case filenames matching the feature (e.g., `plans/animate_channel_dist.md`).
+This applies to all new scripts, new flags on existing scripts, and architectural changes.
+
 ## Project Overview
 
 MLX-based diffusion (SD3-Medium) pipeline with post-training quantization (PTQ) tooling. The main focus is implementing **TaQ-DiT** adaptive rounding (AdaRound) for W4A8 quantization of the SD3-Medium DiT backbone using Apple's MLX framework.
@@ -183,3 +190,5 @@ pipeline.mmdit.load_weights(pipeline.load_mmdit(only_modulation_dict=True), stri
 ## Critical Lesson
 
 **Always read DiffusionKit source before implementing anything that touches the pipeline.** Guessing at the Euler formula, sigma broadcasting, or modulation caching causes subtle bugs that are hard to diagnose. See `LESSONS_READ_SOURCE_FIRST.md` for details.
+
+**Always save plans in the /plans folder with relevant context**

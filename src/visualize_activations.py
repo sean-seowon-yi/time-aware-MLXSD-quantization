@@ -16,9 +16,10 @@ Usage:
 """
 
 import argparse
+import io
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -559,6 +560,139 @@ def plot_distribution_temporal_evolution(ts_dir: Path, layer_name: str,
 
 
 # ---------------------------------------------------------------------------
+# GIF animation: per-channel distribution evolving over timesteps
+# ---------------------------------------------------------------------------
+
+def animate_channel_dist(
+    timesteps: Dict,
+    sigma_map: Dict,
+    step_keys: List[str],
+    layer_name: str,
+    out_dir: Path,
+    fps: int = 3,
+) -> Optional[Path]:
+    """
+    Render a GIF showing per-channel absmax distribution evolving over timesteps.
+
+    Uses the same two-panel layout as plot_channel_dist (sorted bar + histogram)
+    with fixed axes across all frames so the motion is legible.
+    Frames are ordered high-σ → low-σ (high noise → clean image).
+
+    Parameters
+    ----------
+    fps : int
+        Frames per second (default 3 → ~333 ms/frame; 25 steps ≈ 8 s).
+
+    Returns
+    -------
+    Path to the saved GIF, or None if the layer has no data.
+    """
+    from PIL import Image
+
+    # Collect absmax arrays for all timesteps to fix axis limits
+    all_absmax = []
+    for key in step_keys:
+        s = timesteps[key].get(layer_name)
+        if s:
+            avg_min = np.array(s["avg_min"])
+            avg_max = np.array(s["avg_max"])
+            all_absmax.append(np.maximum(np.abs(avg_min), np.abs(avg_max)))
+
+    if not all_absmax:
+        print(f"  SKIP {layer_name}: no data")
+        return None
+
+    global_ymax = float(max(a.max() for a in all_absmax)) * 1.05
+    global_hist_xmax = global_ymax
+
+    # Pre-compute max histogram count across all frames for stable y-axis
+    max_hist_count = 0
+    for absmax in all_absmax:
+        counts, _ = np.histogram(absmax, bins=60, range=(0, global_hist_xmax))
+        max_hist_count = max(max_hist_count, int(counts.max()))
+    max_hist_count = int(max_hist_count * 1.1)
+
+    frames = []
+    for key in step_keys:
+        s = timesteps[key].get(layer_name)
+        if not s:
+            continue
+
+        sigma = sigma_map[int(key)]
+        avg_min = np.array(s["avg_min"])
+        avg_max = np.array(s["avg_max"])
+        absmax = np.maximum(np.abs(avg_min), np.abs(avg_max))
+        C = len(absmax)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+
+        # Left: sorted per-channel absmax
+        ax = axes[0]
+        sorted_abs = np.sort(absmax)[::-1]
+        ax.bar(np.arange(C), sorted_abs, width=1.0,
+               color=layer_color(layer_name), edgecolor="none")
+        p50 = np.percentile(absmax, 50)
+        p99 = np.percentile(absmax, 99)
+        ax.axhline(p50, color="blue", linewidth=1.2, linestyle="--",
+                   label=f"p50={p50:.2f}")
+        ax.axhline(p99, color="red", linewidth=1.2, linestyle="--",
+                   label=f"p99={p99:.2f}")
+        ax.set_xlabel("channel (sorted by absmax)")
+        ax.set_ylabel("absmax")
+        ax.set_ylim(0, global_ymax)
+        ax.set_title(f"Per-channel absmax — {layer_name}\nStep {key}  σ={sigma:.3f}")
+        ax.legend(fontsize=9)
+        ax.grid(axis="y", alpha=0.3)
+
+        # Right: histogram of absmax values
+        ax = axes[1]
+        counts, edges = np.histogram(absmax, bins=60, range=(0, global_hist_xmax))
+        bin_width = edges[1] - edges[0]
+        ax.bar(edges[:-1], counts, width=bin_width,
+               color=layer_color(layer_name), edgecolor="none", alpha=0.8)
+        ax.axvline(p50, color="blue", linewidth=1.5, linestyle="--",
+                   label=f"p50={p50:.2f}")
+        ax.axvline(p99, color="red", linewidth=1.5, linestyle="--",
+                   label=f"p99={p99:.2f}")
+        if "shift" in s:
+            shift_abs = np.abs(np.array(s["shift"]))
+            ax.axvline(np.median(shift_abs), color="green", linewidth=1.5,
+                       linestyle=":", label=f"shift median={np.median(shift_abs):.2f}")
+        ax.set_xlabel("absmax value")
+        ax.set_xlim(0, global_hist_xmax)
+        ax.set_ylim(0, max_hist_count)
+        ax.set_ylabel("# channels")
+        ax.set_title("Distribution of per-channel absmax")
+        ax.legend(fontsize=9)
+        ax.grid(axis="y", alpha=0.3)
+
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100)
+        plt.close(fig)
+        buf.seek(0)
+        frames.append(Image.open(buf).copy())
+        buf.close()
+
+    if not frames:
+        return None
+
+    safe_name = layer_name.replace(".", "_")
+    gif_path = out_dir / f"anim_{safe_name}.gif"
+    frame_ms = int(1000 / fps)
+    frames[0].save(
+        gif_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=frame_ms,
+        loop=0,
+    )
+    print(f"  ✓ {gif_path.name}  ({len(frames)} frames @ {fps} fps)")
+    return gif_path
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -572,6 +706,12 @@ def main():
                         help="Optional quant_config.json for overlaying quantization levels")
     parser.add_argument("--plot-distributions", action="store_true",
                         help="Generate raw distribution plots with shift/quant overlays")
+    parser.add_argument("--animate", action="store_true",
+                        help="Generate GIFs: top N most-variable post-GELU layers + least-variable layer")
+    parser.add_argument("--animate-n", type=int, default=3,
+                        help="Number of most-variable post-GELU layers to animate (default 3)")
+    parser.add_argument("--animate-fps", type=int, default=3,
+                        help="GIF frame rate in fps (default 3)")
     args = parser.parse_args()
 
     out_dir = args.output_dir or (args.stats.parent / "plots")
@@ -706,6 +846,38 @@ def main():
                 plot_distribution_temporal_evolution(
                     ts_dir, layer_name, step_keys, sigma_map, out_dir
                 )
+
+    # --- GIF animations ---
+    if args.animate:
+        print("\n=== Animations ===")
+
+        # Compute variability for all layers
+        all_variability = []
+        for name in layer_names:
+            vals = [timesteps[k][name]["tensor_absmax"]
+                    for k in step_keys if name in timesteps[k]]
+            if vals:
+                all_variability.append((name, max(vals) / (min(vals) + 1e-6)))
+        all_variability.sort(key=lambda x: -x[1])
+
+        # Most variable post-GELU layers
+        pg_variable = [(n, v) for n, v in all_variability if n.endswith(".mlp.fc2")]
+        top_pg = [n for n, _ in pg_variable[: args.animate_n]]
+
+        # Least variable layer across all types (contrast)
+        least_variable = all_variability[-1][0] if all_variability else None
+
+        layers_to_animate = top_pg[:]
+        if least_variable and least_variable not in layers_to_animate:
+            layers_to_animate.append(least_variable)
+
+        print(f"  Most-variable post-GELU: {top_pg}")
+        print(f"  Least-variable (contrast): {least_variable}")
+
+        for layer in layers_to_animate:
+            animate_channel_dist(
+                timesteps, sigma_map, step_keys, layer, out_dir, fps=args.animate_fps
+            )
 
     print(f"\n✓ All plots saved to {out_dir}")
 
