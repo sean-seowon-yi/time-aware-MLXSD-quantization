@@ -210,11 +210,13 @@ def plot_heatmap(timesteps, sigma_map, step_keys, layer_names, out_dir: Path,
             if s:
                 matrix[i, j] = s["tensor_absmax"]
 
+    # Compute variability for all layers (used for annotation regardless of sort_by)
+    valid = ~np.isnan(matrix).all(axis=1)
+    row_range = np.nanmax(matrix, axis=1) / (np.nanmin(matrix, axis=1) + 1e-6)
+    row_range[~valid] = 0
+
     # Sort rows
     if sort_by == "variability":
-        valid = ~np.isnan(matrix).all(axis=1)
-        row_range = np.nanmax(matrix, axis=1) / (np.nanmin(matrix, axis=1) + 1e-6)
-        row_range[~valid] = 0
         order = np.argsort(-row_range)
     elif sort_by == "absmax":
         order = np.argsort(-np.nanmax(matrix, axis=1))
@@ -233,8 +235,10 @@ def plot_heatmap(timesteps, sigma_map, step_keys, layer_names, out_dir: Path,
     im = ax.imshow(log_matrix, aspect="auto", cmap="YlOrRd",
                    extent=[sigmas[0], sigmas[-1], len(names_sorted) - 0.5, -0.5])
 
+    variability_sorted = row_range[order]
+    tick_labels = [f"{name}  {v:.1f}×" for name, v in zip(names_sorted, variability_sorted)]
     ax.set_yticks(np.arange(len(names_sorted)))
-    ax.set_yticklabels(names_sorted, fontsize=6)
+    ax.set_yticklabels(tick_labels, fontsize=6)
     ax.set_xlabel("σ (noise level)")
     ax.set_title(f"Activation Heatmap — log(1+absmax)  [sorted by {sort_by}]")
 
@@ -570,6 +574,7 @@ def animate_channel_dist(
     layer_name: str,
     out_dir: Path,
     fps: int = 3,
+    label: str = "",
 ) -> Optional[Path]:
     """
     Render a GIF showing per-channel absmax distribution evolving over timesteps.
@@ -640,7 +645,8 @@ def animate_channel_dist(
         ax.set_xlabel("channel (sorted by absmax)")
         ax.set_ylabel("absmax")
         ax.set_ylim(0, global_ymax)
-        ax.set_title(f"Per-channel absmax — {layer_name}\nStep {key}  σ={sigma:.3f}")
+        title_top = f"{label}  —  {layer_name}" if label else f"Per-channel absmax — {layer_name}"
+        ax.set_title(f"{title_top}\nStep {key}  σ={sigma:.3f}")
         ax.legend(fontsize=9)
         ax.grid(axis="y", alpha=0.3)
 
@@ -690,6 +696,16 @@ def animate_channel_dist(
     )
     print(f"  ✓ {gif_path.name}  ({len(frames)} frames @ {fps} fps)")
     return gif_path
+
+
+# ---------------------------------------------------------------------------
+# Helpers for animation labels
+# ---------------------------------------------------------------------------
+
+def _ordinal(n: int) -> str:
+    if 11 <= (n % 100) <= 13:
+        return f"{n}th"
+    return f"{n}{('th', 'st', 'nd', 'rd', 'th')[min(n % 10, 4)]}"
 
 
 # ---------------------------------------------------------------------------
@@ -860,23 +876,31 @@ def main():
                 all_variability.append((name, max(vals) / (min(vals) + 1e-6)))
         all_variability.sort(key=lambda x: -x[1])
 
-        # Most variable post-GELU layers
-        pg_variable = [(n, v) for n, v in all_variability if n.endswith(".mlp.fc2")]
-        top_pg = [n for n, _ in pg_variable[: args.animate_n]]
+        # Top N most variable layers (all types)
+        top_layers_with_var = all_variability[: args.animate_n]
 
         # Least variable layer across all types (contrast)
         least_variable = all_variability[-1][0] if all_variability else None
 
-        layers_to_animate = top_pg[:]
-        if least_variable and least_variable not in layers_to_animate:
-            layers_to_animate.append(least_variable)
+        layers_with_labels = []
+        for rank, (name, var) in enumerate(top_layers_with_var, 1):
+            if rank == 1:
+                lbl = f"Most variable overall  ({var:.1f}× range)"
+            else:
+                lbl = f"{_ordinal(rank)} most variable  ({var:.1f}× range)"
+            layers_with_labels.append((name, lbl))
 
-        print(f"  Most-variable post-GELU: {top_pg}")
+        if least_variable and least_variable not in [n for n, _ in layers_with_labels]:
+            lv_var = all_variability[-1][1]
+            layers_with_labels.append((least_variable, f"Most constant  ({lv_var:.1f}× range)"))
+
+        print(f"  Top {args.animate_n} most variable (all types): {[n for n, _ in top_layers_with_var]}")
         print(f"  Least-variable (contrast): {least_variable}")
 
-        for layer in layers_to_animate:
+        for layer, lbl in layers_with_labels:
             animate_channel_dist(
-                timesteps, sigma_map, step_keys, layer, out_dir, fps=args.animate_fps
+                timesteps, sigma_map, step_keys, layer, out_dir,
+                fps=args.animate_fps, label=lbl,
             )
 
     print(f"\n✓ All plots saved to {out_dir}")
