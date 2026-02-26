@@ -470,7 +470,7 @@ def _generate_single_image(
             seed=seed,
             negative_text="",
         )
-        return images[0]
+        return images
 
 
 def generate_images(
