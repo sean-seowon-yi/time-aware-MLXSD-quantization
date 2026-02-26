@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MLX-based diffusion (SD3-Medium) pipeline with post-training quantization (PTQ) tooling. The main focus is implementing **TaQ-DiT** adaptive rounding (AdaRound) for W4A8 quantization of the SD3-Medium DiT backbone using Apple's MLX framework.
 
+Extended pipeline adds **HTG + Bayesian Bits** (arXiv 2503.06930, 2005.07093): agglomerative timestep clustering partitions the denoising trajectory into G groups; Bayesian Bits learns per-layer W2/W4/W8 bit-widths per group via L0 hard-concrete gating; AdaRound + activation-scale optimization runs independently per group.
+
 ## Environment
 
 Scripts must run inside the `diffusionkit` conda environment:
@@ -96,6 +98,74 @@ conda run -n diffusionkit python -m src.load_adaround_model \
     --prompt "a tabby cat on a table" \
     --output-image quant_w4a8_actquant.png [--compare]
 ```
+
+## HTG + Bayesian Bits Extended Pipeline
+
+```bash
+# Stage 0 — HTG Clustering
+conda run -n diffusionkit python -m src.htg_cluster \
+    --stats calibration_data_100/activations/layer_statistics.json \
+    --output htg_groups.json [--n-groups 5]
+
+# Stage 1 — Bayesian Bits (per group)
+conda run -n diffusionkit python -m src.bayesianbits_optimize \
+    --adaround-cache calibration_data_100/adaround_cache \
+    --htg-groups htg_groups.json --output bb_config.json \
+    [--iters 20000] [--gating-lambda 0.01] [--blocks mm0]
+
+# Stages 2+3 — Per-group shift + outlier config
+conda run -n diffusionkit python -m src.analyze_activations \
+    --stats calibration_data_100/activations/layer_statistics.json \
+    --htg-groups htg_groups.json --output quant_config_htg.json
+
+# Stages 4+5 — Per-group AdaRound + joint reconstruction
+conda run -n diffusionkit python -m src.adaround_optimize \
+    --adaround-cache calibration_data_100/adaround_cache \
+    --output quantized_weights_htg \
+    --htg-groups htg_groups.json --bb-config bb_config.json \
+    [--iters 20000] [--blocks mm0]
+```
+
+### HTG Data Flow
+
+```
+collect_layer_activations.py + cache_adaround_data.py  (existing, reused)
+
+htg_cluster.py  (adjacent agglomerative on per-layer shift vectors)
+    → htg_groups.json
+      global_groups: {g: {timestep_indices, step_keys, sigma_range}}
+      per_layer_z_bar: {layer: {g: [z̄_c, ...]}}
+
+bayesianbits_optimize.py  (hierarchical quant + L0 hard-concrete gating, per group)
+    → bb_config.json
+      {group_g: {block.linear_path: bits (2|4|8)}}
+
+analyze_activations.py --htg-groups  (per-group scale/shift/outlier)
+    → quant_config_htg.json  (format: per_group_quant_config_htg_v1)
+
+adaround_optimize.py --htg-groups --bb-config  (one pass per group)
+    → quantized_weights_htg/group_{g}/weights/{block_name}.npz
+    → quantized_weights_htg/group_{g}/config.json
+    → quantized_weights_htg/config.json
+```
+
+### Key HTG Implementation Details
+
+**adjacent_agglomerative()** (`htg_cluster.py`): O(T²) greedy merge; only adjacent cluster
+pairs are eligible. Centroid distance = L2 norm between group averages of shift vectors.
+Produces monotone (non-decreasing) group labels.
+
+**Consensus partition** (`htg_cluster.py`): Each layer produces its own partition boundaries.
+Global boundaries = median boundary per slot across all layers, used by Stages 1 and 4+5.
+Per-layer z̄ is computed from per-layer partitions for Stages 2+3 (faithful to paper).
+
+**BBParams** (`bayesianbits_optimize.py`): holds `log_alphas_4`, `log_alphas_8` (per layer,
+shape=W.shape), `a_scales` (per layer, shape=(1,)). Nested scales: s_2=absmax, s_4=s_2/3,
+s_8=s_4/9. Gate finalization: frac_4<0.5→W2; frac_4≥0.5,frac_8<0.5→W4; both≥0.5→W8.
+
+**HTG mode in adaround_optimize.py**: `--htg-groups` activates per-group sample filtering
+(by `global_groups[g]["timestep_indices"]`); `--bb-config` sets block-level effective bits
+as the median of per-layer bits from bb_config[group_id].
 
 ## Architecture
 

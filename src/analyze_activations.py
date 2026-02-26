@@ -10,13 +10,25 @@ Reads layer_statistics.json produced by collect_layer_activations.py and outputs
   2. Per-channel shift vectors for post-GELU layers (passed through unchanged)
   3. sigma_map for inference-time timestep lookup
 
+HTG mode (--htg-groups): when htg_groups.json is provided, outputs a per-group
+quant_config_htg.json using pre-computed per_layer_z_bar from Stage 0. Each group
+gets its own scale, shift, and outlier_config derived from the average activation
+statistics across its constituent timesteps.
+
 For experimental multi-tier (A4/A6/A8) dynamic switching, see:
   src/analyze_activations_multitier.py
 
 Usage:
+    # Standard per-timestep config:
     conda run -n diffusionkit python -m src.analyze_activations \\
         --stats /path/to/calibration_data/activations/layer_statistics.json \\
         --output /path/to/calibration_data/activations/quant_config.json
+
+    # HTG per-group config:
+    conda run -n diffusionkit python -m src.analyze_activations \\
+        --stats /path/to/calibration_data/activations/layer_statistics.json \\
+        --htg-groups htg_groups.json \\
+        --output quant_config_htg.json
 """
 
 import argparse
@@ -144,6 +156,88 @@ def identify_outlier_channels(
 # Main
 # ---------------------------------------------------------------------------
 
+def _build_per_group_config(
+    htg_groups: Dict,
+    per_step_full: Dict,
+    layer_names: List[str],
+    use_hist_p999: bool,
+) -> Dict:
+    """
+    Build per-group quant config using HTG group definitions.
+
+    For each group g and each layer:
+      - scale = max tensor_absmax across group's timesteps
+      - shift = per_layer_z_bar[layer][g] (pre-computed averaged shift from Stage 0)
+      - outlier_config = identify_outlier_channels on group-averaged avg_min/avg_max
+
+    Returns per_group_config dict keyed by group_id (str).
+    """
+    global_groups = htg_groups["global_groups"]
+    per_layer_z_bar = htg_groups.get("per_layer_z_bar", {})
+    step_keys = htg_groups.get("step_keys", [])
+
+    per_group_config: Dict[str, Dict] = {}
+    per_group_outlier: Dict[str, Dict] = {}
+
+    for group_id, group_info in global_groups.items():
+        group_step_keys = group_info.get("step_keys", [
+            step_keys[i] for i in group_info["timestep_indices"]
+            if i < len(step_keys)
+        ])
+
+        per_group_config[group_id] = {}
+        per_group_outlier[group_id] = {}
+
+        for layer_name in layer_names:
+            # Aggregate activation stats across the group's timesteps
+            absmax_vals = []
+            hist_p999_vals = []
+            avg_min_list = []
+            avg_max_list = []
+
+            for sk in group_step_keys:
+                data = per_step_full.get(sk, {}).get(layer_name, {})
+                if data:
+                    am = data.get("tensor_absmax")
+                    if am is not None:
+                        absmax_vals.append(float(am))
+                    hp = data.get("hist_p999")
+                    if hp is not None:
+                        hist_p999_vals.append(float(hp))
+                    mn = data.get("avg_min")
+                    mx_arr = data.get("avg_max")
+                    if mn is not None and mx_arr is not None:
+                        avg_min_list.append(mn)
+                        avg_max_list.append(mx_arr)
+
+            if not absmax_vals:
+                continue
+
+            scale_val = (
+                float(max(hist_p999_vals)) if (use_hist_p999 and hist_p999_vals)
+                else float(max(absmax_vals))
+            )
+
+            entry: Dict = {"bits": 8, "scale": scale_val}
+
+            # Shift: use the pre-computed per_layer_z_bar for this layer+group
+            z_bar = per_layer_z_bar.get(layer_name, {}).get(str(group_id))
+            if z_bar is not None:
+                entry["shift"] = z_bar
+
+            per_group_config[group_id][layer_name] = entry
+
+            # Outlier detection: use group-averaged avg_min/avg_max
+            if avg_min_list and avg_max_list:
+                grp_avg_min = np.mean(avg_min_list, axis=0)
+                grp_avg_max = np.mean(avg_max_list, axis=0)
+                oc_result = identify_outlier_channels(grp_avg_min, grp_avg_max, bits=8)
+                if oc_result:
+                    per_group_outlier[group_id][layer_name] = oc_result
+
+    return per_group_config, per_group_outlier
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate W4A8 quantization config (faithful TaQ-DiT baseline)"
@@ -154,6 +248,8 @@ def main():
                         help="Output quant_config.json path")
     parser.add_argument("--use-hist-p999", action="store_true", default=False,
                         help="Use hist_p999 (percentile clipping) instead of tensor_absmax for scale")
+    parser.add_argument("--htg-groups", type=Path, default=None,
+                        help="htg_groups.json from src.htg_cluster; enables per-group HTG mode")
     args = parser.parse_args()
 
     output_path = args.output or (args.stats.parent / "quant_config.json")
@@ -168,6 +264,52 @@ def main():
     print(f"Using {'hist_p999 (percentile)' if args.use_hist_p999 else 'tensor_absmax'} for scale")
     print(f"Activation bits: fixed A8 (faithful TaQ-DiT baseline)")
 
+    # ------------------------------------------------------------------
+    # HTG mode: produce per-group config
+    # ------------------------------------------------------------------
+    if args.htg_groups is not None:
+        print(f"\n=== HTG Mode: per-group quant config ===")
+        with open(args.htg_groups) as f:
+            htg_groups = json.load(f)
+
+        n_groups = htg_groups["n_groups"]
+        print(f"HTG groups: {n_groups}")
+
+        per_group_config, per_group_outlier = _build_per_group_config(
+            htg_groups, per_step_full, layer_names, args.use_hist_p999
+        )
+
+        total_decisions = sum(len(v) for v in per_group_config.values())
+        print(f"Per-group decisions: {total_decisions} total  ({n_groups} groups × {len(layer_names)} layers)")
+
+        n_outlier_layers = sum(len(v) for v in per_group_outlier.values())
+        print(f"Layers with outlier channels (across all groups): {n_outlier_layers}")
+
+        quant_config = {
+            "format": "per_group_quant_config_htg_v1",
+            "n_groups": n_groups,
+            "per_group": per_group_config,
+            "outlier_config": per_group_outlier,
+            "sigma_map": {str(k): v for k, v in sigma_map.items()},
+            "summary": {
+                "total_groups": n_groups,
+                "total_layers": len(layer_names),
+                "total_decisions": total_decisions,
+                "activation_bits": 8,
+                "scale_source": "hist_p999" if args.use_hist_p999 else "tensor_absmax",
+            },
+            "metadata": metadata,
+        }
+
+        output_path = args.output or (args.stats.parent / "quant_config_htg.json")
+        with open(output_path, "w") as f:
+            json.dump(quant_config, f, indent=2)
+        print(f"\n✓ HTG quant config -> {output_path}")
+        return
+
+    # ------------------------------------------------------------------
+    # Standard per-timestep mode (original behaviour)
+    # ------------------------------------------------------------------
     step_keys_sorted = sorted(timesteps.keys(), key=int)
 
     # Build per-timestep config: fixed A8, scale from absmax, shift passthrough

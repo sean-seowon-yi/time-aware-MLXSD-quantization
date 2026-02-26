@@ -606,11 +606,13 @@ def main() -> None:
                         help="Comma-separated block names to process (default: all)")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite existing output")
+    parser.add_argument("--htg-groups", type=Path, default=None,
+                        help="htg_groups.json from src.htg_cluster; enables per-group optimization")
+    parser.add_argument("--bb-config", type=Path, default=None,
+                        help="bb_config.json from src.bayesianbits_optimize; uses per-layer bit widths")
     args = parser.parse_args()
 
     args.output.mkdir(parents=True, exist_ok=True)
-    weights_dir = args.output / "weights"
-    weights_dir.mkdir(exist_ok=True)
     config_path = args.output / "config.json"
 
     if config_path.exists() and not args.force:
@@ -630,9 +632,9 @@ def main() -> None:
 
     block_names: List[str] = meta["block_names"]
     n_mm: int = meta["n_mm_blocks"]
-    sample_files = sorted((args.adaround_cache / "samples").glob("*.npz"))
+    all_sample_files = sorted((args.adaround_cache / "samples").glob("*.npz"))
 
-    if not sample_files:
+    if not all_sample_files:
         print("Error: no sample files found in cache")
         return
 
@@ -640,11 +642,26 @@ def main() -> None:
         selected_blocks = set(args.blocks.split(","))
         block_names = [b for b in block_names if b in selected_blocks]
 
+    # Load optional HTG groups and BB config
+    htg_groups: Optional[Dict] = None
+    bb_config: Optional[Dict] = None
+    if args.htg_groups is not None:
+        with open(args.htg_groups) as f:
+            htg_groups = json.load(f)
+    if args.bb_config is not None:
+        with open(args.bb_config) as f:
+            bb_config = json.load(f)
+
+    htg_mode = htg_groups is not None
     print("=== AdaRound Optimisation ===")
-    print(f"  Cache:   {args.adaround_cache}  ({len(sample_files)} samples)")
+    print(f"  Cache:   {args.adaround_cache}  ({len(all_sample_files)} samples)")
     print(f"  Blocks:  {len(block_names)}")
     print(f"  Iters:   {args.iters}  batch={args.batch_size}")
     print(f"  W{args.bits_w}A{args.bits_a}  w_lr={args.w_lr}  a_lr={args.a_lr}")
+    if htg_mode:
+        print(f"  HTG mode: {htg_groups['n_groups']} groups")
+    if bb_config is not None:
+        print(f"  BB config: per-layer bit widths from {args.bb_config}")
     print(f"  Output:  {args.output}\n")
 
     # ------------------------------------------------------------------
@@ -667,8 +684,159 @@ def main() -> None:
     mmdit = pipeline.mmdit
 
     # ------------------------------------------------------------------
-    # Process blocks sequentially
+    # Helper to save one block's quantised weights
     # ------------------------------------------------------------------
+    def _save_block_weights(
+        weights_dir: Path,
+        block_name: str,
+        block: Any,
+        is_mm: bool,
+        params: "AdaRoundParams",
+        bits_w: int,
+    ) -> List[str]:
+        linears = get_block_linears(block, is_mm)
+        linear_paths = [p for p, _, _ in linears]
+        linear_layers = [l for _, l, _ in linears]
+        W_fps_np = [np.array(l.weight) for l in linear_layers]
+        w_scales_np = [compute_per_channel_scale(W, bits_w) for W in W_fps_np]
+        quant_weights = finalize_block(params, W_fps_np, w_scales_np, linear_paths)
+        out_npz = weights_dir / f"{block_name}.npz"
+        save_dict: Dict[str, np.ndarray] = {}
+        for path, data in quant_weights.items():
+            safe = path.replace(".", "_")
+            save_dict[f"{safe}__weight_int"] = data["weight_int"]
+            save_dict[f"{safe}__scale"] = data["scale"]
+            save_dict[f"{safe}__a_scale"] = np.array([data["a_scale"]])
+        np.savez_compressed(out_npz, **save_dict)
+        return linear_paths
+
+    # ------------------------------------------------------------------
+    # HTG mode: one optimization pass per group
+    # ------------------------------------------------------------------
+    if htg_mode:
+        global_groups = htg_groups["global_groups"]
+        all_group_metrics: Dict[str, List[Dict]] = {}
+
+        for group_id, group_info in tqdm(global_groups.items(), desc="Groups"):
+            group_step_indices = set(group_info["timestep_indices"])
+            # Filter sample files: step index encoded as f.stem.split("_")[1]
+            group_sample_files = [
+                f for f in all_sample_files
+                if int(f.stem.split("_")[1]) in group_step_indices
+            ]
+
+            tqdm.write(f"\n=== Group {group_id}: {len(group_sample_files)} samples ===")
+
+            # Output directory for this group
+            group_out_dir = args.output / f"group_{group_id}"
+            group_out_dir.mkdir(parents=True, exist_ok=True)
+            group_weights_dir = group_out_dir / "weights"
+            group_weights_dir.mkdir(exist_ok=True)
+
+            group_metrics: List[Dict] = []
+
+            for block_name in tqdm(block_names, desc=f"  Blocks (group {group_id})", leave=False):
+                is_mm = block_name.startswith("mm")
+                idx = int(block_name[2:] if is_mm else block_name[3:])
+                block = (
+                    mmdit.multimodal_transformer_blocks[idx]
+                    if is_mm
+                    else mmdit.unified_transformer_blocks[idx]
+                )
+
+                block_data = load_block_data(block_name, group_sample_files)
+                if not block_data or "arg0" not in block_data:
+                    tqdm.write(f"  SKIP {block_name} (group {group_id}): no data")
+                    continue
+
+                # Determine bit width: prefer BB config if available
+                effective_bits_w = args.bits_w
+                if bb_config is not None:
+                    group_key = f"group_{group_id}"
+                    group_bb = bb_config.get(group_key, {})
+                    # Block-level median bit-width from per-layer BB decisions
+                    block_bits_list = [
+                        v for k, v in group_bb.items()
+                        if k.startswith(f"{block_name}.")
+                    ]
+                    if block_bits_list:
+                        from statistics import median
+                        effective_bits_w = int(round(median(block_bits_list)))
+                        effective_bits_w = max(4, min(8, effective_bits_w))
+
+                n_samples = block_data["arg0"].shape[0]
+                tqdm.write(f"\n  [{block_name}] group={group_id}  samples={n_samples}  W{effective_bits_w}")
+
+                params, metrics = optimize_block(
+                    block=block,
+                    block_name=block_name,
+                    is_mm=is_mm,
+                    block_data=block_data,
+                    iters=args.iters,
+                    batch_size=args.batch_size,
+                    bits_w=effective_bits_w,
+                    bits_a=args.bits_a,
+                    w_lr=args.w_lr,
+                    a_lr=args.a_lr,
+                )
+                tqdm.write(f"  {block_name} (group {group_id}) done — "
+                           f"final_loss={metrics['final_loss']:.4f}")
+
+                linear_paths = _save_block_weights(
+                    group_weights_dir, block_name, block, is_mm, params, effective_bits_w
+                )
+                metrics["quant_paths"] = linear_paths
+                metrics["group_id"] = group_id
+                metrics["bits_w"] = effective_bits_w
+                group_metrics.append(metrics)
+
+                del block_data
+
+            # Save per-group config
+            group_config = {
+                "format": "adaround_v1",
+                "model_version": "argmaxinc/mlx-stable-diffusion-3-medium",
+                "group_id": group_id,
+                "bits_w": args.bits_w,
+                "bits_a": args.bits_a,
+                "iters": args.iters,
+                "batch_size": args.batch_size,
+                "n_blocks_quantised": len(group_metrics),
+                "block_metrics": group_metrics,
+            }
+            with open(group_out_dir / "config.json", "w") as f:
+                json.dump(group_config, f, indent=2)
+
+            all_group_metrics[group_id] = group_metrics
+
+        # Save top-level config
+        total_blocks = sum(len(v) for v in all_group_metrics.values())
+        top_config = {
+            "format": "adaround_htg_v1",
+            "model_version": "argmaxinc/mlx-stable-diffusion-3-medium",
+            "n_groups": htg_groups["n_groups"],
+            "bits_w": args.bits_w,
+            "bits_a": args.bits_a,
+            "iters": args.iters,
+            "batch_size": args.batch_size,
+            "n_blocks_quantised_total": total_blocks,
+            "group_metrics": all_group_metrics,
+        }
+        with open(config_path, "w") as f:
+            json.dump(top_config, f, indent=2)
+
+        print(f"\n=== Done (HTG) ===")
+        print(f"  {total_blocks} block×group optimizations")
+        print(f"  Config:  {config_path}")
+        print(f"  Weights: {args.output}/group_*/weights/")
+        return
+
+    # ------------------------------------------------------------------
+    # Standard (non-HTG) mode: single pass over all sample files
+    # ------------------------------------------------------------------
+    weights_dir = args.output / "weights"
+    weights_dir.mkdir(exist_ok=True)
+
     all_metrics: List[Dict] = []
 
     for block_name in tqdm(block_names, desc="Blocks", unit="block"):
@@ -682,7 +850,7 @@ def main() -> None:
         )
 
         # Load calibration data for this block
-        block_data = load_block_data(block_name, sample_files)
+        block_data = load_block_data(block_name, all_sample_files)
         if not block_data or "arg0" not in block_data:
             tqdm.write(f"  SKIP {block_name}: no calibration data")
             continue
@@ -707,24 +875,9 @@ def main() -> None:
             f"  {block_name} done — final_loss={metrics['final_loss']:.4f}"
         )
 
-        # Finalise and save weights
-        linears = get_block_linears(block, is_mm)
-        linear_paths = [p for p, _, _ in linears]
-        linear_layers = [l for _, l, _ in linears]
-        W_fps_np = [np.array(l.weight) for l in linear_layers]
-        w_scales_np = [compute_per_channel_scale(W, args.bits_w) for W in W_fps_np]
-
-        quant_weights = finalize_block(params, W_fps_np, w_scales_np, linear_paths)
-
-        out_npz = weights_dir / f"{block_name}.npz"
-        save_dict: Dict[str, np.ndarray] = {}
-        for path, data in quant_weights.items():
-            safe = path.replace(".", "_")
-            save_dict[f"{safe}__weight_int"] = data["weight_int"]
-            save_dict[f"{safe}__scale"] = data["scale"]
-            save_dict[f"{safe}__a_scale"] = np.array([data["a_scale"]])
-        np.savez_compressed(out_npz, **save_dict)
-
+        linear_paths = _save_block_weights(
+            weights_dir, block_name, block, is_mm, params, args.bits_w
+        )
         metrics["quant_paths"] = linear_paths
         all_metrics.append(metrics)
 
