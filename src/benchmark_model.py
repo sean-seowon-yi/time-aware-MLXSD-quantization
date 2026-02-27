@@ -481,6 +481,33 @@ def _generate_single_image(
         return images
 
 
+def _load_image_stats(output_dir: Path) -> Dict[int, Dict]:
+    """Load per-image stats from image_stats.jsonl, keyed by img_idx."""
+    stats_path = output_dir / "image_stats.jsonl"
+    saved: Dict[int, Dict] = {}
+    if stats_path.exists():
+        with open(stats_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entry = json.loads(line)
+                    saved[entry["img_idx"]] = entry
+    return saved
+
+
+def _append_image_stat(output_dir: Path, img_idx: int, elapsed_s: float,
+                        metal_peak_mb: float, rss_peak_mb: float) -> None:
+    """Append one per-image stat record to image_stats.jsonl."""
+    entry = {
+        "img_idx": img_idx,
+        "elapsed_s": elapsed_s,
+        "metal_peak_mb": metal_peak_mb,
+        "rss_peak_mb": rss_peak_mb,
+    }
+    with open(output_dir / "image_stats.jsonl", "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 def generate_images(
     config: str,
     prompts: List[str],
@@ -511,9 +538,17 @@ def generate_images(
     images_dir = output_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load any previously saved per-image stats (populated when resuming)
+    saved_stats = _load_image_stats(output_dir)
+
     timings: List[float] = []
     peak_metal_mb = 0.0
     peak_rss_mb = 0.0
+
+    # Recover aggregate peaks from previously completed images
+    for stat in saved_stats.values():
+        peak_metal_mb = max(peak_metal_mb, stat.get("metal_peak_mb", 0.0))
+        peak_rss_mb = max(peak_rss_mb, stat.get("rss_peak_mb", 0.0))
 
     total = len(prompts)
     completed = 0
@@ -523,8 +558,14 @@ def generate_images(
     for img_idx, prompt in pbar:
         img_path = images_dir / f"{img_idx:04d}.png"
         if resume and img_path.exists():
-            print(f"  [resume] skipping {img_idx:04d}.png")
-            timings.append(0.0)   # placeholder so indices stay aligned
+            saved = saved_stats.get(img_idx)
+            if saved:
+                timings.append(saved["elapsed_s"])
+                print(f"  [resume] skipping {img_idx:04d}.png "
+                      f"(saved: {saved['elapsed_s']:.1f}s)")
+            else:
+                timings.append(0.0)  # pre-new-format run; no timing available
+                print(f"  [resume] skipping {img_idx:04d}.png")
             continue
 
         seed = seed_base + img_idx
@@ -554,8 +595,12 @@ def generate_images(
 
         # Memory
         mem = sample_metal_memory()
-        peak_metal_mb = max(peak_metal_mb, mem["peak_mb"])
-        peak_rss_mb = max(peak_rss_mb, sample_system_rss_mb())
+        img_metal_mb = mem["peak_mb"]
+        img_rss_mb = sample_system_rss_mb()
+        peak_metal_mb = max(peak_metal_mb, img_metal_mb)
+        peak_rss_mb = max(peak_rss_mb, img_rss_mb)
+
+        _append_image_stat(output_dir, img_idx, elapsed, img_metal_mb, img_rss_mb)
 
         # ETA
         measured = [t for t in timings if t > 0]
