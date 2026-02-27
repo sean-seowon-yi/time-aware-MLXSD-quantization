@@ -15,9 +15,23 @@ import numpy as np
 import pytest
 from PIL import Image
 
+
+def _torch_importable() -> bool:
+    """Return True only if torch can actually be imported in this process."""
+    try:
+        import torch  # noqa: F401
+        return True
+    except (ImportError, RuntimeError):
+        return False
+
+
+_TORCH_AVAILABLE = _torch_importable()
+
 from src.benchmark_model import (
     compute_latency_stats,
     compute_fidelity_metrics,
+    compute_sfid,
+    compute_model_size,
     sample_metal_memory,
     sample_system_rss_mb,
     load_prompts,
@@ -545,3 +559,167 @@ class TestDynamicInt8ActLayer:
         remove_dynamic_int8_act_hooks(patches)
         # After removal: should be original QuantizedLinear
         assert attn.q_proj is original_q
+
+
+# ---------------------------------------------------------------------------
+# TestComputeSfid
+# ---------------------------------------------------------------------------
+
+class TestComputeSfid:
+    """Tests for compute_sfid()."""
+
+    def test_graceful_degradation_when_torchvision_missing(self):
+        """Returns None without raising if torchvision is unavailable."""
+        with patch.dict("sys.modules", {"torchvision": None, "torchvision.models": None,
+                                         "torchvision.transforms": None}):
+            result = compute_sfid("/fake/gen", "/fake/ref")
+            assert result is None
+
+    def test_graceful_degradation_when_scipy_missing(self):
+        """Returns None without raising if scipy is unavailable.
+
+        torch and torchvision are mocked so scipy is the only missing dep.
+        """
+        mock_torch = MagicMock()
+        mock_tv = MagicMock()
+        with patch.dict("sys.modules", {
+            "torch": mock_torch,
+            "torchvision": mock_tv,
+            "torchvision.models": mock_tv,
+            "torchvision.transforms": mock_tv,
+            "scipy": None,
+            "scipy.linalg": None,
+        }):
+            result = compute_sfid("/fake/gen", "/fake/ref")
+            assert result is None
+
+    @pytest.mark.skipif(not _TORCH_AVAILABLE,
+                        reason="torch not importable alongside mlx in this process")
+    def test_returns_float_for_valid_dirs(self, tmp_path):
+        """Returns a float when both directories contain ≥2 PNG images."""
+        pytest.importorskip("torchvision")
+        pytest.importorskip("scipy")
+
+        gen_dir = tmp_path / "gen"
+        ref_dir = tmp_path / "ref"
+        gen_dir.mkdir()
+        ref_dir.mkdir()
+
+        for i in range(3):
+            img = Image.fromarray(
+                np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+            )
+            img.save(gen_dir / f"{i:04d}.png")
+            img.save(ref_dir / f"{i:04d}.png")
+
+        result = compute_sfid(str(gen_dir), str(ref_dir))
+        assert result is not None
+        assert isinstance(result, float)
+
+    @pytest.mark.skipif(not _TORCH_AVAILABLE,
+                        reason="torch not importable alongside mlx in this process")
+    def test_returns_none_for_single_image_dir(self, tmp_path):
+        """Returns None when a directory has only 1 image (covariance undefined)."""
+        pytest.importorskip("torchvision")
+        pytest.importorskip("scipy")
+
+        gen_dir = tmp_path / "gen"
+        ref_dir = tmp_path / "ref"
+        gen_dir.mkdir()
+        ref_dir.mkdir()
+
+        img = Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8))
+        img.save(gen_dir / "0000.png")
+        img.save(ref_dir / "0000.png")
+
+        result = compute_sfid(str(gen_dir), str(ref_dir))
+        assert result is None
+
+    @pytest.mark.skipif(not _TORCH_AVAILABLE,
+                        reason="torch not importable alongside mlx in this process")
+    def test_returns_none_for_empty_dir(self, tmp_path):
+        """Returns None when a directory has no images."""
+        pytest.importorskip("torchvision")
+        pytest.importorskip("scipy")
+
+        gen_dir = tmp_path / "gen"
+        ref_dir = tmp_path / "ref"
+        gen_dir.mkdir()
+        ref_dir.mkdir()
+
+        result = compute_sfid(str(gen_dir), str(ref_dir))
+        assert result is None
+
+    @pytest.mark.skipif(not _TORCH_AVAILABLE,
+                        reason="torch not importable alongside mlx in this process")
+    def test_identical_dirs_gives_near_zero(self, tmp_path):
+        """sFID should be near 0 when gen and ref are the same images."""
+        pytest.importorskip("torchvision")
+        pytest.importorskip("scipy")
+
+        img_dir = tmp_path / "imgs"
+        img_dir.mkdir()
+        for i in range(4):
+            img = Image.fromarray(
+                np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+            )
+            img.save(img_dir / f"{i:04d}.png")
+
+        result = compute_sfid(str(img_dir), str(img_dir))
+        assert result is not None
+        assert abs(result) < 1e-3
+
+
+# ---------------------------------------------------------------------------
+# TestComputeModelSize
+# ---------------------------------------------------------------------------
+
+class TestComputeModelSize:
+    """Tests for compute_model_size()."""
+
+    def _make_pipeline_with_module(self, dim=64):
+        """Pipeline with a real mlx.nn module as mmdit."""
+        import mlx.nn as nn
+
+        class _FakeMmdit(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(dim, dim, bias=False)
+
+        class _FakePipeline:
+            pass
+
+        p = _FakePipeline()
+        p.mmdit = _FakeMmdit()
+        return p
+
+    def test_returns_expected_keys(self):
+        pipeline = self._make_pipeline_with_module()
+        result = compute_model_size(pipeline)
+        assert "size_gb" in result
+        assert "total_params_M" in result
+
+    def test_values_are_nonnegative(self):
+        pipeline = self._make_pipeline_with_module()
+        result = compute_model_size(pipeline)
+        assert result["size_gb"] >= 0.0
+        assert result["total_params_M"] >= 0.0
+
+    def test_size_reflects_parameter_count(self):
+        """A larger linear layer should report a larger size."""
+        small = self._make_pipeline_with_module(dim=32)
+        large = self._make_pipeline_with_module(dim=256)
+        r_small = compute_model_size(small)
+        r_large = compute_model_size(large)
+        assert r_large["size_gb"] > r_small["size_gb"]
+        assert r_large["total_params_M"] > r_small["total_params_M"]
+
+    def test_known_param_count(self):
+        """Linear(64, 64, bias=False) has exactly 64*64 = 4096 params."""
+        import mlx.core as mx
+        pipeline = self._make_pipeline_with_module(dim=64)
+        import mlx.nn as nn
+        mx.eval(pipeline.mmdit.parameters())
+        result = compute_model_size(pipeline)
+        expected_params = 64 * 64  # 4096
+        assert result["total_params_M"] == pytest.approx(expected_params / 1e6, rel=0.01)

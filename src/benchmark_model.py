@@ -144,7 +144,7 @@ def compute_fidelity_metrics(
     reference_dir: str,
 ) -> Optional[Dict]:
     """
-    Compute FID, IS, and KID between two image directories.
+    Compute FID, IS, KID, Precision, and Recall between two image directories.
 
     Requires ``pip install torch-fidelity``.  Returns None gracefully if the
     package is not installed.
@@ -158,7 +158,7 @@ def compute_fidelity_metrics(
 
     Returns
     -------
-    dict with keys fid, isc_mean, isc_std, kid_mean, kid_std,
+    dict with keys fid, isc_mean, isc_std, kid_mean, kid_std, precision, recall,
     or None if torch-fidelity is unavailable.
     """
     try:
@@ -178,6 +178,7 @@ def compute_fidelity_metrics(
         fid=True,
         isc=True,
         kid=True,
+        prc=True,
         kid_subset_size=kid_subset_size,
         verbose=False,
         cuda=False,
@@ -189,6 +190,148 @@ def compute_fidelity_metrics(
         "isc_std": float(metrics.get("inception_score_std", float("nan"))),
         "kid_mean": float(metrics.get("kernel_inception_distance_mean", float("nan"))),
         "kid_std": float(metrics.get("kernel_inception_distance_std", float("nan"))),
+        "precision": float(metrics.get("precision", float("nan"))),
+        "recall": float(metrics.get("recall", float("nan"))),
+    }
+
+
+def compute_sfid(
+    generated_dir: str,
+    reference_dir: str,
+) -> Optional[float]:
+    """
+    Compute sFID using InceptionV3 spatial features from the Mixed_6e block.
+
+    sFID uses global-average-pooled 768-d vectors from Mixed_6e (instead of
+    the 2048-d final-pooling features used by FID) and is more sensitive to
+    spatial structure.
+
+    Requires torchvision and scipy.  Returns None gracefully if unavailable.
+
+    Parameters
+    ----------
+    generated_dir : str | Path
+        Directory containing generated PNG images.
+    reference_dir : str | Path
+        Directory containing reference PNG images.
+
+    Returns
+    -------
+    float or None
+    """
+    try:
+        import torch
+        import torchvision.models as tv_models
+        import torchvision.transforms as transforms
+        from scipy.linalg import sqrtm as scipy_sqrtm
+    except ImportError:
+        print("WARNING: torchvision or scipy not installed — skipping sFID.")
+        return None
+
+    import numpy as np
+    from PIL import Image as PILImage
+
+    # Load InceptionV3 — try new-style weights API, fall back to legacy
+    try:
+        model = tv_models.inception_v3(
+            weights=tv_models.Inception_V3_Weights.IMAGENET1K_V1
+        )
+    except (AttributeError, TypeError):
+        model = tv_models.inception_v3(pretrained=True)  # type: ignore[call-arg]
+    model.eval()
+
+    # Hook Mixed_6e to capture spatial features (N x 768 x 17 x 17)
+    _captured: Dict = {}
+
+    def _hook(module, input, output):  # noqa: ARG001
+        # Global-average-pool spatial dims → (N, 768)
+        _captured["feat"] = output.mean(dim=[2, 3]).detach().cpu().numpy()
+
+    hook_handle = model.Mixed_6e.register_forward_hook(_hook)
+
+    preprocess = transforms.Compose([
+        transforms.Resize(299),
+        transforms.CenterCrop(299),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+
+    def _extract(img_dir: str) -> np.ndarray:
+        paths = sorted(Path(img_dir).glob("*.png"))
+        feats = []
+        for p in paths:
+            img = PILImage.open(p).convert("RGB")
+            tensor = preprocess(img).unsqueeze(0)
+            with torch.no_grad():
+                model(tensor)
+            feats.append(_captured["feat"].copy())
+        if not feats:
+            return np.zeros((0, 768), dtype=np.float64)
+        return np.concatenate(feats, axis=0).astype(np.float64)
+
+    try:
+        feats_gen = _extract(str(generated_dir))
+        feats_ref = _extract(str(reference_dir))
+    finally:
+        hook_handle.remove()
+
+    if feats_gen.shape[0] < 2 or feats_ref.shape[0] < 2:
+        print("WARNING: sFID requires ≥2 images per directory — returning None.")
+        return None
+
+    mu1 = feats_gen.mean(axis=0)
+    mu2 = feats_ref.mean(axis=0)
+    sigma1 = np.cov(feats_gen, rowvar=False)
+    sigma2 = np.cov(feats_ref, rowvar=False)
+
+    diff = mu1 - mu2
+    # disp=False was deprecated in scipy 1.17 and removed in 1.18; use the
+    # forward-compatible form and discard the (now-gone) error-estimate return.
+    sqrtm_result = scipy_sqrtm(sigma1 @ sigma2)
+    covmean = sqrtm_result[0] if isinstance(sqrtm_result, tuple) else sqrtm_result
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+
+    sfid = float(diff @ diff + np.trace(sigma1 + sigma2 - 2.0 * covmean))
+    return sfid
+
+
+def compute_model_size(pipeline) -> Dict:
+    """
+    Compute DiT model size in GB and total parameter count (millions).
+
+    Walks ``pipeline.mmdit.parameters()`` and sums actual tensor bytes.
+
+    Parameters
+    ----------
+    pipeline : DiffusionPipeline
+        A loaded pipeline; only ``pipeline.mmdit`` is inspected.
+
+    Returns
+    -------
+    dict with keys ``size_gb`` (float) and ``total_params_M`` (float).
+    """
+    import mlx.core as mx
+
+    total_bytes = 0
+    total_params = 0
+
+    def _walk(obj) -> None:
+        nonlocal total_bytes, total_params
+        if isinstance(obj, mx.array):
+            total_bytes += obj.nbytes
+            total_params += obj.size
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                _walk(v)
+
+    _walk(pipeline.mmdit.parameters())
+    return {
+        "size_gb": total_bytes / 1e9,
+        "total_params_M": total_params / 1e6,
     }
 
 
@@ -646,8 +789,17 @@ def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict]) 
 
     if fidelity is not None:
         print(f"FID:           {fidelity['fid']:.4f}")
+        sfid = fidelity.get("sfid")
+        if sfid is not None:
+            print(f"sFID:          {sfid:.4f}")
         print(f"IS:            {fidelity['isc_mean']:.2f} ± {fidelity['isc_std']:.2f}")
         print(f"KID:           {fidelity['kid_mean']:.5f} ± {fidelity['kid_std']:.5f}")
+        prec = fidelity.get("precision")
+        rec = fidelity.get("recall")
+        if prec is not None:
+            print(f"Precision:     {prec:.4f}")
+        if rec is not None:
+            print(f"Recall:        {rec:.4f}")
     else:
         print("FID/IS/KID:    skipped")
 
@@ -720,6 +872,7 @@ def main() -> None:
     timings: List[float] = []
     memory_stats: Dict = {"peak_metal_mb": 0.0, "peak_rss_mb": 0.0}
     fidelity_result: Optional[Dict] = None
+    model_stats: Optional[Dict] = None
 
     # ------------------------------------------------------------------
     # Phase 1 — Image generation
@@ -746,6 +899,21 @@ def main() -> None:
             group_size=args.group_size,
         )
 
+        # Compute model size once after generation (pipeline discarded per-image;
+        # load once more just for parameter counting, then discard).
+        print("\n=== Computing model size ===")
+        try:
+            pipeline_sz, _ = _load_pipeline(
+                args.config, args.adaround_output, args.adaround_act_config,
+                args.mlx_int4, args.group_size,
+            )
+            model_stats = compute_model_size(pipeline_sz)
+            del pipeline_sz
+            print(f"  size_gb={model_stats['size_gb']:.3f}  "
+                  f"params={model_stats['total_params_M']:.0f}M")
+        except Exception as e:
+            print(f"WARNING: model size computation failed: {e}")
+
     # ------------------------------------------------------------------
     # Phase 2 — Fidelity metrics
     # ------------------------------------------------------------------
@@ -760,7 +928,7 @@ def main() -> None:
         else:
             n_gen = len(list(gen_dir.glob("*.png")))
             n_ref = len(list(ref_dir.glob("*.png")))
-            print(f"\n=== Computing FID/IS/KID "
+            print(f"\n=== Computing FID/IS/KID/Precision "
                   f"({n_gen} generated vs {n_ref} reference) ===")
             raw = compute_fidelity_metrics(gen_dir, ref_dir)
             if raw is not None:
@@ -770,6 +938,13 @@ def main() -> None:
                     "num_reference_images": n_ref,
                     "num_generated_images": n_gen,
                 }
+
+            print(f"\n=== Computing sFID ===")
+            sfid_val = compute_sfid(str(gen_dir), str(ref_dir))
+            if fidelity_result is not None:
+                fidelity_result["sfid"] = sfid_val
+            elif sfid_val is not None:
+                fidelity_result = {"sfid": sfid_val}
 
     # ------------------------------------------------------------------
     # Latency stats
@@ -789,6 +964,7 @@ def main() -> None:
         "seed": args.seed,
         "latency": lat_stats,
         "memory": memory_stats,
+        "model": model_stats,
         "fidelity": fidelity_result,
     }
 
