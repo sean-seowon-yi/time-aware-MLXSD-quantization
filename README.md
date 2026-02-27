@@ -34,6 +34,51 @@ python -m src.generate_calibration_data --num-images 10
 
 Options: `--num-steps` (default 50), `--cfg-weight` (default 7.5), `--calib-dir`, `--prompt-csv` (default `all_prompts.csv`), `--seed`. The script uses the same pipeline config as the notebook (SD3 medium, no T5) and writes one `.npz` per (image, step) with keys `x`, `timestep`, `sigma`, `conditioning`, `pooled_conditioning`, `step_index`.
 
+## Benchmarking
+
+`src/benchmark_model.py` measures image quality (FID / IS / KID via
+[torch-fidelity](https://github.com/toshas/torch-fidelity)), per-image latency,
+and peak memory usage (Metal + system RSS).
+
+### Canonical FID benchmark (matched to calibration data)
+
+The reference images in `calibration_data_100/` were generated with
+`--num-steps 100 --cfg-scale 7.5`. **You must use the same settings** when
+benchmarking, otherwise FID measures step-count quality difference rather than
+quantization degradation.
+
+```bash
+conda run -n diffusionkit python -m src.benchmark_model \
+    --config fp16 \
+    --num-images 150 \
+    --num-steps 100 \
+    --cfg-scale 7.5 \
+    --output-dir benchmark_results/fp16_matched \
+    --reference-dir calibration_data_100/images
+```
+
+### Quick latency / memory run (no FID)
+
+Use `--skip-metrics` to skip image-quality computation entirely. Any step count
+works because no reference comparison is made.
+
+```bash
+conda run -n diffusionkit python -m src.benchmark_model \
+    --config fp16 \
+    --num-images 5 \
+    --num-steps 28 \
+    --output-dir benchmark_results/fp16_mem \
+    --skip-metrics
+```
+
+### Progress tracking
+
+The outer image loop shows a `tqdm` progress bar with `s/img`, `ETA`, and
+`metal_GB` postfix fields. DiffusionKit's inner denoising loop also shows its
+own `tqdm` bar (in the INFO logs), so you see both levels of progress.
+
+---
+
 ## Running the sensitivity notebook
 
 1. Install dependencies (e.g. `pip install -e DiffusionKit`, MLX).

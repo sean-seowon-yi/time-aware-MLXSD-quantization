@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
@@ -517,7 +518,9 @@ def generate_images(
     total = len(prompts)
     completed = 0
 
-    for img_idx, prompt in enumerate(prompts):
+    pbar = tqdm(enumerate(prompts), total=len(prompts),
+                desc=f"  {config}", unit="img", dynamic_ncols=True)
+    for img_idx, prompt in pbar:
         img_path = images_dir / f"{img_idx:04d}.png"
         if resume and img_path.exists():
             print(f"  [resume] skipping {img_idx:04d}.png")
@@ -568,6 +571,11 @@ def generate_images(
         metal_gb = mem["peak_mb"] / 1000.0
         print(f"  [{img_idx + 1}/{total}] {elapsed:.1f}s | {eta_str} | "
               f"peak_metal {metal_gb:.1f} GB")
+        pbar.set_postfix({
+            "s/img": f"{elapsed:.1f}",
+            "ETA": eta_str,
+            "metal_GB": f"{peak_metal_mb / 1024:.1f}",
+        }, refresh=True)
 
     return timings, {"peak_metal_mb": peak_metal_mb, "peak_rss_mb": peak_rss_mb}
 
