@@ -1,17 +1,20 @@
 """
 Phase 1 calibration config: paper-aligned constants for calibration data generation.
+
+Aligned with arXiv:2503.06930 (HTG), Section 5.1:
+  "We randomly generate 32 class-conditioned samples and save both the
+   intermediate and output feature maps at each timestep."
+
+SD3 adaptation: class-conditioned → text-conditioned (20 diverse prompts).
 """
 
 from pathlib import Path
 
-# Paper: "Set the sampling steps to 100"
+# Paper: 100-step diffusion process
 NUM_SAMPLING_STEPS = 100
 
-# Paper: "Generate 256 samples"
-NUM_CALIBRATION_SAMPLES = 256
-
-# Paper: "Uniformly select 25 steps from the total steps"
-NUM_SELECTED_TIMESTEPS = 25
+# Paper: "randomly generate 32 ... samples"
+NUM_CALIBRATION_SAMPLES = 32
 
 # DiffusionKit SD3 Medium for MLX (default)
 MODEL_VERSION = "argmaxinc/mlx-stable-diffusion-3-medium"

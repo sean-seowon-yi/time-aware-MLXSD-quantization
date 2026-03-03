@@ -1,0 +1,27 @@
+# ── Core ML framework (Apple Silicon M-series, including M5) ─────────────────
+# Pin mlx to 0.17.x for DiffusionKit API compatibility.
+# If you hit M5-specific issues, try: pip install -U mlx
+mlx>=0.17.3,<0.18.0
+
+# ── DiffusionKit dependencies ─────────────────────────────────────────────────
+argmaxtools>=0.1.13
+safetensors
+jaxtyping
+transformers
+pillow
+sentencepiece
+# torch ships with MPS backend on Apple Silicon — no CPU-only index-url needed
+torch
+
+# ── Numerics & data ───────────────────────────────────────────────────────────
+numpy>=1.26          # 1.26+ ships universal2 / arm64 wheels for Apple Silicon
+scipy>=1.11          # used for clustering utilities (compute_htg_params.py)
+
+# ── Visualisation (Phase 2 diagnostics) ──────────────────────────────────────
+matplotlib
+
+# ── Progress bars ─────────────────────────────────────────────────────────────
+tqdm
+
+# ── Beartype (used by DiffusionKit type annotations) ─────────────────────────
+beartype

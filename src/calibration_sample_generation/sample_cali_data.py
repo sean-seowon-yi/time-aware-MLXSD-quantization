@@ -1,19 +1,19 @@
 """
-Phase 1: Generate calibration data for time-aware quantization of SD3 (MMDiT).
+Phase 1: Generate calibration data for HTG quantization of SD3 (MMDiT).
 
-Aligned with TaQ-DiT (arXiv:2411.14172):
-  - 100 sampling steps per trajectory
-  - 256 trajectories total
-  - Uniformly select 25 timesteps from the 100
-  - Shuffle the calibration pool
+Aligned with arXiv:2503.06930 (HTG), Section 5.1:
+  "We randomly generate 32 class-conditioned samples and save both the
+   intermediate and output feature maps at each timestep for all linear
+   layers and attention modules."
 
-Improvements over the paper's single-class-label setup for SD3:
-  - Supports 1-N diverse text prompts (loaded from a file)
-  - Prompts are cycled round-robin across trajectories so the calibration
-    set covers varied conditioning, producing more representative activation
-    distributions for quantization.
-  - Conditioning is stored *once per unique prompt* (not duplicated per
-    calibration point) to keep the .npz small (~200 MB instead of ~8 GB).
+  - 32 trajectories (paper: 32 samples)
+  - 100 sampling steps per trajectory (paper: 100-step DDPM)
+  - ALL 100 timesteps saved per trajectory (paper: "at each timestep")
+  - Total calibration points: 32 × 100 = 3,200
+
+SD3 adaptation (class-conditioned → text-conditioned):
+  - 20 diverse text prompts cycled round-robin across trajectories.
+  - Conditioning stored once per unique prompt to keep the .npz compact.
 
 Saved .npz keys:
   xs              (n_cal, H, W, C)                  noisy latent inputs
@@ -54,7 +54,6 @@ except ImportError:
 from calibration_config import (
     NUM_CALIBRATION_SAMPLES,
     NUM_SAMPLING_STEPS,
-    NUM_SELECTED_TIMESTEPS,
     MODEL_VERSION,
     DEFAULT_LATENT_SIZE,
     DEFAULT_CFG_WEIGHT,
@@ -147,15 +146,11 @@ def main():
     )
     parser.add_argument(
         "--num-fid-samples", type=int, default=NUM_CALIBRATION_SAMPLES,
-        help="Total number of trajectories to generate",
+        help="Total number of trajectories to generate (paper: 32)",
     )
     parser.add_argument(
         "--num-sampling-steps", type=int, default=NUM_SAMPLING_STEPS,
-        help="Denoising steps per trajectory",
-    )
-    parser.add_argument(
-        "--num-selected-steps", type=int, default=NUM_SELECTED_TIMESTEPS,
-        help="Uniformly selected timesteps for calibration set",
+        help="Denoising steps per trajectory (paper: 100)",
     )
     parser.add_argument(
         "--latent-size", type=int, nargs=2, default=list(DEFAULT_LATENT_SIZE),
@@ -217,6 +212,7 @@ def main():
     n_samples = args.num_fid_samples
     n_prompts = len(prompts)
     print(f"\nGenerating {n_samples} trajectories x {args.num_sampling_steps} steps "
+          f"= {n_samples * args.num_sampling_steps} calibration points "
           f"(batch_size=1, {n_prompts} prompt(s) cycled round-robin)")
 
     # Per-trajectory collectors: xs[step][sample], ts[step][sample]
@@ -264,20 +260,16 @@ def main():
     xs = np.concatenate(all_xs, axis=1)
     ts = np.stack(all_ts, axis=1)
 
-    # --- Paper: uniformly select 25 steps from 100 ---
-    total_steps = xs.shape[0]
-    selected_indices = np.linspace(0, total_steps - 1, args.num_selected_steps, dtype=int)
-    xs = xs[selected_indices]   # (25, n_samples, H, W, C)
-    ts = ts[selected_indices]   # (25, n_samples)
-
+    # Paper: save at EVERY timestep (no selection step)
     # Flatten (steps, n_samples, ...) -> (n_cal, ...)
+    # n_cal = num_sampling_steps * n_samples = 100 * 32 = 3,200
     N, S = xs.shape[0], xs.shape[1]
     n_cal = N * S
-    xs = xs.reshape(n_cal, *xs.shape[2:])   # (6400, H, W, C)
-    ts = ts.reshape(n_cal)                   # (6400,)
+    xs = xs.reshape(n_cal, *xs.shape[2:])   # (3200, H, W, C)
+    ts = ts.reshape(n_cal)                   # (3200,)
 
-    # Expand per-trajectory prompt indices to per-calibration-point
-    # Each trajectory contributes N_selected_steps calibration points
+    # Expand per-trajectory prompt indices to per-calibration-point.
+    # Each trajectory contributes num_sampling_steps calibration points.
     prompt_indices = np.tile(traj_prompt_idx, N)
 
     # Shuffle consistently
