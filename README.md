@@ -29,7 +29,12 @@ Samples are assumed ordered as: image 0 step 0, image 0 step 1, …, image 1 ste
 From the repo root, run the calibration generator so that `calibration_data/samples/` is populated with `.npz` files and `manifest.json` is updated:
 
 ```bash
-python -m src.generate_calibration_data --num-images 10
+python -m src.generate_calibration_data \
+    --num-images 200 \
+    --num-steps 100 \
+    --calib-dir calibration_data_100 \
+    --prompt-csv all_prompts.csv \
+    --resume
 ```
 
 Options: `--num-steps` (default 50), `--cfg-weight` (default 7.5), `--calib-dir`, `--prompt-csv` (default `all_prompts.csv`), `--seed`. The script uses the same pipeline config as the notebook (SD3 medium, no T5) and writes one `.npz` per (image, step) with keys `x`, `timestep`, `sigma`, `conditioning`, `pooled_conditioning`, `step_index`.

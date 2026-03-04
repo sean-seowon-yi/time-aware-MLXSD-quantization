@@ -200,6 +200,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--calib-dir", type=Path, default=None)
     parser.add_argument("--prompt-csv", type=Path, default=None)
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip images already generated in calib-dir")
     args = parser.parse_args()
     
     calib_dir = args.calib_dir or (_REPO / "calibration_data")
@@ -218,12 +220,60 @@ def main():
     print(f"=== Generating {len(prompts)} Images ===\n")
     
     images_metadata = []
+    existing_metadata = {}
+    manifest_path_used = None
+    if args.resume:
+        manifest_path = calib_dir / "manifest.json"
+        if not manifest_path.exists():
+            alt_path = samples_dir / "manifest.json"
+            if alt_path.exists():
+                manifest_path = alt_path
+        if manifest_path.exists():
+            manifest_path_used = manifest_path
+            with open(manifest_path, "r") as f:
+                prev = json.load(f)
+            if prev.get("num_steps") not in (None, args.num_steps):
+                print("Error: --num-steps does not match existing manifest.")
+                print(f"  manifest num_steps={prev.get('num_steps')}, "
+                      f"requested={args.num_steps}")
+                return
+            if prev.get("cfg_scale") not in (None, args.cfg_weight):
+                print("Error: --cfg-weight does not match existing manifest.")
+                print(f"  manifest cfg_scale={prev.get('cfg_scale')}, "
+                      f"requested={args.cfg_weight}")
+                return
+            existing_metadata = {
+                int(img["image_id"]): img
+                for img in prev.get("images", [])
+                if "image_id" in img
+            }
     start_time = time.time()
     
     for img_idx, prompt in enumerate(prompts):
         seed = args.seed + img_idx
         
         print(f"[{img_idx + 1}/{len(prompts)}] {prompt[:60]}...")
+        image_path = images_dir / f"{img_idx:04d}.png"
+        latent_path = latents_dir / f"{img_idx:04d}.npy"
+        final_sample = samples_dir / f"{img_idx:04d}_{args.num_steps-1:03d}.npz"
+        if args.resume and image_path.exists() and latent_path.exists() and final_sample.exists():
+            print("  [resume] skipping (already generated)")
+            images_metadata.append(
+                existing_metadata.get(
+                    img_idx,
+                    {
+                        'image_id': img_idx,
+                        'prompt': prompt,
+                        'seed': seed,
+                        'cfg_weight': args.cfg_weight,
+                        'num_steps': args.num_steps,
+                        'filename': f"{img_idx:04d}.png",
+                        'latent_filename': f"{img_idx:04d}.npy",
+                    },
+                )
+            )
+            print("")
+            continue
         
         img_start = time.time()
         
@@ -244,9 +294,8 @@ def main():
         )
         print("✓")
         
-        image_path = images_dir / f"{img_idx:04d}.png"
         image.save(image_path)
-        np.save(latents_dir / f"{img_idx:04d}.npy", np.array(final_latent))
+        np.save(latent_path, np.array(final_latent))
         
         images_metadata.append({
             'image_id': img_idx,
@@ -278,7 +327,8 @@ def main():
         "images": images_metadata,
     }
     
-    with open(calib_dir / "manifest.json", 'w') as f:
+    output_manifest = manifest_path_used or (calib_dir / "manifest.json")
+    with open(output_manifest, 'w') as f:
         json.dump(manifest, f, indent=2)
     
     total_time = time.time() - start_time

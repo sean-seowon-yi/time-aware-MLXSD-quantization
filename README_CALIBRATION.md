@@ -22,10 +22,11 @@ This pipeline generates calibration data for quantizing diffusion transformers w
 ```bash
 # Generate 1000 images with per-step latent states
 python -m src.generate_calibration_data \
-    --num-images 1000 \
-    --num-steps 50 \
-    --calib-dir calibration_data \
-    --prompt-csv all_prompts.csv
+    --num-images 200 \
+    --num-steps 100 \
+    --calib-dir calibration_data_100 \
+    --prompt-csv all_prompts.csv \
+    --resume
 
 # Time: ~10-12 hours (M4 Max)
 # Output: ~1.3 GB (samples + latents + images + manifest)
