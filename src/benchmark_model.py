@@ -14,6 +14,8 @@ Phase 1 — Generate images
 Phase 2 — Compute metrics
     FID / IS / KID: requires ``pip install torch-fidelity``.  Gracefully
     degrades (logs warning, writes null) if the package is not available.
+    PRDC / CMMD (CLIP): requires ``pip install open_clip_torch``.  Gracefully
+    skipped if unavailable or if ``--skip-clip-metrics`` is set.
     Pass ``--reference-dir`` to trigger this phase.
 
 Usage
@@ -136,7 +138,7 @@ def sample_system_rss_mb() -> float:
 
 
 # ---------------------------------------------------------------------------
-# Section 3 — FID / IS / KID
+# Section 3 — FID / IS / KID / CLIP metrics
 # ---------------------------------------------------------------------------
 
 def compute_fidelity_metrics(
@@ -193,6 +195,242 @@ def compute_fidelity_metrics(
         "precision": float(metrics.get("precision", float("nan"))),
         "recall": float(metrics.get("recall", float("nan"))),
     }
+
+
+_CLIP_CACHE = {}
+
+
+def _load_clip_model():
+    """
+    Load CLIP model + preprocess once (open_clip).
+
+    Returns (model, preprocess, model_id) or (None, None, None) if unavailable.
+    """
+    if _CLIP_CACHE.get("model") is not None:
+        return _CLIP_CACHE["model"], _CLIP_CACHE["preprocess"], _CLIP_CACHE["model_id"]
+    try:
+        import open_clip
+        import torch
+    except ImportError:
+        print("WARNING: open_clip_torch or torch not installed — "
+              "skipping CLIP metrics. Install with: pip install open_clip_torch")
+        return None, None, None
+    model_id = "openai/clip-vit-large-patch14-336"
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-L-14-336", pretrained="openai"
+    )
+    model.eval()
+    model.to("cpu")
+    _CLIP_CACHE["model"] = model
+    _CLIP_CACHE["preprocess"] = preprocess
+    _CLIP_CACHE["model_id"] = model_id
+    return model, preprocess, model_id
+
+
+def _list_pngs(img_dir: str) -> List[Path]:
+    return sorted(Path(img_dir).glob("*.png"))
+
+
+def _compute_clip_embeddings(img_dir: str) -> Optional[Dict]:
+    """
+    Compute CLIP embeddings for all PNGs in a directory.
+
+    Returns dict with keys: embeddings (np.ndarray), filenames (list[str]), model_id (str).
+    """
+    model, preprocess, model_id = _load_clip_model()
+    if model is None:
+        return None
+    import torch
+    import numpy as np
+    from PIL import Image as PILImage
+
+    paths = _list_pngs(img_dir)
+    if not paths:
+        return {"embeddings": np.zeros((0, 768), dtype=np.float32),
+                "filenames": [], "model_id": model_id}
+
+    embeddings = []
+    filenames: List[str] = []
+    batch = []
+    batch_names = []
+    batch_size = 16
+
+    def _flush():
+        if not batch:
+            return
+        x = torch.stack(batch, dim=0)
+        with torch.no_grad():
+            feats = model.encode_image(x)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+        embeddings.append(feats.cpu().numpy().astype(np.float32))
+        filenames.extend(batch_names)
+        batch.clear()
+        batch_names.clear()
+
+    for p in paths:
+        img = PILImage.open(p).convert("RGB")
+        tensor = preprocess(img)
+        batch.append(tensor)
+        batch_names.append(p.name)
+        if len(batch) >= batch_size:
+            _flush()
+    _flush()
+
+    emb = np.concatenate(embeddings, axis=0) if embeddings else np.zeros((0, 768), dtype=np.float32)
+    return {"embeddings": emb, "filenames": filenames, "model_id": model_id}
+
+
+def _load_clip_cache(cache_path: Path) -> Optional[Dict]:
+    if not cache_path.exists():
+        return None
+    try:
+        data = np.load(cache_path, allow_pickle=True)
+        return {k: data[k].tolist() if data[k].dtype == object else data[k] for k in data.files}
+    except Exception:
+        return None
+
+
+def _save_clip_cache(cache_path: Path, cache: Dict) -> None:
+    np.savez(
+        cache_path,
+        generated_embeddings=cache["generated_embeddings"],
+        generated_filenames=np.array(cache["generated_filenames"], dtype=object),
+        reference_embeddings=cache["reference_embeddings"],
+        reference_filenames=np.array(cache["reference_filenames"], dtype=object),
+        clip_model_id=cache["clip_model_id"],
+    )
+
+
+def _get_clip_embeddings_with_cache(
+    generated_dir: str,
+    reference_dir: str,
+    cache_path: Path,
+) -> Optional[Dict]:
+    cache = _load_clip_cache(cache_path)
+    gen_files = [p.name for p in _list_pngs(generated_dir)]
+    ref_files = [p.name for p in _list_pngs(reference_dir)]
+    _, _, model_id = _load_clip_model()
+    if model_id is None:
+        return None
+
+    if cache is not None:
+        if (cache.get("clip_model_id") == model_id and
+                cache.get("generated_filenames") == gen_files and
+                cache.get("reference_filenames") == ref_files):
+            return {
+                "generated_embeddings": cache["generated_embeddings"],
+                "reference_embeddings": cache["reference_embeddings"],
+                "clip_model_id": cache["clip_model_id"],
+            }
+
+    gen = _compute_clip_embeddings(generated_dir)
+    ref = _compute_clip_embeddings(reference_dir)
+    if gen is None or ref is None:
+        return None
+
+    cache_out = {
+        "generated_embeddings": gen["embeddings"],
+        "generated_filenames": gen["filenames"],
+        "reference_embeddings": ref["embeddings"],
+        "reference_filenames": ref["filenames"],
+        "clip_model_id": gen["model_id"],
+    }
+    _save_clip_cache(cache_path, cache_out)
+    return {
+        "generated_embeddings": cache_out["generated_embeddings"],
+        "reference_embeddings": cache_out["reference_embeddings"],
+        "clip_model_id": cache_out["clip_model_id"],
+    }
+
+
+def _pairwise_sq_dists(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    a2 = np.sum(a * a, axis=1, keepdims=True)
+    b2 = np.sum(b * b, axis=1, keepdims=True).T
+    return a2 + b2 - 2.0 * (a @ b.T)
+
+
+def compute_prdc_metrics(
+    gen_emb: np.ndarray,
+    ref_emb: np.ndarray,
+    k: int = 5,
+) -> Optional[Dict]:
+    """
+    Compute PRDC (precision/recall/density/coverage) in embedding space.
+    """
+    n_gen, n_ref = gen_emb.shape[0], ref_emb.shape[0]
+    if n_gen < 2 or n_ref < 2:
+        print("WARNING: PRDC requires ≥2 images per directory — returning None.")
+        return None
+    k_gen = min(k, n_gen - 1)
+    k_ref = min(k, n_ref - 1)
+    if k_gen < 1 or k_ref < 1:
+        print("WARNING: PRDC requires at least 2 images per directory — returning None.")
+        return None
+
+    d_rr = _pairwise_sq_dists(ref_emb, ref_emb)
+    d_ff = _pairwise_sq_dists(gen_emb, gen_emb)
+    d_fr = _pairwise_sq_dists(gen_emb, ref_emb)
+
+    np.fill_diagonal(d_rr, np.inf)
+    np.fill_diagonal(d_ff, np.inf)
+
+    r_ref = np.partition(d_rr, k_ref, axis=1)[:, k_ref]
+    r_gen = np.partition(d_ff, k_gen, axis=1)[:, k_gen]
+
+    # Precision
+    min_d_fr = d_fr.min(axis=1)
+    nn_ref = d_fr.argmin(axis=1)
+    precision = float(np.mean(min_d_fr <= r_ref[nn_ref]))
+
+    # Recall
+    min_d_rf = d_fr.min(axis=0)
+    nn_gen = d_fr.argmin(axis=0)
+    recall = float(np.mean(min_d_rf <= r_gen[nn_gen]))
+
+    # Density
+    density = float(np.mean((d_fr <= r_ref[None, :]).sum(axis=1) / float(k_ref)))
+
+    # Coverage
+    coverage = float(np.mean(min_d_rf <= r_ref))
+
+    return {
+        "prdc_precision": precision,
+        "prdc_recall": recall,
+        "prdc_density": density,
+        "prdc_coverage": coverage,
+        "prdc_k": k,
+    }
+
+
+def compute_cmmd_from_embeddings(
+    gen_emb: np.ndarray,
+    ref_emb: np.ndarray,
+) -> Optional[float]:
+    """
+    Compute CMMD using RBF-kernel MMD over CLIP embeddings.
+    """
+    if gen_emb.shape[0] < 2 or ref_emb.shape[0] < 2:
+        print("WARNING: CMMD requires ≥2 images per directory — returning None.")
+        return None
+    all_emb = np.concatenate([gen_emb, ref_emb], axis=0)
+    dists = _pairwise_sq_dists(all_emb, all_emb)
+    tri = dists[np.triu_indices_from(dists, k=1)]
+    med = np.median(tri[tri > 0])
+    if not np.isfinite(med) or med <= 0:
+        med = 1.0
+    sigma2 = med
+    gamma = 1.0 / (2.0 * sigma2)
+
+    d_rr = _pairwise_sq_dists(ref_emb, ref_emb)
+    d_ff = _pairwise_sq_dists(gen_emb, gen_emb)
+    d_fr = _pairwise_sq_dists(gen_emb, ref_emb)
+
+    k_rr = np.exp(-gamma * d_rr)
+    k_ff = np.exp(-gamma * d_ff)
+    k_fr = np.exp(-gamma * d_fr)
+
+    mmd2 = float(k_rr.mean() + k_ff.mean() - 2.0 * k_fr.mean())
+    return mmd2
 
 
 def compute_sfid(
@@ -800,6 +1038,21 @@ def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict]) 
             print(f"Precision:     {prec:.4f}")
         if rec is not None:
             print(f"Recall:        {rec:.4f}")
+        cmmd = fidelity.get("cmmd")
+        if cmmd is not None:
+            print(f"CMMD:          {cmmd:.4f}")
+        prdc_p = fidelity.get("prdc_precision")
+        prdc_r = fidelity.get("prdc_recall")
+        prdc_d = fidelity.get("prdc_density")
+        prdc_c = fidelity.get("prdc_coverage")
+        if prdc_p is not None:
+            print(f"PRDC Precision:{prdc_p:>10.4f}")
+        if prdc_r is not None:
+            print(f"PRDC Recall:   {prdc_r:>10.4f}")
+        if prdc_d is not None:
+            print(f"PRDC Density:  {prdc_d:>10.4f}")
+        if prdc_c is not None:
+            print(f"PRDC Coverage: {prdc_c:>10.4f}")
     else:
         print("FID/IS/KID:    skipped")
 
@@ -834,8 +1087,8 @@ def main() -> None:
                         help="Number of images to generate (default: 150)")
     parser.add_argument("--num-steps", type=int, default=28,
                         help="Denoising steps per image (default: 28)")
-    parser.add_argument("--cfg-scale", type=float, default=7.0,
-                        help="CFG guidance weight (default: 7.0)")
+    parser.add_argument("--cfg-scale", type=float, default=1.5,
+                        help="CFG guidance weight (default: 1.5)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Base seed; image i uses seed+i (default: 42)")
     parser.add_argument("--mlx-int4", action="store_true",
@@ -850,6 +1103,8 @@ def main() -> None:
                         help="Reference image dir for FID/IS/KID (omit to skip metrics)")
     parser.add_argument("--generated-dir", type=Path, default=None,
                         help="Override generated image dir for metrics phase")
+    parser.add_argument("--skip-clip-metrics", action="store_true",
+                        help="Skip CLIP-based metrics (PRDC + CMMD)")
 
     # Phase control
     parser.add_argument("--skip-generation", action="store_true",
@@ -945,6 +1200,27 @@ def main() -> None:
                 fidelity_result["sfid"] = sfid_val
             elif sfid_val is not None:
                 fidelity_result = {"sfid": sfid_val}
+
+            if not args.skip_clip_metrics:
+                print(f"\n=== Computing CLIP metrics (PRDC + CMMD) ===")
+                cache_path = output_dir / "embeddings.npz"
+                clip_cache = _get_clip_embeddings_with_cache(
+                    str(gen_dir), str(ref_dir), cache_path
+                )
+                if clip_cache is not None:
+                    gen_emb = clip_cache["generated_embeddings"]
+                    ref_emb = clip_cache["reference_embeddings"]
+                    prdc = compute_prdc_metrics(gen_emb, ref_emb, k=5)
+                    cmmd_val = compute_cmmd_from_embeddings(gen_emb, ref_emb)
+                    if fidelity_result is None:
+                        fidelity_result = {}
+                    if prdc is not None:
+                        fidelity_result.update(prdc)
+                    if cmmd_val is not None:
+                        fidelity_result["cmmd"] = cmmd_val
+                    fidelity_result["clip_model"] = clip_cache.get("clip_model_id")
+                else:
+                    print("WARNING: CLIP metrics unavailable — skipping PRDC/CMMD.")
 
     # ------------------------------------------------------------------
     # Latency stats
