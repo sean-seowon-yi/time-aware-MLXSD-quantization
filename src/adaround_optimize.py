@@ -748,6 +748,7 @@ def optimize_block(
         # Average loss over sampled indices
         total_loss = mx.array(0.0)
         total_grads = None
+        n_valid = 0
 
         for si in idx:
             # Build input tensors for this sample
@@ -793,7 +794,20 @@ def optimize_block(
                 s_inputs, s_kwargs, s_outputs,
                 b_val, poly_alphas,
             )
+            mx.eval(loss_i)
+
+            # Skip NaN samples — don't let one bad sample corrupt the whole mini-batch
+            loss_i_val = float(loss_i)
+            if math.isnan(loss_i_val) or math.isinf(loss_i_val):
+                print(
+                    f"  WARNING: NaN/Inf loss for sample {si} at step {step}"
+                    f" (b={b_val:.1f}), skipping",
+                    flush=True,
+                )
+                continue
+
             total_loss = total_loss + loss_i
+            n_valid += 1
 
             if total_grads is None:
                 total_grads = grads_i
@@ -807,16 +821,33 @@ def optimize_block(
                         total_grads["a_scales"][i] + grads_i["a_scales"][i]
                     )
 
-        n_used = len(idx)
-        # Average grads
+        # Count valid (non-NaN) samples actually accumulated
+        n_used = n_valid
+        if total_grads is None:
+            # All samples in this batch produced NaN — skip the optimizer step
+            loss_val = float("nan")
+            loss_history.append(loss_val)
+            if step % 50 == 0:
+                pbar.set_postfix(loss="nan", b=f"{b_val:.1f}")
+            if step % 200 == 0:
+                print(f"  {block_name} iter {step}/{iters}  loss=nan  b={b_val:.1f}", flush=True)
+            pbar.update(1)
+            continue
+
+        # Average grads over valid samples
         for i in range(len(params.alphas)):
             total_grads["alphas"][i] = total_grads["alphas"][i] / n_used
             total_grads["a_scales"][i] = total_grads["a_scales"][i] / n_used
 
-        # Clip a_scale gradients to prevent NaN from large initial loss
-        GRAD_CLIP = 1.0
+        # Clip gradients: a_scale needs tight clipping (small param, sensitive to explosion)
+        # alpha uses a looser clip — needs enough gradient to make rounding decisions
+        ALPHA_GRAD_CLIP = 0.1
+        A_SCALE_GRAD_CLIP = 1.0
+        clipped_alpha_grads = [
+            mx.clip(g, -ALPHA_GRAD_CLIP, ALPHA_GRAD_CLIP) for g in total_grads["alphas"]
+        ]
         clipped_a_grads = [
-            mx.clip(g, -GRAD_CLIP, GRAD_CLIP) for g in total_grads["a_scales"]
+            mx.clip(g, -A_SCALE_GRAD_CLIP, A_SCALE_GRAD_CLIP) for g in total_grads["a_scales"]
         ]
 
         # Cosine LR schedule for a_scale: anneal effective LR from a_lr → 0
@@ -825,7 +856,7 @@ def optimize_block(
         scaled_a_grads = [g * cos_factor for g in clipped_a_grads]
 
         # Split and apply
-        alpha_grads = {"alphas": total_grads["alphas"]}
+        alpha_grads = {"alphas": clipped_alpha_grads}
         a_scale_grads = {"a_scales": scaled_a_grads}
 
         w_opt.update(params, alpha_grads)
