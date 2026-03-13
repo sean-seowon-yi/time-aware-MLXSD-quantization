@@ -324,11 +324,21 @@ def main() -> None:
     )
 
     summary = tracer.summarize()
+    summary_pre = tracer.summarize_pre()
 
     flat: dict[str, np.ndarray] = {}
+
+    # Post-GELU stats: keys  {layer_id}::t={t_key}::{stat_name}
     for layer_id, tdict in summary.items():
         for t_key, stats in tdict.items():
             prefix = f"{layer_id}::t={t_key}"
+            for stat_name, arr in stats.items():
+                flat[f"{prefix}::{stat_name}"] = arr
+
+    # Pre-fc1 input stats: keys  pre::{layer_id}::t={t_key}::{stat_name}
+    for layer_id, tdict in summary_pre.items():
+        for t_key, stats in tdict.items():
+            prefix = f"pre::{layer_id}::t={t_key}"
             for stat_name, arr in stats.items():
                 flat[f"{prefix}::{stat_name}"] = arr
 
@@ -340,10 +350,10 @@ def main() -> None:
 
     np.savez_compressed(args.output, **flat)
     print(f"\nSaved activation statistics to {args.output}")
-    print(f"  Layers traced: {len(summary)}")
+    print(f"  Layers traced: {len(summary)} (post-GELU), {len(summary_pre)} (pre-fc1 input)")
     print(f"  Unique timesteps: {len(unique_ts)}")
     print(f"  Histogram bins: {HISTOGRAM_NUM_BINS} in [{HISTOGRAM_RANGE[0]}, {HISTOGRAM_RANGE[1]}]")
-    print("You can now inspect per-layer, per-timestep stats/histograms in a notebook.")
+    print("Load with load_stats(path) for post-GELU or load_stats(path, kind='pre') for fc1 inputs.")
 
 
 if __name__ == "__main__":

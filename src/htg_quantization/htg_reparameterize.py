@@ -19,9 +19,9 @@ In SD3 MMDiT, γ and β are computed dynamically by adaLN_modulation:
 Approach: store per-group HTG correction arrays alongside the model.
 At inference, a patched cache_modulation_params applies:
     β̂₁_g = (β₁ - z_g_qkv) / s_qkv     (for QKV layers)
-    γ̂₁   = γ₁ / s_qkv
+    γ̂₁   = (1 + γ₁) / s_qkv - 1       (DiffusionKit stores raw γ; affine_transform uses 1+γ)
     β̂₂_g = (β₂ - z_g_fc1) / s_fc1     (for fc1 layers)
-    γ̂₂   = γ₂ / s_fc1
+    γ̂₂   = (1 + γ₂) / s_fc1 - 1
     β̂_oproj = (β_oproj - z_g_oproj) / s_oproj  (stored separately)
 
 The weight rescaling Ŵ = W * s[None, :] (column-wise) is applied once here.

@@ -1,7 +1,7 @@
 """
 HTGTransform — InferenceTransform for Hierarchical Timestep Grouping (HTG).
 
-Applies the two inference-time corrections from arXiv:2503.06930:
+Applies the inference-time corrections from arXiv:2503.06930 (Algorithm 2):
 
 1. Weight rescaling (static, once at load):
        Ŵ = W * s[None, :]          (per-channel column scaling)
@@ -17,29 +17,34 @@ Applies the two inference-time corrections from arXiv:2503.06930:
                           γ̂₂ = (1 + γ₂) / s_fc1 - 1
        oproj (no AdaLN):  sdpa_output = (sdpa_output - z_g_oproj[g]) / s_oproj  (in post_sdpa)
 
+3. Weight quantization (optional):
+       Ŵ → nn.QuantizedLinear  (MLX block-wise INT8/INT4, dequantize-then-multiply)
+
+4. Activation fake-quantization (optional, paper Algorithm 2 Step 8-9):
+       X̂ = fake_quantize(X̂, act_min[g], act_max[g], bits)
+   Simulates INT8 activation quantization using static per-group ranges from
+   htg_activation_ranges.npz. MLX has no true W+A INT8 GEMM, so this is the
+   standard PTQ simulation approach (correct quantization error, float16 compute).
+
+Quantization pipeline — independent toggles
+-------------------------------------------
+    quantize_weights     — Ŵ → MLX QuantizedLinear (weight-only INT8/4)
+    quantize_activations — fake-quantize layer inputs (requires activation_ranges_path)
+    Both enabled         — full W+A simulation (paper-aligned W8A8/W4A8)
+
 Ablation flags
 --------------
-All four correction components can be toggled independently:
+All correction components can be toggled independently:
     apply_weight_rescaling  — Ŵ = W * s
     apply_qkv_correction    — β̂₁, γ̂₁ for attention input
     apply_fc1_correction    — β̂₂, γ̂₂ for FFN input
     apply_oproj_correction  — (sdpa_output - z_g) / s before o_proj
-
-Example ablations:
-    # Weight rescaling only
-    HTGTransform(path, apply_qkv_correction=False,
-                 apply_fc1_correction=False, apply_oproj_correction=False)
-
-    # adaLN corrections only (no weight rescaling)
-    HTGTransform(path, apply_weight_rescaling=False)
-
-    # Attention stream only
-    HTGTransform(path, apply_fc1_correction=False, apply_oproj_correction=False)
 """
 
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -48,6 +53,111 @@ import numpy as np
 from .base import InferenceTransform
 
 _ROOT = Path(__file__).resolve().parents[2]
+
+
+# ---------------------------------------------------------------------------
+# Activation fake-quantization helpers (Algorithm 2, Steps 8-9)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _HTGActQuantCtx:
+    """
+    Shared mutable context that tracks the current denoising timestep key.
+    All FakeQuantizedLinear instances hold a reference to one instance of
+    this class so they can look up the correct per-group quantizer range
+    without explicit argument passing.
+    """
+    current_t_key: str = ""
+    debug: bool = False
+    # Accumulator: layer_id → list of {clip_frac, mse, sqnr}
+    act_stats: Dict[str, List[Dict]] = field(default_factory=dict)
+
+
+def fake_quantize(
+    x: "mx.array",
+    x_min: float,
+    x_max: float,
+    bits: int = 8,
+) -> "mx.array":
+    """
+    Asymmetric uniform fake-quantization (Eq. 1 of arXiv:2503.06930).
+
+    Simulates INT{bits} quantization by clipping, rounding, and dequantizing
+    back to float16.  Computation remains in float16; only the quantization
+    error is faithfully modelled.
+
+        scale = (x_max - x_min) / (2^bits - 1)
+        x_int = clip(round((x - x_min) / scale), 0, 2^bits - 1)
+        x_hat = x_int * scale + x_min
+    """
+    import mlx.core as mx
+    levels = float((1 << bits) - 1)
+    scale = (x_max - x_min) / levels
+    x_int = mx.clip(mx.round((x - x_min) / scale), 0.0, levels)
+    return (x_int * scale + x_min).astype(x.dtype)
+
+
+class FakeQuantizedLinear:
+    """
+    Drop-in wrapper around nn.Linear or nn.QuantizedLinear that fake-quantizes
+    the input activation before the matrix multiply.
+
+    Uses a shared _HTGActQuantCtx to look up the current timestep group at
+    forward-pass time, then reads the corresponding (act_min, act_max) range
+    from group_ranges.
+
+    Parameters
+    ----------
+    linear : nn.Linear or nn.QuantizedLinear
+        The wrapped layer whose __call__ is invoked after quantization.
+    group_ranges : {g: (act_min, act_max)}
+        Per-group static activation quantizer ranges from htg_activation_ranges.npz.
+    ts_to_group : {t_key: g_idx}
+        Mapping from timestep string key to group index for this layer.
+    ctx : _HTGActQuantCtx
+        Shared context; current_t_key is updated by wrap_pre_sdpa each step.
+    bits : int
+        Activation quantization bit-width (default 8).
+    """
+
+    def __init__(
+        self,
+        linear,
+        group_ranges: Dict[int, Tuple[float, float]],
+        ts_to_group: Dict[str, int],
+        ctx: _HTGActQuantCtx,
+        bits: int = 8,
+        layer_id: str = "",
+    ) -> None:
+        self.linear = linear
+        self.group_ranges = group_ranges
+        self.ts_to_group = ts_to_group
+        self.ctx = ctx
+        self.bits = bits
+        self.layer_id = layer_id
+
+    def __call__(self, x: "mx.array") -> "mx.array":
+        g = self.ts_to_group.get(self.ctx.current_t_key, 0)
+        lo, hi = self.group_ranges.get(g, (-1.0, 1.0))
+        x_q = fake_quantize(x, lo, hi, self.bits)
+
+        if self.ctx.debug and self.layer_id:
+            x_np   = np.array(x, dtype=np.float32)
+            x_q_np = np.array(x_q, dtype=np.float32)
+            clip_frac = float(((x_np < lo) | (x_np > hi)).mean())
+            err = x_np - x_q_np
+            mse = float(np.mean(err ** 2))
+            sig_var = float(np.var(x_np))
+            sqnr = 10.0 * np.log10(sig_var / (mse + 1e-12))
+            self.ctx.act_stats.setdefault(self.layer_id, []).append(
+                {"clip_frac": clip_frac, "mse": mse, "sqnr": sqnr}
+            )
+
+        return self.linear(x_q)
+
+    # Forward attribute access to the wrapped layer (weight, scales, etc.)
+    def __getattr__(self, name: str):
+        return getattr(self.linear, name)
 
 
 def _ensure_diffusionkit() -> None:
@@ -114,18 +224,27 @@ class HTGTransform(InferenceTransform):
         apply_qkv_correction: bool = True,
         apply_fc1_correction: bool = True,
         apply_oproj_correction: bool = True,
-        quantize: bool = False,
+        quantize: bool = False,              # backward-compat alias for quantize_weights
+        quantize_weights: bool = False,
+        quantize_activations: bool = False,
         weight_bits: int = 8,
+        activation_bits: int = 8,
         group_size: int = 64,
+        activation_ranges_path: str | None = None,
+        debug: bool = False,
     ) -> None:
         self.corrections_path = corrections_path
         self.apply_weight_rescaling = apply_weight_rescaling
         self.apply_qkv_correction = apply_qkv_correction
         self.apply_fc1_correction = apply_fc1_correction
         self.apply_oproj_correction = apply_oproj_correction
-        self.quantize = quantize
+        self.quantize_weights = quantize_weights or quantize   # resolve alias
+        self.quantize_activations = quantize_activations
         self.weight_bits = weight_bits
+        self.activation_bits = activation_bits
         self.group_size = group_size
+        self.activation_ranges_path = activation_ranges_path
+        self.debug = debug
 
         # Populated by _load_corrections()
         self._corrections: Dict[str, Dict] = {}       # layer_id → {z_g, s, ...}
@@ -133,7 +252,18 @@ class HTGTransform(InferenceTransform):
         self._timesteps_sorted: Optional[np.ndarray] = None
         self._blocks_info: List[Tuple] = []            # (tb, base_id) pairs
 
+        # Activation fake-quantization state
+        self._act_ranges: Dict[str, Dict[int, Tuple[float, float]]] = {}
+        self._act_ctx = _HTGActQuantCtx(debug=debug)
+
+        # Debug accumulators
+        self._debug_weight_errors: Dict[str, Dict] = {}   # layer_key → {mse, sqnr, ...}
+        self._debug_ts_total: int = 0
+        self._debug_ts_misses: int = 0
+
         self._load_corrections()
+        if self.quantize_activations and activation_ranges_path:
+            self._load_act_ranges()
 
     # ------------------------------------------------------------------
     # Load corrections
@@ -165,6 +295,126 @@ class HTGTransform(InferenceTransform):
             }
             self._ts_to_group[lid] = _build_ts_to_group(ts_sorted, ga_np)
 
+    def _load_act_ranges(self) -> None:
+        """Parse htg_activation_ranges.npz into per-layer per-group range dicts."""
+        raw = np.load(self.activation_ranges_path, allow_pickle=True)
+        tmp: Dict[str, Dict[int, list]] = {}
+        for key in raw.files:
+            parts = key.split("::")   # "{layer_id}", "g{g}", "act_min"|"act_max"
+            if len(parts) != 3:
+                continue
+            lid, g_tag, stat = parts
+            if not g_tag.startswith("g"):
+                continue
+            g = int(g_tag[1:])
+            tmp.setdefault(lid, {}).setdefault(g, [None, None])
+            if stat == "act_min":
+                tmp[lid][g][0] = float(raw[key])
+            elif stat == "act_max":
+                tmp[lid][g][1] = float(raw[key])
+        self._act_ranges = {
+            lid: {g: (v[0], v[1]) for g, v in gdict.items()}
+            for lid, gdict in tmp.items()
+        }
+        print(f"[HTGTransform] Loaded activation ranges for {len(self._act_ranges)} layers.")
+
+    # ------------------------------------------------------------------
+    # Debug helpers
+    # ------------------------------------------------------------------
+
+    def _record_weight_quant_error(
+        self, layer_id: str, lin_idx: int, w_before: np.ndarray, qlinear
+    ) -> None:
+        """Compute and store weight quantization MSE/SQNR for a single linear."""
+        if not self.debug:
+            return
+        import mlx.core as mx
+
+        w_dequant = np.array(
+            mx.dequantize(
+                qlinear.weight,
+                qlinear.scales,
+                qlinear.biases,
+                qlinear.group_size,
+                qlinear.bits,
+            ),
+            dtype=np.float32,
+        )
+        err = w_before - w_dequant
+        mse = float(np.mean(err ** 2))
+        sig_var = float(np.var(w_before))
+        sqnr = 10.0 * np.log10(sig_var / (mse + 1e-12))
+        key = f"{layer_id}::{lin_idx}"
+        self._debug_weight_errors[key] = {
+            "mse": mse,
+            "sqnr": sqnr,
+            "w_max": float(np.max(np.abs(w_before))),
+            "w_range": float(w_before.max() - w_before.min()),
+        }
+
+    def print_debug_summary(self) -> None:
+        """Print three diagnostic tables after a full inference run."""
+        print("\n" + "=" * 76)
+        print("HTGTransform Debug Summary")
+        print("=" * 76)
+
+        # Table 1: Weight quantization error
+        print("\n--- Table 1: Weight quantization error (sorted by MSE descending) ---")
+        if not self._debug_weight_errors:
+            print("  (no weight quantization performed or debug disabled)")
+        else:
+            print(f"{'Layer key':<46} {'MSE':>10} {'SQNR(dB)':>10} {'w_max':>8} {'w_range':>8}")
+            print("-" * 84)
+            for key, v in sorted(
+                self._debug_weight_errors.items(), key=lambda x: -x[1]["mse"]
+            ):
+                flag = " ← LOW SQNR" if v["sqnr"] < 25.0 else ""
+                print(
+                    f"{key:<46} {v['mse']:>10.6f} {v['sqnr']:>10.2f}"
+                    f" {v['w_max']:>8.4f} {v['w_range']:>8.4f}{flag}"
+                )
+
+        # Table 2: Activation quantization
+        print("\n--- Table 2: Activation quantization (sorted by clip_frac descending) ---")
+        act_summary = {}
+        for lid, records in self._act_ctx.act_stats.items():
+            if not records:
+                continue
+            clip_fracs = [r["clip_frac"] for r in records]
+            mses       = [r["mse"]       for r in records]
+            sqnrs      = [r["sqnr"]      for r in records]
+            act_summary[lid] = {
+                "mean_clip_frac": float(np.mean(clip_fracs)),
+                "mean_mse":       float(np.mean(mses)),
+                "mean_sqnr":      float(np.mean(sqnrs)),
+            }
+        if not act_summary:
+            print("  (no activation quantization performed or debug disabled)")
+        else:
+            print(f"{'Layer':<40} {'clip_frac':>10} {'mean_MSE':>10} {'mean_SQNR':>10}")
+            print("-" * 72)
+            for lid, v in sorted(
+                act_summary.items(), key=lambda x: -x[1]["mean_clip_frac"]
+            ):
+                flag = " ← HIGH CLIP" if v["mean_clip_frac"] > 0.05 else ""
+                print(
+                    f"{lid:<40} {v['mean_clip_frac']:>10.4f}"
+                    f" {v['mean_mse']:>10.6f} {v['mean_sqnr']:>10.2f}{flag}"
+                )
+
+        # Table 3: Timestep key misses
+        print("\n--- Table 3: Timestep key misses ---")
+        total  = self._debug_ts_total
+        misses = self._debug_ts_misses
+        rate   = 100.0 * misses / total if total > 0 else 0.0
+        print(f"  total_calls={total}  missed_calls={misses}  miss_rate={rate:.2f}%")
+        if misses > 0:
+            print("  WARNING: timestep key misses cause activation range fallback to group 0!")
+        else:
+            print("  OK: no timestep key misses.")
+
+        print("=" * 76)
+
     # ------------------------------------------------------------------
     # Hook 1: weight modifications
     # ------------------------------------------------------------------
@@ -189,34 +439,78 @@ class HTGTransform(InferenceTransform):
                 print(f"[HTGTransform] Warning: layer not found: {layer_id}")
                 continue
 
-            for linear in linear_layers:
+            for lin_idx, linear in enumerate(linear_layers):
                 w_np = np.array(linear.weight, dtype=np.float32)
                 w_hat = (w_np * s[None, :]).astype(np.float16)
                 linear.weight = mx.array(w_hat)
                 mx.eval(linear.weight)
 
-            if self.quantize and tb is not None:
+            # Pass A: weight quantization
+            if self.quantize_weights and tb is not None:
                 if layer_type == "fc1":
+                    w_before = np.array(tb.mlp.fc1.weight, dtype=np.float32)
                     tb.mlp.fc1 = nn.QuantizedLinear.from_linear(
                         tb.mlp.fc1, bits=self.weight_bits, group_size=self.group_size
                     )
+                    self._record_weight_quant_error(layer_id, 0, w_before, tb.mlp.fc1)
                 elif layer_type == "qkv":
-                    tb.attn.q_proj = nn.QuantizedLinear.from_linear(
-                        tb.attn.q_proj, bits=self.weight_bits, group_size=self.group_size
-                    )
-                    tb.attn.k_proj = nn.QuantizedLinear.from_linear(
-                        tb.attn.k_proj, bits=self.weight_bits, group_size=self.group_size
-                    )
-                    tb.attn.v_proj = nn.QuantizedLinear.from_linear(
-                        tb.attn.v_proj, bits=self.weight_bits, group_size=self.group_size
-                    )
+                    for q_idx, attr in enumerate(("q_proj", "k_proj", "v_proj")):
+                        lin = getattr(tb.attn, attr)
+                        w_before = np.array(lin.weight, dtype=np.float32)
+                        q_lin = nn.QuantizedLinear.from_linear(
+                            lin, bits=self.weight_bits, group_size=self.group_size
+                        )
+                        setattr(tb.attn, attr, q_lin)
+                        self._record_weight_quant_error(layer_id, q_idx, w_before, q_lin)
                 elif layer_type == "oproj":
+                    w_before = np.array(tb.attn.o_proj.weight, dtype=np.float32)
                     tb.attn.o_proj = nn.QuantizedLinear.from_linear(
                         tb.attn.o_proj, bits=self.weight_bits, group_size=self.group_size
                     )
+                    self._record_weight_quant_error(layer_id, 0, w_before, tb.attn.o_proj)
+                elif layer_type == "fc2":
+                    w_before = np.array(tb.mlp.fc2.weight, dtype=np.float32)
+                    tb.mlp.fc2 = nn.QuantizedLinear.from_linear(
+                        tb.mlp.fc2, bits=self.weight_bits, group_size=self.group_size
+                    )
+                    self._record_weight_quant_error(layer_id, 0, w_before, tb.mlp.fc2)
 
-        print(f"[HTGTransform] Weight rescaling applied to {len(self._corrections)} layers"
-              + (" + quantized" if self.quantize else "") + ".")
+            # Pass B: activation fake-quantization (wraps linear after Pass A)
+            if self.quantize_activations and tb is not None:
+                ranges = self._act_ranges.get(layer_id)
+                ts2g = self._ts_to_group.get(layer_id, {})
+                if ranges:
+                    if layer_type == "fc1":
+                        tb.mlp.fc1 = FakeQuantizedLinear(
+                            tb.mlp.fc1, ranges, ts2g, self._act_ctx, self.activation_bits,
+                            layer_id=layer_id,
+                        )
+                    elif layer_type == "qkv":
+                        for attr in ("q_proj", "k_proj", "v_proj"):
+                            lin = getattr(tb.attn, attr)
+                            setattr(tb.attn, attr, FakeQuantizedLinear(
+                                lin, ranges, ts2g, self._act_ctx, self.activation_bits,
+                                layer_id=layer_id,
+                            ))
+                    elif layer_type == "oproj":
+                        tb.attn.o_proj = FakeQuantizedLinear(
+                            tb.attn.o_proj, ranges, ts2g, self._act_ctx, self.activation_bits,
+                            layer_id=layer_id,
+                        )
+                    elif layer_type == "fc2":
+                        tb.mlp.fc2 = FakeQuantizedLinear(
+                            tb.mlp.fc2, ranges, ts2g, self._act_ctx, self.activation_bits,
+                            layer_id=layer_id,
+                        )
+
+        status = []
+        if self.apply_weight_rescaling:
+            status.append("rescaled")
+        if self.quantize_weights:
+            status.append(f"W{self.weight_bits}")
+        if self.quantize_activations:
+            status.append(f"A{self.activation_bits}")
+        print(f"[HTGTransform] {len(self._corrections)} layers: {', '.join(status) or 'corrections only'}.")
 
     # ------------------------------------------------------------------
     # Hook 2: cache_modulation_params wrapper
@@ -254,12 +548,27 @@ class HTGTransform(InferenceTransform):
     # ------------------------------------------------------------------
 
     def wrap_pre_sdpa(self, fn: Callable) -> Callable:
-        """Adds _htg_t_key to the intermediates dict for post_sdpa to consume."""
+        """Adds _htg_t_key to the intermediates dict and updates the activation context."""
+        act_ctx = self._act_ctx
+        ts_to_group = self._ts_to_group
+        debug = self.debug
+        debug_state = self  # reference for counter updates
+
         def pre_sdpa_with_tkey(self_block, tensor, timestep):
             intermediates = fn(self_block, tensor, timestep)
             if isinstance(intermediates, dict):
                 t_val = timestep[0].item() if timestep.size > 1 else timestep.item()
-                intermediates["_htg_t_key"] = _t_key(t_val)
+                tk = _t_key(t_val)
+                intermediates["_htg_t_key"] = tk
+                act_ctx.current_t_key = tk   # update shared context for FakeQuantizedLinear
+
+                if debug:
+                    # Check timestep key match across all layers that have ts_to_group data
+                    for lid, tsg in ts_to_group.items():
+                        debug_state._debug_ts_total += 1
+                        if tk not in tsg:
+                            debug_state._debug_ts_misses += 1
+                        break  # one representative layer is sufficient per block call
             return intermediates
         return pre_sdpa_with_tkey
 

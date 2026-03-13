@@ -40,7 +40,7 @@ except ImportError:
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-def load_stats(path: str) -> Tuple[
+def load_stats(path: str, kind: str = "post") -> Tuple[
     Dict[str, Dict[str, Dict[str, np.ndarray]]],
     np.ndarray,
     np.ndarray,
@@ -48,11 +48,25 @@ def load_stats(path: str) -> Tuple[
     """
     Load the flat .npz and reconstruct the nested structure.
 
-    Returns:
-        stats: {layer_id: {t_key: {stat_name: array}}}
-        timesteps_unique: sorted float array
-        histogram_bin_edges: array of bin edges
+    Parameters
+    ----------
+    path : str
+        Path to the .npz file from profile_postgelu.py.
+    kind : ``"post"`` | ``"pre"``
+        ``"post"`` (default) — post-GELU activations (D = 4 × hidden_size).
+        ``"pre"``  — pre-fc1 input activations (D = hidden_size).
+        Use ``kind="pre"`` with a ``corrections_path`` for shifted/scaled plots,
+        since z_g and s are computed for the fc1 input space.
+
+    Returns
+    -------
+    stats : {layer_id: {t_key: {stat_name: array}}}
+    timesteps_unique : sorted float array
+    histogram_bin_edges : array of bin edges
     """
+    if kind not in ("post", "pre"):
+        raise ValueError(f"kind must be 'post' or 'pre', got '{kind}'")
+
     data = np.load(path, allow_pickle=True)
     timesteps_unique = data["timesteps_unique"]
     histogram_bin_edges = data["histogram_bin_edges"]
@@ -60,12 +74,30 @@ def load_stats(path: str) -> Tuple[
     stats: Dict[str, Dict[str, Dict[str, np.ndarray]]] = defaultdict(
         lambda: defaultdict(dict)
     )
-    for key in data.files:
-        if "::t=" not in key:
-            continue
-        layer_id, rest = key.split("::t=", 1)
-        t_key, stat_name = rest.split("::", 1)
-        stats[layer_id][t_key][stat_name] = data[key]
+
+    if kind == "post":
+        # Keys: {layer_id}::t={t_key}::{stat_name}  (no "pre::" prefix)
+        for key in data.files:
+            if "::t=" not in key or key.startswith("pre::"):
+                continue
+            layer_id, rest = key.split("::t=", 1)
+            t_key, stat_name = rest.split("::", 1)
+            stats[layer_id][t_key][stat_name] = data[key]
+    else:
+        # Keys: pre::{layer_id}::t={t_key}::{stat_name}
+        for key in data.files:
+            if not key.startswith("pre::") or "::t=" not in key:
+                continue
+            stripped = key[len("pre::"):]
+            layer_id, rest = stripped.split("::t=", 1)
+            t_key, stat_name = rest.split("::", 1)
+            stats[layer_id][t_key][stat_name] = data[key]
+
+        if not stats:
+            raise KeyError(
+                f"No pre-fc1 activation stats found in '{path}'. "
+                "Re-run profile_postgelu.py to regenerate with pre-fc1 recording."
+            )
 
     return dict(stats), timesteps_unique, histogram_bin_edges
 
@@ -335,6 +367,595 @@ def plot_negative_fraction(
     fig.savefig(output_dir / "negative_fraction_heatmap.png", dpi=150)
     plt.close(fig)
     print("  Saved negative_fraction_heatmap.png")
+
+
+# ---------------------------------------------------------------------------
+# Plot 6: Boxplot of a single channel's activations across timesteps
+# ---------------------------------------------------------------------------
+
+def plot_channel_boxplot_across_timesteps(
+    stats: Dict[str, Dict[str, Dict[str, np.ndarray]]],
+    layer_id: str,
+    channel_idx: int,
+    t_range: Tuple[float, float] | None = None,
+    output_dir: Path | None = None,
+    ax=None,
+):
+    """
+    Draw a boxplot showing the activation distribution of one channel
+    across profiled timesteps (x-axis ordered high→low, denoising order).
+
+    Since only summary statistics are stored (not raw samples), the box
+    is constructed from Gaussian approximations:
+      - whisker low  = min[channel]
+      - Q1           ≈ mean[channel] - 0.674 * std[channel]
+      - median       ≈ mean[channel]
+      - Q3           ≈ mean[channel] + 0.674 * std[channel]
+      - whisker high = max[channel]
+
+    Parameters
+    ----------
+    stats : nested dict from load_stats()
+    layer_id : str
+        Layer to visualise, e.g. ``"mm_05_img"``.
+    channel_idx : int
+        Zero-based channel (hidden-unit) index.
+    t_range : (t_min, t_max) or None
+        Inclusive timestep range to display, e.g. ``(200, 800)`` shows only
+        timesteps between 200 and 800.  ``None`` shows all profiled timesteps.
+    output_dir : Path or None
+        If given, saves the figure as
+        ``{output_dir}/channel_boxplot_{layer_id}_ch{channel_idx}.png``.
+    ax : matplotlib Axes or None
+        If given, draws into this axes object (useful in notebooks).
+        If None, a new figure is created.
+
+    Returns
+    -------
+    fig : matplotlib Figure
+    """
+    if layer_id not in stats:
+        raise KeyError(
+            f"Layer '{layer_id}' not found. Available layers: {sorted(stats.keys())}"
+        )
+
+    all_t_keys = _sorted_timestep_keys(stats[layer_id])
+
+    # Apply timestep range filter
+    if t_range is not None:
+        t_min, t_max = float(t_range[0]), float(t_range[1])
+        t_keys = [k for k in all_t_keys if t_min <= _t_key_to_float(k) <= t_max]
+        if not t_keys:
+            raise ValueError(
+                f"No timesteps in range [{t_min}, {t_max}]. "
+                f"Available: {[_t_key_to_float(k) for k in all_t_keys]}"
+            )
+    else:
+        t_keys = all_t_keys
+
+    n_channels = stats[layer_id][t_keys[0]]["mean"].shape[0]
+    if channel_idx < 0 or channel_idx >= n_channels:
+        raise ValueError(
+            f"channel_idx={channel_idx} out of range for layer '{layer_id}' "
+            f"which has {n_channels} channels."
+        )
+
+    # Build bxp-compatible dicts, one per timestep (denoising order: high→low)
+    box_stats = []
+    for tk in reversed(t_keys):
+        s = stats[layer_id][tk]
+        mu = float(s["mean"][channel_idx])
+        sigma = float(s["std"][channel_idx])
+        lo = float(s["min"][channel_idx])
+        hi = float(s["max"][channel_idx])
+        box_stats.append({
+            "med":    mu,
+            "q1":     mu - 0.674 * sigma,
+            "q3":     mu + 0.674 * sigma,
+            "whislo": lo,
+            "whishi": hi,
+            "fliers": [],
+        })
+
+    t_labels = [f"{_t_key_to_float(k):.0f}" for k in reversed(t_keys)]
+
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(max(8, len(t_keys) * 0.2), 4))
+    else:
+        fig = ax.get_figure()
+
+    _spacing = 0.3  # center-to-center distance; reduce to compress gaps
+    _positions = [i * _spacing for i in range(len(box_stats))]
+    ax.bxp(
+        box_stats,
+        positions=_positions,
+        widths=0.1,
+        showfliers=False,
+        patch_artist=True,
+        boxprops=dict(facecolor="steelblue", alpha=0.6),
+        medianprops=dict(color="white", linewidth=1.5),
+        whiskerprops=dict(color="steelblue"),
+        capprops=dict(color="steelblue"),
+    )
+
+    ax.set_xticks(_positions)
+    ax.set_xticklabels(t_labels, rotation=90, ha="center", fontsize=8)
+    ax.set_xlabel("Timestep (denoising order →)", fontsize=9)
+    ax.set_ylabel("Activation value", fontsize=9)
+
+    range_str = f"  t ∈ [{t_range[0]:.0f}, {t_range[1]:.0f}]" if t_range else ""
+    ax.set_title(
+        f"Channel {channel_idx} activation distribution across timesteps\n"
+        f"Layer: {layer_id}{range_str}  "
+        f"(box = mean ± 0.674σ, whiskers = [min, max])",
+        fontsize=10,
+    )
+    ax.grid(True, axis="y", alpha=0.3)
+
+    if own_fig:
+        fig.tight_layout()
+
+    if output_dir is not None:
+        safe_layer = layer_id.replace("/", "_")
+        fname = output_dir / f"channel_boxplot_{safe_layer}_ch{channel_idx:04d}.png"
+        fig.savefig(fname, dpi=150)
+        print(f"  Saved {fname.name}")
+
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Plot 7 (helper): Group boundary computation for HTG analysis
+# ---------------------------------------------------------------------------
+
+def _group_boundaries(t_vals_asc: np.ndarray, divisor: int) -> np.ndarray:
+    """
+    Return timestep values at which HTG group transitions occur for a given divisor.
+
+    With T timesteps and divisor d, G = T // d equal-count groups are formed.
+    The boundary between group i and i+1 is the midpoint between the last
+    timestep of group i and the first timestep of group i+1.
+
+    Parameters
+    ----------
+    t_vals_asc : (T,) array of timestep values sorted ascending
+    divisor : int  — e.g. 2 → T/2 groups, 5 → T/5 groups, 10 → T/10 groups
+    """
+    T = len(t_vals_asc)
+    G = max(1, T // divisor)
+    step = T // G
+    boundaries = []
+    for i in range(1, G):
+        idx = i * step
+        if idx < T:
+            mid = (float(t_vals_asc[idx - 1]) + float(t_vals_asc[idx])) / 2.0
+            boundaries.append(mid)
+    return np.array(boundaries)
+
+
+# ---------------------------------------------------------------------------
+# Plot 8: Channel activation range vs timestep (continuous band + group lines)
+# ---------------------------------------------------------------------------
+
+def plot_channel_range_vs_timestep(
+    stats: Dict[str, Dict[str, Dict[str, np.ndarray]]],
+    layer_id: str,
+    channel_idx: int,
+    group_divisors: List[int] | None = None,
+    output_dir: Path | None = None,
+    ax=None,
+) -> plt.Figure:
+    """
+    Plot a single channel's activation statistics as a continuous band over
+    all profiled timesteps, with optional HTG group-boundary overlays.
+
+    Useful for investigating whether T/2, T/5, or T/10 grouping aligns with
+    where activation statistics actually change across the diffusion trajectory.
+
+    Visual elements
+    ---------------
+    - Faint fill  (alpha=0.15): [min, max] envelope
+    - Medium fill (alpha=0.35): mean ± std band
+    - Solid line:               mean
+    - Dashed black line:        y = 0
+    - Vertical dashed lines:    group boundaries for each entry in
+                                ``group_divisors`` (one colour per divisor)
+
+    Parameters
+    ----------
+    stats : dict from load_stats()
+        Works with both ``kind="post"`` (D=6144) and ``kind="pre"`` (D=1536).
+    layer_id : str
+        e.g. ``"mm_05_img"``.
+    channel_idx : int
+        Zero-based channel index.
+    group_divisors : list[int] or None
+        Divisors for overlaying group boundaries.  e.g. ``[2, 5, 10]`` draws
+        boundaries for T/2, T/5, and T/10 groups.  ``None`` = no overlays.
+    output_dir : Path or None
+        If given, saves as ``channel_range_{layer_id}_ch{channel_idx:04d}.png``.
+    ax : matplotlib Axes or None
+        Draw into an existing axes (notebook); ``None`` creates a new figure.
+
+    Returns
+    -------
+    fig : matplotlib Figure
+    """
+    if layer_id not in stats:
+        raise KeyError(
+            f"Layer '{layer_id}' not found. Available: {sorted(stats.keys())}"
+        )
+
+    t_keys = _sorted_timestep_keys(stats[layer_id])
+    n_ch = stats[layer_id][t_keys[0]]["mean"].shape[0]
+    if not (0 <= channel_idx < n_ch):
+        raise ValueError(
+            f"channel_idx={channel_idx} out of range; layer '{layer_id}' has {n_ch} channels."
+        )
+
+    # Collect per-timestep stats for this channel (denoising order: high → low)
+    t_vals = np.array([_t_key_to_float(k) for k in reversed(t_keys)])
+    means  = np.array([stats[layer_id][k]["mean"][channel_idx] for k in reversed(t_keys)])
+    stds   = np.array([stats[layer_id][k]["std"][channel_idx]  for k in reversed(t_keys)])
+    lows   = np.array([stats[layer_id][k]["min"][channel_idx]  for k in reversed(t_keys)])
+    highs  = np.array([stats[layer_id][k]["max"][channel_idx]  for k in reversed(t_keys)])
+
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(max(8, len(t_vals) * 0.18), 4))
+    else:
+        fig = ax.get_figure()
+
+    color = "steelblue"
+    ax.fill_between(t_vals, lows,  highs,            color=color, alpha=0.15, label="[min, max]")
+    ax.fill_between(t_vals, means - stds, means + stds, color=color, alpha=0.35, label="mean ± std")
+    ax.plot(t_vals, means, color=color, linewidth=1.2, label="mean")
+    ax.axhline(0, color="black", linewidth=0.6, linestyle="--", alpha=0.5)
+
+    # Group boundary overlays
+    if group_divisors:
+        t_asc = np.sort(t_vals)   # ascending for boundary computation
+        _COLORS = plt.get_cmap("tab10").colors  # type: ignore[attr-defined]
+        for i, d in enumerate(sorted(group_divisors)):
+            boundaries = _group_boundaries(t_asc, d)
+            G = max(1, len(t_vals) // d)
+            c = _COLORS[i % len(_COLORS)]
+            for j, b in enumerate(boundaries):
+                ax.axvline(
+                    b, color=c, linewidth=0.9, linestyle=":",
+                    label=f"T/{d} ({G} groups)" if j == 0 else "_nolegend_",
+                )
+
+    # X-axis: denoising direction label (high → low already)
+    ax.invert_xaxis()
+    ax.set_xlabel("Timestep (denoising direction →)", fontsize=9)
+    ax.set_ylabel("Activation value", fontsize=9)
+    ax.set_title(
+        f"Ch {channel_idx} activation range vs timestep  |  layer: {layer_id}",
+        fontsize=10,
+    )
+    ax.legend(fontsize=7, loc="upper right", ncol=max(1, 1 + len(group_divisors or [])))
+    ax.grid(True, axis="y", alpha=0.25)
+
+    if own_fig:
+        fig.tight_layout()
+
+    if output_dir is not None:
+        safe_layer = layer_id.replace("/", "_")
+        fname = output_dir / f"channel_range_{safe_layer}_ch{channel_idx:04d}.png"
+        fig.savefig(fname, dpi=150)
+        print(f"  Saved {fname.name}")
+
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Plot 9: Unified channel-wise distribution with HTG transform modes
+# ---------------------------------------------------------------------------
+
+def _load_corrections(corrections_path: str) -> Dict[str, np.ndarray]:
+    """Load htg_corrections.npz or htg_params.npz into a flat dict."""
+    data = np.load(corrections_path, allow_pickle=True)
+    return {k: data[k] for k in data.files}
+
+
+def _find_htg_layer(corrections: Dict[str, np.ndarray], layer_id: str) -> str | None:
+    """
+    Match a stats layer_id (e.g. ``"mm_05_img"``) to the corresponding HTG
+    layer key in the corrections file.
+
+    Post-GELU stats correspond to the output of fc1+GELU, so we look for
+    ``{layer_id}_fc1`` first, then any key that begins with ``{layer_id}_``.
+    """
+    preferred = f"{layer_id}_fc1"
+    htg_layer_ids = {k.split("::")[0] for k in corrections if "::" in k}
+    if preferred in htg_layer_ids:
+        return preferred
+    for lid in sorted(htg_layer_ids):
+        if lid.startswith(layer_id + "_"):
+            return lid
+    return None
+
+
+def _snap_timestep(stats_layer: Dict[str, Dict[str, np.ndarray]], timestep: float) -> str:
+    """Return the t_key whose float value is closest to ``timestep``."""
+    t_keys = list(stats_layer.keys())
+    return min(t_keys, key=lambda k: abs(_t_key_to_float(k) - timestep))
+
+
+def _apply_transform(
+    mode: str,
+    mean: np.ndarray,
+    std: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    z_g: np.ndarray,
+    s: np.ndarray,
+) -> tuple:
+    """
+    Apply the requested HTG transform to per-channel summary statistics.
+
+    Parameters
+    ----------
+    mode : ``"original"`` | ``"shifted"`` | ``"scaled"``
+    z_g  : (D,) per-channel group shift
+    s    : (D,) per-channel scale (safe, ≥ 1e-8)
+
+    Returns
+    -------
+    (mean, std, lo, hi) after transformation
+    """
+    if mode == "original":
+        return mean, std, lo, hi
+    if mode == "shifted":
+        return mean - z_g, std, lo - z_g, hi - z_g
+    if mode == "scaled":
+        return (mean - z_g) / s, std / s, (lo - z_g) / s, (hi - z_g) / s
+    raise ValueError(f"Unknown mode '{mode}'. Choose from: 'original', 'shifted', 'scaled'.")
+
+
+_MODE_COLOR = {
+    "original": "steelblue",
+    "shifted":  "darkorange",
+    "scaled":   "seagreen",
+}
+
+_MODE_LABEL = {
+    "original": "X  (raw)",
+    "shifted":  "X − z_g",
+    "scaled":   "(X − z_g) / s",
+}
+
+
+def plot_channel_distribution(
+    stats: Dict[str, Dict[str, Dict[str, np.ndarray]]],
+    layer_id: str,
+    timestep: float,
+    corrections_path: str | None = None,
+    show: List[str] = ("original",),
+    channel_idx: "int | List[int] | None" = None,
+    output_dir: Path | None = None,
+) -> plt.Figure:
+    """
+    Plot the channel-wise activation distribution for a given layer and
+    timestep, with optional HTG transforms applied.
+
+    One panel is drawn per entry in ``show``, stacked vertically and sharing
+    the x-axis (channel index). Each panel displays:
+      - Faint envelope:  [min, max] across calibration samples
+      - Shaded band:     mean ± std
+      - Line:            mean
+      - Dashed line:     y = 0
+
+    Supported transform modes
+    -------------------------
+    ``"original"``
+        Raw activations X.  Works with both ``kind="post"`` and ``kind="pre"``.
+    ``"shifted"``
+        X − z_g[group]  — subtracts the per-group HTG shifting vector.
+        Requires ``stats`` loaded with ``load_stats(path, kind="pre")`` so that
+        D matches z_g (both = hidden_size).
+    ``"scaled"``
+        (X − z_g[group]) / s  — full HTG normalization (shift + scale).
+        Also requires ``kind="pre"`` stats.
+
+    Parameters
+    ----------
+    stats : dict from load_stats()
+        For ``"shifted"`` / ``"scaled"`` modes use ``load_stats(path, kind="pre")``
+        to obtain fc1 input activation stats (D = hidden_size) that align with z_g.
+    layer_id : str
+        Stats layer ID, e.g. ``"mm_05_img"``. For ``"shifted"`` and
+        ``"scaled"`` modes the matching HTG layer (``"mm_05_img_fc1"``)
+        is resolved automatically from the corrections file.
+    timestep : float
+        Target denoising timestep (snapped to nearest recorded value).
+    corrections_path : str or None
+        Path to ``htg_corrections.npz`` or ``htg_params.npz``. Required
+        when ``show`` includes ``"shifted"`` or ``"scaled"``.
+    show : sequence of str
+        Ordered list of modes to display. Default: ``("original",)``.
+        Each entry produces one panel.
+    channel_idx : int, list of int, or None
+        Channels to display. A single int selects one channel; a list selects
+        multiple (plotted at their true channel-index positions on the x-axis);
+        ``None`` (default) displays all channels.
+    output_dir : Path or None
+        If given, saves the figure as
+        ``channel_dist_{layer_id}_t{t:.0f}_{modes}.png``.
+
+    Returns
+    -------
+    fig : matplotlib Figure
+    """
+    _valid_modes = {"original", "shifted", "scaled"}
+    show = list(show)
+    for m in show:
+        if m not in _valid_modes:
+            raise ValueError(f"Unknown mode '{m}'. Choose from: {sorted(_valid_modes)}.")
+
+    needs_corrections = any(m in ("shifted", "scaled") for m in show)
+    if needs_corrections and corrections_path is None:
+        raise ValueError(
+            "corrections_path is required for 'shifted' and 'scaled' modes."
+        )
+
+    if layer_id not in stats:
+        raise KeyError(
+            f"Layer '{layer_id}' not found. Available: {sorted(stats.keys())}"
+        )
+
+    # --- Snap to nearest recorded timestep ---
+    t_key = _snap_timestep(stats[layer_id], timestep)
+    t_actual = _t_key_to_float(t_key)
+    if abs(t_actual - timestep) > 1.0:
+        print(f"  Note: requested t={timestep:.1f}, snapped to t={t_actual:.1f}")
+
+    s_dict = stats[layer_id][t_key]
+    mean = s_dict["mean"].astype(np.float64)   # (D,)
+    std  = s_dict["std"].astype(np.float64)    # (D,)
+    lo   = s_dict["min"].astype(np.float64)    # (D,)
+    hi   = s_dict["max"].astype(np.float64)    # (D,)
+    D = mean.shape[0]
+    ch = np.arange(D)
+
+    # --- Load HTG corrections if needed ---
+    z_g = np.zeros(D, dtype=np.float64)
+    s_scale = np.ones(D, dtype=np.float64)
+    group_label = ""
+    htg_lid = None
+
+    if needs_corrections:
+        corrections = _load_corrections(corrections_path)
+        htg_lid = _find_htg_layer(corrections, layer_id)
+        if htg_lid is None:
+            print(
+                f"  Warning: no HTG corrections found for '{layer_id}'. "
+                f"z_g=0, s=1 will be used."
+            )
+        else:
+            z_g_all   = corrections[f"{htg_lid}::z_g"].astype(np.float64)   # (G, D)
+            s_raw     = corrections[f"{htg_lid}::s"].astype(np.float64)      # (D,)
+            group_asn = corrections[f"{htg_lid}::group_assignments"]          # (T,)
+            ts_sorted = corrections["timesteps_sorted"].astype(np.float64)   # (T,)
+
+            t_idx = int(np.argmin(np.abs(ts_sorted - t_actual)))
+            g_idx = int(group_asn[t_idx])
+            z_g     = z_g_all[g_idx]
+            s_scale = np.maximum(s_raw, 1e-8)
+            group_label = f"group {g_idx}  ({htg_lid})"
+
+            # Dimension sanity check: z_g is for fc1 *input* (D=hidden),
+            # but post-GELU stats are for fc1 *output* (D=4×hidden).
+            if z_g.shape[0] != D:
+                raise ValueError(
+                    f"Dimension mismatch for layer '{layer_id}': "
+                    f"activation stats have D={D} (post-GELU, fc1 output = 4 × hidden_size) "
+                    f"but z_g has D={z_g.shape[0]} (fc1 input = hidden_size). "
+                    f"Load fc1 input stats with load_stats(path, kind='pre') — these have "
+                    f"D={z_g.shape[0]} and align with z_g / s from the corrections file."
+                )
+
+    # --- Channel selection ---
+    if channel_idx is None:
+        sel = np.arange(D)
+    elif isinstance(channel_idx, int):
+        sel = np.array([channel_idx])
+    else:
+        sel = np.array(sorted(channel_idx))
+
+    ch      = sel
+    mean    = mean[sel]
+    std     = std[sel]
+    lo      = lo[sel]
+    hi      = hi[sel]
+    z_g     = z_g[sel]
+    s_scale = s_scale[sel]
+
+    D_plot = len(sel)
+    ch_label = (
+        "Channel index"
+        if channel_idx is None
+        else f"Channel index  (showing {D_plot} of {D})"
+    )
+
+    # --- Build figure ---
+    _spacing = 0.3
+    _positions = [i * _spacing for i in range(D_plot)]
+
+    n_panels = len(show)
+    fig, axes = plt.subplots(
+        n_panels, 1,
+        figsize=(min(16, max(10, D_plot // 100)), 3.5 * n_panels),
+        sharex=True,
+        squeeze=False,
+    )
+
+    def _draw_panel(ax, mu, sg, vlo, vhi, color, title):
+        box_stats = [
+            {
+                "med":    float(mu[i]),
+                "q1":     float(mu[i] - 0.674 * sg[i]),
+                "q3":     float(mu[i] + 0.674 * sg[i]),
+                "whislo": float(vlo[i]),
+                "whishi": float(vhi[i]),
+                "fliers": [],
+            }
+            for i in range(D_plot)
+        ]
+        ax.bxp(
+            box_stats,
+            positions=_positions,
+            widths=0.1,
+            showfliers=False,
+            patch_artist=True,
+            boxprops=dict(facecolor=color, alpha=0.6),
+            medianprops=dict(color="white", linewidth=1.5),
+            whiskerprops=dict(color=color),
+            capprops=dict(color=color),
+        )
+        ax.axhline(0, color="black", linewidth=0.6, linestyle="--", alpha=0.5)
+        ax.set_ylabel("Activation value", fontsize=9)
+        ax.set_title(title, fontsize=9)
+        ax.grid(True, axis="y", alpha=0.25)
+
+    # Pre-compute all transforms to find shared y range
+    transformed = [
+        _apply_transform(mode, mean, std, lo, hi, z_g, s_scale) for mode in show
+    ]
+    y_min = min(float(vlo.min()) for _, _, vlo, _ in transformed)
+    y_max = max(float(vhi.max()) for _, _, _, vhi in transformed)
+    y_pad = (y_max - y_min) * 0.05
+    y_lim = (y_min - y_pad, y_max + y_pad)
+
+    for row, (mode, (mu, sg, vlo, vhi)) in enumerate(zip(show, transformed)):
+        ax = axes[row, 0]
+
+        subtitle = f"{_MODE_LABEL[mode]}"
+        if mode != "original" and group_label:
+            subtitle += f"  |  {group_label}"
+
+        _draw_panel(ax, mu, sg, vlo, vhi, color=_MODE_COLOR[mode], title=subtitle)
+        ax.set_ylim(y_lim)
+
+    axes[-1, 0].set_xticks(_positions)
+    axes[-1, 0].set_xticklabels([str(c) for c in sel], rotation=90, ha="center", fontsize=8)
+    axes[-1, 0].set_xlabel(ch_label, fontsize=9)
+    fig.suptitle(
+        f"Channel-wise activation distribution  |  layer: {layer_id}  |  t ≈ {t_actual:.0f}",
+        fontsize=11,
+    )
+    fig.tight_layout()
+
+    if output_dir is not None:
+        safe_layer = layer_id.replace("/", "_")
+        modes_tag = "_".join(show)
+        fname = output_dir / f"channel_dist_{safe_layer}_t{t_actual:.0f}_{modes_tag}.png"
+        fig.savefig(fname, dpi=150)
+        print(f"  Saved {fname.name}")
+
+    return fig
 
 
 # ---------------------------------------------------------------------------

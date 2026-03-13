@@ -34,12 +34,29 @@ python -m src.inference.run_inference \\
     --prompt "a red fox running through snow" \\
     --output htg_adaln_only.png
 
-# HTG + integer quantization
+# HTG + weight quantization only (W8)
 python -m src.inference.run_inference \\
     --htg-corrections htg_output/htg_corrections.npz \\
-    --htg-quantize --htg-bits 8 \\
+    --htg-quantize-weights --htg-bits 8 \\
     --prompt "a red fox running through snow" \\
-    --output htg_quantized.png
+    --output htg_w8.png
+
+# HTG + activation fake-quantization only (A8)
+python -m src.inference.run_inference \\
+    --htg-corrections htg_output/htg_corrections.npz \\
+    --htg-quantize-activations \\
+    --htg-activation-ranges htg_output/htg_activation_ranges.npz \\
+    --prompt "a red fox running through snow" \\
+    --output htg_a8.png
+
+# HTG + full W8A8 (paper-aligned)
+python -m src.inference.run_inference \\
+    --htg-corrections htg_output/htg_corrections.npz \\
+    --htg-quantize-weights --htg-bits 8 \\
+    --htg-quantize-activations \\
+    --htg-activation-ranges htg_output/htg_activation_ranges.npz \\
+    --prompt "a red fox running through snow" \\
+    --output htg_w8a8.png
 """
 
 from __future__ import annotations
@@ -128,11 +145,21 @@ def build_parser() -> argparse.ArgumentParser:
                      dest="htg_oproj", default=True,
                      help="Disable oproj sdpa_output shift correction")
     htg.add_argument("--htg-quantize", action="store_true", default=False,
-                     help="Apply MLX block-wise integer quantization after rescaling")
+                     help="(Backward compat) Alias for --htg-quantize-weights")
+    htg.add_argument("--htg-quantize-weights", action="store_true", default=False,
+                     help="Apply MLX block-wise integer weight quantization (W8/W4)")
     htg.add_argument("--htg-bits", type=int, default=8, choices=[4, 8],
-                     help="Quantization bit-width (only used with --htg-quantize)")
+                     help="Weight quantization bit-width")
     htg.add_argument("--htg-group-size", type=int, default=64,
-                     help="MLX quantization group size (only with --htg-quantize)")
+                     help="MLX weight quantization group size")
+    htg.add_argument("--htg-quantize-activations", action="store_true", default=False,
+                     help="Fake-quantize activation inputs (simulates A8, paper Algorithm 2)")
+    htg.add_argument("--htg-activation-ranges", type=str, default=None,
+                     help="Path to htg_activation_ranges.npz (required for --htg-quantize-activations)")
+    htg.add_argument("--htg-activation-bits", type=int, default=8, choices=[4, 8],
+                     help="Activation fake-quantization bit-width")
+    htg.add_argument("--debug", action="store_true", default=False,
+                     help="Enable HTG quantization diagnostics (weight/activation error, timestep misses)")
 
     # ── Placeholder groups for future strategies ──────────────────────
     # Add --adaround-* and --bb-* argument groups here when implemented.
@@ -145,6 +172,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Load base pipeline ─────────────────────────────────────────────
+
     print(f"Loading model: {args.model_version}")
     pipeline = _load_pipeline(args.model_version, args.local_ckpt, args.low_memory_mode)
 
@@ -155,6 +183,10 @@ def main() -> None:
     transforms = []
 
     if args.htg_corrections is not None:
+        q_weights = args.htg_quantize_weights or args.htg_quantize
+        q_acts = args.htg_quantize_activations
+        if q_acts and not args.htg_activation_ranges:
+            parser.error("--htg-quantize-activations requires --htg-activation-ranges")
         print(f"HTG corrections: {args.htg_corrections}")
         htg_transform = HTGTransform(
             corrections_path=args.htg_corrections,
@@ -162,14 +194,22 @@ def main() -> None:
             apply_qkv_correction=args.htg_qkv,
             apply_fc1_correction=args.htg_fc1,
             apply_oproj_correction=args.htg_oproj,
-            quantize=args.htg_quantize,
+            quantize_weights=q_weights,
+            quantize_activations=q_acts,
             weight_bits=args.htg_bits,
+            activation_bits=args.htg_activation_bits,
             group_size=args.htg_group_size,
+            activation_ranges_path=args.htg_activation_ranges,
+            debug=args.debug,
         )
         transforms.append(htg_transform)
+        mode = "/".join(filter(None, [
+            f"W{args.htg_bits}" if q_weights else None,
+            f"A{args.htg_activation_bits}" if q_acts else None,
+        ])) or "corrections only"
         print(f"  weight_rescaling={args.htg_weight_rescaling}, "
               f"qkv={args.htg_qkv}, fc1={args.htg_fc1}, oproj={args.htg_oproj}, "
-              f"quantize={args.htg_quantize}")
+              f"quantization={mode}")
     else:
         print("No transforms configured — running FP16 baseline.")
 
@@ -197,6 +237,9 @@ def main() -> None:
     print(f"\nSaved → {out_path.resolve()}")
 
     qpipe.remove()
+
+    if args.debug and args.htg_corrections is not None:
+        htg_transform.print_debug_summary()
 
 
 if __name__ == "__main__":

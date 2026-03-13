@@ -5,13 +5,13 @@ Aligned with arXiv:2503.06930 (HTG), Section 5.1:
   "We randomly generate 32 class-conditioned samples and save both the
    intermediate and output feature maps at each timestep."
 
-SD3 adaptation: class-conditioned → text-conditioned (20 diverse prompts).
+SD3 adaptation: class-conditioned → text-conditioned (32 diverse prompts), 50-step schedule.
 """
 
 from pathlib import Path
 
-# Paper: 100-step diffusion process
-NUM_SAMPLING_STEPS = 100
+# SD3 deployment target: 50-step inference (paper used 100-step DDPM)
+NUM_SAMPLING_STEPS = 50
 
 # Paper: "randomly generate 32 ... samples"
 NUM_CALIBRATION_SAMPLES = 32

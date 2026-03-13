@@ -12,13 +12,14 @@ source on disk. It works by:
   - Maintain a lightweight "current context" (layer_id, timestep).
 - Monkey-patching FFN.__call__ to:
   - Reproduce the original computation: fc1 -> GELU -> fc2.
-  - Record statistics for the *post-GELU* activations from fc1.
+  - Record statistics for the *pre-fc1* input activations (D = hidden_size).
+  - Record statistics for the *post-GELU* activations from fc1 (D = 4 × hidden_size).
 
 Only calls executed while a tracing context is active are recorded, so
 other uses of FFN elsewhere in DiffusionKit are left untouched apart
 from a small wrapper overhead.
 
-What we record (per layer_id, per timestep):
+What we record (per layer_id, per timestep), for both pre-fc1 and post-GELU:
 - count: total number of activation elements seen per channel
 - sum:   sum over all positions for each hidden unit
 - sq_sum: sum of squares (for variance)
@@ -29,6 +30,9 @@ From these, you can reconstruct:
 - mean, variance, std
 - channel-wise ranges
 - full activation histograms (TaQ-DiT Figs 2-3 style)
+
+Pre-fc1 stats (D = hidden_size) align with the HTG correction vectors (z_g, s)
+and are the correct input for visualizing shifted/scaled channel distributions.
 """
 
 from __future__ import annotations
@@ -118,14 +122,27 @@ class ActivationTracer:
     Global tracing state.
 
     A single ActivationTracer instance is intended to be active at once.
+
+    Two parallel stat collections are maintained:
+    - ``stats``     — post-GELU activations (fc1 output, D = 4 × hidden_size)
+    - ``pre_stats`` — pre-fc1 input activations (fc1 input, D = hidden_size)
+
+    Use ``summarize()`` / ``summarize_pre()`` to retrieve them separately.
+    ``pre_stats`` align dimensionally with the HTG correction vectors (z_g, s)
+    and are the correct data source for shifted/scaled channel distribution plots.
     """
 
     # id(block) -> layer_id string (keyed by Python object id since nn.Module is unhashable)
     layer_ids: Dict[int, str] = field(default_factory=dict)
 
-    # stats[layer_id][timestep_key] -> PerLayerTimeStats
+    # stats[layer_id][timestep_key] -> PerLayerTimeStats  (post-GELU, D = 4 × hidden)
     # timestep_key is a string to avoid float dict-key precision issues
     stats: Dict[str, Dict[str, PerLayerTimeStats]] = field(
+        default_factory=dict
+    )
+
+    # pre_stats[layer_id][timestep_key] -> PerLayerTimeStats  (fc1 input, D = hidden)
+    pre_stats: Dict[str, Dict[str, PerLayerTimeStats]] = field(
         default_factory=dict
     )
 
@@ -142,12 +159,12 @@ class ActivationTracer:
     def current_context(self) -> Optional[Tuple[str, str]]:
         return self._context_stack[-1] if self._context_stack else None
 
-    def record_post_activation(self, act: mx.array) -> None:
-        """
-        Record statistics for a single FFN post-activation tensor.
-
-        act: MLX array of shape (B, S, 1, D_hidden) or similar.
-        """
+    def _record_activation(
+        self,
+        act: mx.array,
+        store: Dict[str, Dict[str, PerLayerTimeStats]],
+    ) -> None:
+        """Accumulate per-channel statistics for *act* into *store*."""
         ctx = self.current_context
         if ctx is None:
             return
@@ -164,7 +181,6 @@ class ActivationTracer:
         min_vec = mx.min(act_f32, axis=axes)
         max_vec = mx.max(act_f32, axis=axes)
 
-        # Flatten to 1-D for global histogram (across all channels and positions)
         flat_np = np.asarray(act_f32.reshape(-1))
         hist_counts, _ = np.histogram(
             flat_np,
@@ -177,7 +193,7 @@ class ActivationTracer:
         min_np = np.asarray(min_vec)
         max_np = np.asarray(max_vec)
 
-        layer_stats = self.stats.setdefault(layer_id, {})
+        layer_stats = store.setdefault(layer_id, {})
         per_t_stats = layer_stats.get(timestep_key)
         if per_t_stats is None:
             per_t_stats = PerLayerTimeStats()
@@ -192,9 +208,39 @@ class ActivationTracer:
             hist_counts=hist_counts,
         )
 
+    def record_pre_activation(self, act: mx.array) -> None:
+        """
+        Record statistics for the FFN pre-fc1 input tensor.
+
+        act: MLX array of shape (B, S, D) where D = hidden_size (e.g. 1536).
+        Results are stored in ``pre_stats`` and align with HTG z_g / s vectors.
+        """
+        self._record_activation(act, self.pre_stats)
+
+    def record_post_activation(self, act: mx.array) -> None:
+        """
+        Record statistics for a single FFN post-GELU activation tensor.
+
+        act: MLX array of shape (B, S, D_hidden) where D_hidden = 4 × hidden_size.
+        Results are stored in ``stats``.
+        """
+        self._record_activation(act, self.stats)
+
+    def _summarize_store(
+        self,
+        store: Dict[str, Dict[str, PerLayerTimeStats]],
+    ) -> Dict[str, Dict[str, Dict[str, np.ndarray]]]:
+        out: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
+        for layer_id, tdict in store.items():
+            layer_out: Dict[str, Dict[str, np.ndarray]] = {}
+            for t_key, stats in sorted(tdict.items(), key=lambda kv: kv[0]):
+                layer_out[t_key] = stats.finalize()
+            out[layer_id] = layer_out
+        return out
+
     def summarize(self) -> Dict[str, Dict[str, Dict[str, np.ndarray]]]:
         """
-        Convert internal structures into a nested dict:
+        Return finalized post-GELU stats as a nested dict:
 
         {
           "layer_id": {
@@ -206,13 +252,17 @@ class ActivationTracer:
           },
         }
         """
-        out: Dict[str, Dict[str, Dict[str, np.ndarray]]] = {}
-        for layer_id, tdict in self.stats.items():
-            layer_out: Dict[str, Dict[str, np.ndarray]] = {}
-            for t_key, stats in sorted(tdict.items(), key=lambda kv: kv[0]):
-                layer_out[t_key] = stats.finalize()
-            out[layer_id] = layer_out
-        return out
+        return self._summarize_store(self.stats)
+
+    def summarize_pre(self) -> Dict[str, Dict[str, Dict[str, np.ndarray]]]:
+        """
+        Return finalized pre-fc1 input activation stats as a nested dict.
+
+        Same structure as ``summarize()``, but for fc1 input activations
+        (D = hidden_size). Use these stats with HTG z_g / s for shifted/scaled
+        channel distribution plots.
+        """
+        return self._summarize_store(self.pre_stats)
 
 
 # --- Monkey-patching machinery ------------------------------------------------
@@ -339,9 +389,12 @@ def install_tracing(mmdit: MMDiT) -> ActivationTracer:
         )
 
     def ffn_call_patched(self_ffn: FFN, x: mx.array) -> mx.array:
+        tracer_local = _ACTIVE_TRACER
+        if tracer_local is not None and tracer_local.current_context is not None:
+            tracer_local.record_pre_activation(x)
+
         hidden = self_ffn.act_fn(self_ffn.fc1(x))
 
-        tracer_local = _ACTIVE_TRACER
         if tracer_local is not None and tracer_local.current_context is not None:
             tracer_local.record_post_activation(hidden)
 
