@@ -1086,14 +1086,29 @@ def main() -> None:
         sample_image_indices = get_sample_image_indices(all_sample_files)
         unique_sample_ids = sorted(set(sample_image_indices))
         print(f"  Sample image indices found: {unique_sample_ids}")
-        # Use fallback (first available pooled) for any image missing a pooled file
-        fallback_pooled = next(iter(img_pooled_map.values()))
+        # Build valid_sample_mask — exclude images whose pooled embeddings are missing.
+        # Using fallback (wrong) embeddings gives wrong adaLN modulation → NaN gradients.
         missing = [i for i in unique_sample_ids if i not in img_pooled_map]
         if missing:
-            print(f"  WARNING: {len(missing)} image(s) missing pooled embeddings {missing} — using fallback")
-        global_sample_pooled = np.stack([
-            img_pooled_map.get(idx, fallback_pooled) for idx in sample_image_indices
+            print(f"  WARNING: {len(missing)} image(s) missing pooled embeddings {missing}")
+            print(f"  These samples will be EXCLUDED from optimization to prevent NaN gradients.")
+            print(f"  Run cache_adaround_data with --resume to fill missing pooled files.")
+        global_valid_sample_mask = np.array([
+            img_id in img_pooled_map for img_id in sample_image_indices
         ])
+        n_excluded = int((~global_valid_sample_mask).sum())
+        if n_excluded:
+            print(f"  Excluding {n_excluded}/{len(sample_image_indices)} samples with missing embeddings")
+        global_sample_pooled = np.stack([
+            img_pooled_map[idx] for idx in sample_image_indices
+            if idx in img_pooled_map
+        ])
+        # Filter all_sample_files and sample_sigmas to valid (non-fallback) samples only
+        all_sample_files = [sf for sf, ok in zip(all_sample_files, global_valid_sample_mask) if ok]
+        sample_image_indices = [idx for idx, ok in zip(sample_image_indices, global_valid_sample_mask) if ok]
+        if sample_sigmas is not None:
+            sample_sigmas = sample_sigmas[global_valid_sample_mask]
+        print(f"  Using {len(all_sample_files)} samples from {sorted(set(sample_image_indices))} images")
         print("✓ Per-sample modulation will be computed on the fly\n")
     else:
         print("WARNING: No pooled embeddings found in cache. Run cache_adaround_data.py --resume to generate them.")
