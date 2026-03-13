@@ -236,11 +236,18 @@ def load_prior_block(
     prior_a_scales = []
     for i, path in enumerate(linear_paths):
         safe = path.replace(".", "_")
+        alpha_key = f"{safe}__alpha"
         wi_key = f"{safe}__weight_int"
         sc_key = f"{safe}__scale"
         as_key = f"{safe}__a_scale"
 
-        if wi_key in npz.files and sc_key in npz.files:
+        if alpha_key in npz.files:
+            # Prefer saved raw alpha (exact match, no dtype reconstruction issues)
+            prior_alphas.append(npz[alpha_key])
+            a_scale = float(npz[as_key][0]) if as_key in npz.files else 1.0
+            prior_a_scales.append(a_scale)
+        elif wi_key in npz.files and sc_key in npz.files:
+            # Fallback: reconstruct alpha from hard-rounded weights
             weight_int = npz[wi_key]
             scale = npz[sc_key]
             alpha = reconstruct_alpha(W_fps_np[i], scale, weight_int)
@@ -1175,11 +1182,13 @@ def main() -> None:
         quant_weights = finalize_block(params, W_fps_np, w_scales_np, linear_paths)
         out_npz = weights_dir / f"{block_name}.npz"
         save_dict: Dict[str, np.ndarray] = {}
-        for path, data in quant_weights.items():
+        for i, (path, data) in enumerate(quant_weights.items()):
             safe = path.replace(".", "_")
             save_dict[f"{safe}__weight_int"] = data["weight_int"]
             save_dict[f"{safe}__scale"] = data["scale"]
             save_dict[f"{safe}__a_scale"] = np.array([data["a_scale"]])
+            # Save raw alpha for exact warm-start (avoids dtype mismatch in reconstruct)
+            save_dict[f"{safe}__alpha"] = np.array(params.alphas[i])
         np.savez_compressed(out_npz, **save_dict)
         return linear_paths
 
