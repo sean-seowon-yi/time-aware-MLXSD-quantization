@@ -480,6 +480,15 @@ def block_loss_fn(
     """
     n = len(linear_paths)
 
+    # Cast inputs/targets to float32 — the block's internal attention and norm
+    # backward passes produce NaN gradients in bfloat16 when activations are
+    # quantised (Q/K near-zero → RMSNorm grad explosion, attention grad instability).
+    # Float32 inputs force the entire forward+backward through the block to use
+    # float32 (MLX promotes bfloat16 params to float32 in mixed-precision ops).
+    sample_inputs = [inp.astype(mx.float32) for inp in sample_inputs]
+    sample_kwargs = {k: v.astype(mx.float32) for k, v in sample_kwargs.items()}
+    fp_outputs = [out.astype(mx.float32) for out in fp_outputs]
+
     # Build soft-quantised weights (in computation graph via params.alphas)
     soft_weights: List[mx.array] = []
     for i in range(n):
@@ -516,7 +525,7 @@ def block_loss_fn(
         for path, orig in zip(linear_paths, orig_layers):
             _set_nested(block, path, orig)
 
-    # Reconstruction loss
+    # Reconstruction loss (both output and target are float32 now)
     if isinstance(output, (list, tuple)):
         rec = sum(_lp_loss(out, tgt, LP_NORM) for out, tgt in zip(output, fp_outputs))
     else:
@@ -838,6 +847,24 @@ def optimize_block(
         for i in range(len(params.alphas)):
             total_grads["alphas"][i] = total_grads["alphas"][i] / n_used
             total_grads["a_scales"][i] = total_grads["a_scales"][i] / n_used
+
+        # Force evaluation and check for NaN in accumulated gradients.
+        # The backward pass can produce NaN even when the forward loss is finite
+        # (e.g., attention softmax or RMSNorm gradient instability in bfloat16).
+        all_grad_arrays = total_grads["alphas"] + total_grads["a_scales"]
+        mx.eval(*all_grad_arrays)
+        has_nan_grad = any(mx.isnan(g).any().item() for g in all_grad_arrays)
+        if has_nan_grad:
+            if step < 10 or step % 100 == 0:
+                print(
+                    f"  WARNING: NaN in gradients at step {step} (b={b_val:.1f}), "
+                    f"skipping optimizer update",
+                    flush=True,
+                )
+            loss_val = float(total_loss) / n_used
+            loss_history.append(loss_val)
+            pbar.update(1)
+            continue
 
         # Clip gradients: a_scale needs tight clipping (small param, sensitive to explosion)
         # alpha uses a looser clip — needs enough gradient to make rounding decisions
