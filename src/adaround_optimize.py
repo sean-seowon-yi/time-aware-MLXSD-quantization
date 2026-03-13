@@ -689,7 +689,14 @@ def optimize_block(
     init_a_scales = prior_a_scales
     if init_a_scales is None and poly_schedule is not None:
         qmax_a = 2 ** (bits_a - 1) - 1
-        repr_sigma = float(np.median(sample_sigmas)) if sample_sigmas is not None else 0.5
+        # Use median sigma if available and non-degenerate. If sample_sigmas are all
+        # zero (older cache without embedded __sigma__ key), fall back to σ=1.0 so
+        # that a_scale is initialized at the worst-case (highest-noise) clipping range,
+        # which is conservative and avoids catastrophic under-clipping at init.
+        if sample_sigmas is not None and float(np.max(sample_sigmas)) > 0.01:
+            repr_sigma = float(np.median(sample_sigmas))
+        else:
+            repr_sigma = 1.0  # conservative fallback: max noise level
         init_a_scales = _init_a_scales_from_poly(
             poly_schedule, block_name, is_mm, linear_paths, repr_sigma, qmax_a=qmax_a
         )
