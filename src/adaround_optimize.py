@@ -981,17 +981,9 @@ def optimize_block(
                 s_inputs, s_kwargs, s_outputs,
                 b_val, poly_alphas, poly_shifts,
             )
-            mx.eval(loss_i)
-
-            # Skip NaN samples — don't let one bad sample corrupt the whole mini-batch
-            loss_i_val = float(loss_i)
-            if math.isnan(loss_i_val) or math.isinf(loss_i_val):
-                print(
-                    f"  WARNING: NaN/Inf loss for sample {si} at step {step}"
-                    f" (b={b_val:.1f}), skipping",
-                    flush=True,
-                )
-                continue
+            # NO mx.eval here — keep everything lazy.
+            # Accumulate loss and grads in the computation graph so MLX can
+            # fuse all 16 forward+backward passes into one evaluation.
 
             w_i = float(sample_weights[si]) if sample_weights is not None else 1.0
             total_loss = total_loss + w_i * loss_i
@@ -1008,7 +1000,6 @@ def optimize_block(
                 else:
                     total_grads = grads_i
             else:
-                # Accumulate grads (same structure as params)
                 for i in range(len(params.alphas)):
                     total_grads["alphas"][i] = (
                         total_grads["alphas"][i] + w_i * grads_i["alphas"][i]
@@ -1017,10 +1008,8 @@ def optimize_block(
                         total_grads["a_scales"][i] + w_i * grads_i["a_scales"][i]
                     )
 
-        # Count valid (non-NaN) samples actually accumulated
         n_used = n_valid
         if total_grads is None:
-            # All samples in this batch produced NaN — skip the optimizer step
             loss_val = float("nan")
             loss_history.append(loss_val)
             if step % 50 == 0:
@@ -1036,11 +1025,29 @@ def optimize_block(
             total_grads["alphas"][i] = total_grads["alphas"][i] / grad_denom
             total_grads["a_scales"][i] = total_grads["a_scales"][i] / grad_denom
 
-        # Force evaluation and check for NaN in accumulated gradients.
-        # The backward pass can produce NaN even when the forward loss is finite
-        # (e.g., attention softmax or RMSNorm gradient instability in bfloat16).
+        # Single eval for the entire batch: loss + all gradients together.
+        # This lets MLX fuse all 16 forward+backward passes into one GPU dispatch
+        # instead of 16 separate sync points.
         all_grad_arrays = total_grads["alphas"] + total_grads["a_scales"]
-        mx.eval(*all_grad_arrays)
+        mx.eval(total_loss, *all_grad_arrays)
+
+        # NaN check on the batch total (if any sample was NaN, total is NaN)
+        # Capture loss_val NOW before the optimizer mutates params, which would
+        # invalidate the lazy graph and give a wrong value if re-evaluated later.
+        loss_denom = weight_sum if sample_weights is not None else n_used
+        loss_val = float(total_loss) / loss_denom
+        loss_uw_val = float(total_loss_uw) / n_used if n_used > 0 else loss_val
+        if math.isnan(loss_val) or math.isinf(loss_val):
+            if step < 10 or step % 100 == 0:
+                print(
+                    f"  WARNING: NaN/Inf loss at step {step} (b={b_val:.1f}), "
+                    f"skipping optimizer update",
+                    flush=True,
+                )
+            loss_history.append(loss_val)
+            pbar.update(1)
+            continue
+
         has_nan_grad = any(mx.isnan(g).any().item() for g in all_grad_arrays)
         if has_nan_grad:
             if step < 10 or step % 100 == 0:
@@ -1049,8 +1056,6 @@ def optimize_block(
                     f"skipping optimizer update",
                     flush=True,
                 )
-            loss_denom = weight_sum if sample_weights is not None else n_used
-            loss_val = float(total_loss) / loss_denom
             loss_history.append(loss_val)
             pbar.update(1)
             continue
@@ -1080,19 +1085,16 @@ def optimize_block(
 
         mx.eval(params.parameters(), w_opt.state, a_opt.state)
 
-        loss_denom = weight_sum if sample_weights is not None else n_used
-        loss_val = float(total_loss) / loss_denom
+        # loss_val was captured before optimizer step (see above)
         loss_history.append(loss_val)
 
         if step % 50 == 0:
             if sample_weights is not None:
-                loss_uw_val = float(total_loss_uw) / n_used
                 pbar.set_postfix(loss_w=f"{loss_val:.4f}", loss_uw=f"{loss_uw_val:.4f}", b=f"{b_val:.1f}")
             else:
                 pbar.set_postfix(loss=f"{loss_val:.4f}", b=f"{b_val:.1f}")
         if step % 200 == 0:
             if sample_weights is not None:
-                loss_uw_val = float(total_loss_uw) / n_used
                 print(f"  {block_name} iter {step}/{iters}  loss(w)={loss_val:.4f}  loss(uw)={loss_uw_val:.4f}  b={b_val:.1f}", flush=True)
             else:
                 print(f"  {block_name} iter {step}/{iters}  loss={loss_val:.4f}  b={b_val:.1f}", flush=True)
