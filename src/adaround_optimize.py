@@ -32,10 +32,69 @@ Simplifications vs full TaQ-DiT:
   - W4 applied to all blocks (TaQ-DiT uses W8 for first/last few)
 
 Usage:
-    conda run -n diffusionkit python -m src.adaround_optimize \\
+--no-capture-output flag is what lets tqdm progress bars stream through)
+    # Basic training
+    conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \\
         --adaround-cache /path/to/adaround_cache \\
         --output /path/to/quantized_weights_adaround \\
         [--iters 20000] [--batch-size 16] [--bits-w 4] [--bits-a 8]
+
+    # Poly-clipping + σ-weighted loss (Module A)
+    conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \\
+        --adaround-cache /path/to/adaround_cache \\
+        --output /path/to/quantized_weights_poly \\
+        --poly-schedule polynomial_clipping_schedule.json \\
+        --sigma-weighted --sigma-weight-offset 1.0
+
+    # Refine from prior run, skipping converged blocks (< 0.5% tail improvement)
+    conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \\
+        --adaround-cache /path/to/adaround_cache \\
+        --output /path/to/quantized_weights_poly \\
+        --poly-schedule polynomial_clipping_schedule.json \\
+        --refine --refine-skip-converged 0.5 --iters 500
+
+    # FP16 layer exclusion (Module B) — keep extreme-shift layers in FP16
+    conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \\
+        --adaround-cache /path/to/adaround_cache \\
+        --output /path/to/quantized_weights_exclude \\
+        --poly-schedule polynomial_clipping_schedule.json \\
+        --exclude-extreme-shift \\
+        --refine --refine-skip-converged 0.5
+
+    # Asymmetric activation quant (Module C) — requires poly schedule with shift coeffs
+    conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \\
+        --adaround-cache /path/to/adaround_cache \\
+        --output /path/to/quantized_weights_asym \\
+        --poly-schedule polynomial_clipping_schedule_v2.json \\
+        --asymmetric-act \\
+        --refine --refine-skip-converged 0.5
+
+    # All modules combined (A + B + C)
+    conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \\
+        --adaround-cache /path/to/adaround_cache \\
+        --output /path/to/quantized_weights_abc \\
+        --poly-schedule polynomial_clipping_schedule_v2.json \\
+        --sigma-weighted --exclude-extreme-shift --asymmetric-act \\
+        --refine --refine-skip-converged 0.5
+
+Modules:
+  A: σ-weighted loss      --sigma-weighted [--sigma-weight-offset ε]
+     Weights calibration loss by 1/(σ+ε), emphasising clean-image timesteps.
+
+  B: FP16 layer exclusion --exclude-extreme-shift | --exclude-layers KEY,...
+     Keeps specified layers in FP16 (no quant). The 4 extreme adaLN-shift
+     txt mlp_fc2 layers (mm14, mm20, mm21, mm22) are the default targets.
+
+  C: Asymmetric act quant --asymmetric-act (requires --poly-schedule with shift_coeffs)
+     Replaces symmetric [-α, +α] clipping with asymmetric [center-α, center+α]
+     using σ-dependent shift polynomials. Needs poly schedule v2 (generated with
+     ``python -m src.generate_poly_schedule --include-shifts``).
+
+Refinement:
+  --refine                   Warm-start from existing weights in --output dir.
+  --refine-skip-converged P  Skip blocks whose loss improved < P% over the last
+                             20% of the prior run's iteration history. Focuses
+                             training time on blocks still improving.
 
 Output layout:
     <output>/
@@ -271,6 +330,16 @@ def fake_quant_per_tensor(
     return mx.clip(mx.round(x / s), qmin, qmax) * s
 
 
+def fake_quant_asymmetric(
+    x: mx.array, min_val: float, max_val: float, qmin: int, qmax: int
+) -> mx.array:
+    """Asymmetric fake quantization: maps [min_val, max_val] to [qmin, qmax]."""
+    scale = (max_val - min_val) / (qmax - qmin) + 1e-8
+    zero_point = mx.round(mx.array(-min_val / scale))
+    x_q = mx.clip(mx.round(x / scale) + zero_point, qmin, qmax)
+    return (x_q - zero_point) * scale
+
+
 # ---------------------------------------------------------------------------
 # Block linear-layer enumeration
 # ---------------------------------------------------------------------------
@@ -336,7 +405,13 @@ def get_block_linears(block: Any, is_mm: bool) -> List[Tuple[str, Any, bool]]:
     for prefix in prefixes:
         for local in _LOCAL_LINEAR_PATHS:
             full = f"{prefix}.{local}"
-            layer = _get_nested(block, full)
+            try:
+                layer = _get_nested(block, full)
+            except AttributeError:
+                continue  # sub-module doesn't exist (e.g., no mlp on some blocks)
+            # Skip non-Linear layers (e.g., nn.Identity has no weight)
+            if not hasattr(layer, "weight"):
+                continue
             is_post_gelu = (local in _POST_GELU_LOCAL_PATHS)
             results.append((full, layer, is_post_gelu))
     return results
@@ -367,6 +442,7 @@ class _QuantProxy:
         qmin_a: int,
         qmax_a: int,
         poly_alpha: Optional[float] = None,  # if set, overrides a_scale
+        poly_shift: Optional[float] = None,  # if set, uses asymmetric quant
     ):
         self._orig = orig_layer
         self._soft_weight = soft_weight
@@ -374,10 +450,18 @@ class _QuantProxy:
         self._qmin_a = qmin_a
         self._qmax_a = qmax_a
         self._poly_alpha = poly_alpha
+        self._poly_shift = poly_shift
 
     def __call__(self, x: mx.array) -> mx.array:
-        if self._poly_alpha is not None:
-            # Use polynomial-derived scale: α / qmax
+        if self._poly_alpha is not None and self._poly_shift is not None:
+            # Asymmetric path: center ± range → [min_val, max_val]
+            center = self._poly_shift
+            range_val = self._poly_alpha
+            min_val = center - range_val
+            max_val = center + range_val
+            x_q = fake_quant_asymmetric(x, min_val, max_val, self._qmin_a, self._qmax_a)
+        elif self._poly_alpha is not None:
+            # Symmetric poly path: α / qmax
             scale = mx.array(self._poly_alpha / max(abs(self._qmax_a), 1))
             x_q = fake_quant_per_tensor(x, scale, self._qmin_a, self._qmax_a)
         else:
@@ -473,6 +557,7 @@ def block_loss_fn(
     fp_outputs: List[mx.array],       # cached FP block outputs
     b_val: float,
     poly_alphas: Optional[List[Optional[float]]] = None,  # per-linear poly α for this sample's σ
+    poly_shifts: Optional[List[Optional[float]]] = None,  # per-linear poly shift for asymmetric quant
 ) -> mx.array:
     """
     Compute block-level reconstruction + round loss for one mini-batch sample.
@@ -511,6 +596,7 @@ def block_loss_fn(
     for i, path in enumerate(linear_paths):
         orig_layers.append(_get_nested(block, path))
         pa = poly_alphas[i] if poly_alphas else None
+        ps = poly_shifts[i] if poly_shifts else None
         proxy = _QuantProxy(
             linear_layers[i],
             soft_weights[i],
@@ -518,6 +604,7 @@ def block_loss_fn(
             params.qmin_a,
             params.qmax_a,
             poly_alpha=pa,
+            poly_shift=ps,
         )
         _set_nested(block, path, proxy)
 
@@ -581,6 +668,20 @@ def _extract_sample_sigmas(
     return np.array(sigmas)
 
 
+def _compute_sigma_weights(
+    sample_sigmas: np.ndarray,
+    offset: float = 1.0,
+) -> np.ndarray:
+    """Compute per-sample importance weights: w(σ) = 1/(σ + offset).
+
+    Low-σ (clean) samples get higher weight. offset prevents division
+    by zero and controls how aggressively low-σ is emphasized.
+    offset=1.0 gives ~15× ratio between σ=0.03 and σ=14.6.
+    """
+    raw = 1.0 / (sample_sigmas + offset)
+    return raw / raw.mean()  # Normalize so mean weight = 1.0
+
+
 def _init_a_scales_from_poly(
     poly_schedule: Dict,
     block_name: str,
@@ -603,6 +704,29 @@ def _init_a_scales_from_poly(
     return [(alpha / qmax_a) if alpha is not None else 1.0 for alpha in alphas]
 
 
+def _path_to_poly_key(block_name: str, is_mm: bool, path: str) -> str:
+    """Convert block-internal path to poly schedule key (underscore-separated).
+
+    e.g. block_name="mm14", path="text_transformer_block.mlp.fc2" → "mm14_txt_mlp_fc2"
+    """
+    if is_mm:
+        if path.startswith("image_transformer_block."):
+            stream = "img"
+            local = path[len("image_transformer_block."):]
+        elif path.startswith("text_transformer_block."):
+            stream = "txt"
+            local = path[len("text_transformer_block."):]
+        else:
+            return f"{block_name}_{path.replace('.', '_')}"
+        return f"{block_name}_{stream}_{local.replace('.', '_')}"
+    else:
+        if path.startswith("transformer_block."):
+            local = path[len("transformer_block."):]
+        else:
+            local = path
+        return f"{block_name}_{local.replace('.', '_')}"
+
+
 def _compute_poly_alphas_for_sample(
     poly_schedule: Optional[Dict],
     block_name: str,
@@ -622,27 +746,7 @@ def _compute_poly_alphas_for_sample(
     alphas = []
 
     for path in linear_paths:
-        # Convert block-internal path to full layer name matching poly schedule keys
-        # e.g. block_name="mm3", path="image_transformer_block.attn.q_proj"
-        #   → poly key: "mm3_img_attn_q_proj"
-        if is_mm:
-            if path.startswith("image_transformer_block."):
-                stream = "img"
-                local = path[len("image_transformer_block."):]
-            elif path.startswith("text_transformer_block."):
-                stream = "txt"
-                local = path[len("text_transformer_block."):]
-            else:
-                alphas.append(None)
-                continue
-            poly_key = f"{block_name}_{stream}_{local.replace('.', '_')}"
-        else:
-            if path.startswith("transformer_block."):
-                local = path[len("transformer_block."):]
-            else:
-                local = path
-            poly_key = f"{block_name}_{local.replace('.', '_')}"
-
+        poly_key = _path_to_poly_key(block_name, is_mm, path)
         layer_cfg = poly_layers.get(poly_key)
         if layer_cfg is not None:
             sigma_range = poly_schedule.get("sigma_range")
@@ -655,6 +759,43 @@ def _compute_poly_alphas_for_sample(
             alphas.append(None)
 
     return alphas
+
+
+def _compute_poly_shifts_for_sample(
+    poly_schedule: Optional[Dict],
+    block_name: str,
+    is_mm: bool,
+    linear_paths: List[str],
+    sigma: float,
+) -> Optional[List[Optional[float]]]:
+    """
+    Compute per-linear polynomial shift values for a given sigma.
+
+    Returns None if no poly schedule or no shift coefficients present,
+    or a list of Optional[float] per linear (None for layers without shift).
+    """
+    if poly_schedule is None:
+        return None
+
+    poly_layers = poly_schedule.get("layers", {})
+    shifts = []
+    any_shift = False
+
+    for path in linear_paths:
+        poly_key = _path_to_poly_key(block_name, is_mm, path)
+        layer_cfg = poly_layers.get(poly_key)
+        if layer_cfg is not None and "shift_coeffs" in layer_cfg:
+            sigma_range = poly_schedule.get("sigma_range")
+            clamped_sigma = sigma
+            if sigma_range:
+                clamped_sigma = max(sigma_range[0], min(sigma, sigma_range[1]))
+            shift = float(np.polyval(layer_cfg["shift_coeffs"], clamped_sigma))
+            shifts.append(shift)
+            any_shift = True
+        else:
+            shifts.append(None)
+
+    return shifts if any_shift else None
 
 
 def optimize_block(
@@ -675,6 +816,10 @@ def optimize_block(
     mmdit: Optional[Any] = None,
     sample_pooled: Optional[np.ndarray] = None,  # shape (n_samples, *pooled_shape)
     activation_dtype=None,
+    sigma_weighted: bool = False,
+    sigma_weight_offset: float = 1.0,
+    exclude_keys: Optional[set] = None,
+    asymmetric_act: bool = False,
 ) -> Tuple[AdaRoundParams, Dict]:
     """
     Run AdaRound optimisation for a single transformer block.
@@ -695,8 +840,17 @@ def optimize_block(
         loss_history, final_rec_loss, etc.
     """
     linears = get_block_linears(block, is_mm)
-    linear_paths = [p for p, _, _ in linears]
-    linear_layers = [l for _, l, _ in linears]
+
+    # Filter out excluded layers (they stay FP16, no alpha/a_scale optimized)
+    excluded_indices: set = set()
+    if exclude_keys:
+        for i, (path, _, _) in enumerate(linears):
+            poly_key = _path_to_poly_key(block_name, is_mm, path)
+            if poly_key in exclude_keys:
+                excluded_indices.add(i)
+                print(f"    EXCLUDE {poly_key} (FP16)", flush=True)
+    linear_paths = [p for i, (p, _, _) in enumerate(linears) if i not in excluded_indices]
+    linear_layers = [l for i, (_, l, _) in enumerate(linears) if i not in excluded_indices]
     W_fps_np = [np.array(l.weight) for l in linear_layers]
     w_scales_np = [compute_per_channel_scale(W, bits_w) for W in W_fps_np]
 
@@ -736,6 +890,16 @@ def optimize_block(
     # Unpack all calibration samples
     n_samples = block_data["arg0"].shape[0]
 
+    # Precompute per-sample sigma weights
+    sample_weights = None
+    if sigma_weighted and sample_sigmas is not None:
+        sample_weights = _compute_sigma_weights(sample_sigmas, sigma_weight_offset)
+        print(
+            f"  σ-weighted loss enabled (offset={sigma_weight_offset}): "
+            f"weight range [{sample_weights.min():.3f}, {sample_weights.max():.3f}]",
+            flush=True,
+        )
+
     # Build grad function w.r.t. params
     loss_and_grad_fn = nn.value_and_grad(params, block_loss_fn)
 
@@ -763,8 +927,10 @@ def optimize_block(
 
         # Average loss over sampled indices
         total_loss = mx.array(0.0)
+        total_loss_uw = mx.array(0.0)  # unweighted loss (for logging)
         total_grads = None
         n_valid = 0
+        weight_sum = 0.0
 
         for si in idx:
             # Build input tensors for this sample
@@ -795,20 +961,25 @@ def optimize_block(
                     sample_pooled[si], timestep_val, activation_dtype,
                 )
 
-            # Compute poly alphas for this sample's sigma
+            # Compute poly alphas (and shifts for asymmetric mode) for this sample's sigma
             poly_alphas = None
+            poly_shifts = None
             if poly_schedule is not None and sample_sigmas is not None:
                 sigma_val = float(sample_sigmas[si])
                 poly_alphas = _compute_poly_alphas_for_sample(
                     poly_schedule, block_name, is_mm, linear_paths, sigma_val
                 )
+                if asymmetric_act:
+                    poly_shifts = _compute_poly_shifts_for_sample(
+                        poly_schedule, block_name, is_mm, linear_paths, sigma_val
+                    )
 
             loss_i, grads_i = loss_and_grad_fn(
                 params, block, is_mm,
                 linear_paths, linear_layers,
                 W_fps_np, w_scales_np,
                 s_inputs, s_kwargs, s_outputs,
-                b_val, poly_alphas,
+                b_val, poly_alphas, poly_shifts,
             )
             mx.eval(loss_i)
 
@@ -822,19 +993,28 @@ def optimize_block(
                 )
                 continue
 
-            total_loss = total_loss + loss_i
+            w_i = float(sample_weights[si]) if sample_weights is not None else 1.0
+            total_loss = total_loss + w_i * loss_i
+            total_loss_uw = total_loss_uw + loss_i
+            weight_sum += w_i
             n_valid += 1
 
             if total_grads is None:
-                total_grads = grads_i
+                if w_i != 1.0:
+                    total_grads = {
+                        "alphas": [g * w_i for g in grads_i["alphas"]],
+                        "a_scales": [g * w_i for g in grads_i["a_scales"]],
+                    }
+                else:
+                    total_grads = grads_i
             else:
                 # Accumulate grads (same structure as params)
                 for i in range(len(params.alphas)):
                     total_grads["alphas"][i] = (
-                        total_grads["alphas"][i] + grads_i["alphas"][i]
+                        total_grads["alphas"][i] + w_i * grads_i["alphas"][i]
                     )
                     total_grads["a_scales"][i] = (
-                        total_grads["a_scales"][i] + grads_i["a_scales"][i]
+                        total_grads["a_scales"][i] + w_i * grads_i["a_scales"][i]
                     )
 
         # Count valid (non-NaN) samples actually accumulated
@@ -850,10 +1030,11 @@ def optimize_block(
             pbar.update(1)
             continue
 
-        # Average grads over valid samples
+        # Average grads over valid samples (use weight_sum for σ-weighted mode)
+        grad_denom = weight_sum if sample_weights is not None else n_used
         for i in range(len(params.alphas)):
-            total_grads["alphas"][i] = total_grads["alphas"][i] / n_used
-            total_grads["a_scales"][i] = total_grads["a_scales"][i] / n_used
+            total_grads["alphas"][i] = total_grads["alphas"][i] / grad_denom
+            total_grads["a_scales"][i] = total_grads["a_scales"][i] / grad_denom
 
         # Force evaluation and check for NaN in accumulated gradients.
         # The backward pass can produce NaN even when the forward loss is finite
@@ -868,7 +1049,8 @@ def optimize_block(
                     f"skipping optimizer update",
                     flush=True,
                 )
-            loss_val = float(total_loss) / n_used
+            loss_denom = weight_sum if sample_weights is not None else n_used
+            loss_val = float(total_loss) / loss_denom
             loss_history.append(loss_val)
             pbar.update(1)
             continue
@@ -898,13 +1080,22 @@ def optimize_block(
 
         mx.eval(params.parameters(), w_opt.state, a_opt.state)
 
-        loss_val = float(total_loss) / n_used
+        loss_denom = weight_sum if sample_weights is not None else n_used
+        loss_val = float(total_loss) / loss_denom
         loss_history.append(loss_val)
 
         if step % 50 == 0:
-            pbar.set_postfix(loss=f"{loss_val:.4f}", b=f"{b_val:.1f}")
+            if sample_weights is not None:
+                loss_uw_val = float(total_loss_uw) / n_used
+                pbar.set_postfix(loss_w=f"{loss_val:.4f}", loss_uw=f"{loss_uw_val:.4f}", b=f"{b_val:.1f}")
+            else:
+                pbar.set_postfix(loss=f"{loss_val:.4f}", b=f"{b_val:.1f}")
         if step % 200 == 0:
-            print(f"  {block_name} iter {step}/{iters}  loss={loss_val:.4f}  b={b_val:.1f}", flush=True)
+            if sample_weights is not None:
+                loss_uw_val = float(total_loss_uw) / n_used
+                print(f"  {block_name} iter {step}/{iters}  loss(w)={loss_val:.4f}  loss(uw)={loss_uw_val:.4f}  b={b_val:.1f}", flush=True)
+            else:
+                print(f"  {block_name} iter {step}/{iters}  loss={loss_val:.4f}  b={b_val:.1f}", flush=True)
         pbar.update(1)
 
     pbar.close()
@@ -1005,7 +1196,38 @@ def main() -> None:
     parser.add_argument("--sigma-map", type=Path, default=None,
                         help="Path to layer_statistics.json containing sigma_map "
                              "(default: auto-detect from activations dir)")
+    parser.add_argument("--sigma-weighted", action="store_true",
+                        help="Weight per-sample loss by 1/(σ+offset), emphasizing clean timesteps")
+    parser.add_argument("--sigma-weight-offset", type=float, default=1.0,
+                        help="Offset ε in w(σ)=1/(σ+ε). Lower = more aggressive (default: 1.0)")
+    parser.add_argument("--refine-skip-converged", type=float, default=None, metavar="PCT",
+                        help="With --refine, skip blocks whose loss improved less than PCT%% "
+                             "over the last 20%% of the prior run (e.g., 0.5 = skip if <0.5%% improvement)")
+    parser.add_argument("--exclude-layers", type=str, default=None,
+                        help="Comma-separated layer keys to keep in FP16 "
+                             "(e.g., mm14_txt_mlp_fc2,mm20_txt_mlp_fc2)")
+    parser.add_argument("--exclude-extreme-shift", action="store_true",
+                        help="Shortcut: exclude mm14/20/21/22 txt mlp_fc2 (extreme adaLN shift layers)")
+    parser.add_argument("--asymmetric-act", action="store_true",
+                        help="Use asymmetric activation quantization with σ-dependent shift from poly schedule")
     args = parser.parse_args()
+
+    if args.sigma_weighted and args.poly_schedule is None:
+        parser.error("--sigma-weighted requires --poly-schedule (need per-sample sigmas)")
+    if args.asymmetric_act and args.poly_schedule is None:
+        parser.error("--asymmetric-act requires --poly-schedule")
+
+    # Build exclude set from CLI flags
+    exclude_set: set = set()
+    if args.exclude_extreme_shift:
+        exclude_set.update([
+            "mm14_txt_mlp_fc2", "mm20_txt_mlp_fc2",
+            "mm21_txt_mlp_fc2", "mm22_txt_mlp_fc2",
+        ])
+    if args.exclude_layers:
+        exclude_set.update(k.strip() for k in args.exclude_layers.split(","))
+    if exclude_set:
+        print(f"  FP16 exclusions: {sorted(exclude_set)}")
 
     args.output.mkdir(parents=True, exist_ok=True)
     config_path = args.output / "config.json"
@@ -1173,8 +1395,15 @@ def main() -> None:
         is_mm: bool,
         params: "AdaRoundParams",
         bits_w: int,
+        block_exclude_keys: Optional[set] = None,
     ) -> List[str]:
         linears = get_block_linears(block, is_mm)
+        # Filter out excluded layers (same logic as optimize_block)
+        if block_exclude_keys:
+            linears = [
+                (p, l, g) for p, l, g in linears
+                if _path_to_poly_key(block_name, is_mm, p) not in block_exclude_keys
+            ]
         linear_paths = [p for p, _, _ in linears]
         linear_layers = [l for _, l, _ in linears]
         W_fps_np = [np.array(l.weight) for l in linear_layers]
@@ -1269,12 +1498,17 @@ def main() -> None:
                     a_lr=args.a_lr,
                     poly_schedule=poly_schedule,
                     sample_sigmas=group_sample_sigmas,
+                    sigma_weighted=args.sigma_weighted,
+                    sigma_weight_offset=args.sigma_weight_offset,
+                    exclude_keys=exclude_set if exclude_set else None,
+                    asymmetric_act=args.asymmetric_act,
                 )
                 tqdm.write(f"  {block_name} (group {group_id}) done — "
                            f"final_loss={metrics['final_loss']:.4f}")
 
                 linear_paths = _save_block_weights(
-                    group_weights_dir, block_name, block, is_mm, params, effective_bits_w
+                    group_weights_dir, block_name, block, is_mm, params, effective_bits_w,
+                    block_exclude_keys=exclude_set if exclude_set else None,
                 )
                 metrics["quant_paths"] = linear_paths
                 metrics["group_id"] = group_id
@@ -1328,21 +1562,55 @@ def main() -> None:
     weights_dir = args.output / "weights"
     weights_dir.mkdir(exist_ok=True)
 
-    # Load existing metrics if resuming
-    if args.resume and config_path.exists():
+    # Load existing metrics if resuming or refining
+    prev_block_metrics: Dict[str, Dict] = {}
+    if (args.resume or args.refine) and config_path.exists():
         with open(config_path) as f:
             prev_config = json.load(f)
-        all_metrics = prev_config.get("block_metrics", [])
-        print(f"  Resuming: {len(all_metrics)} blocks already done")
+        prev_metrics_list = prev_config.get("block_metrics", [])
+        for m in prev_metrics_list:
+            prev_block_metrics[m["block_name"]] = m
+        if args.resume:
+            print(f"  Resuming: {len(prev_metrics_list)} blocks already done")
+    if args.resume:
+        all_metrics_by_name = dict(prev_block_metrics)
+    elif args.refine:
+        # Preserve prior metrics so interrupted refine runs don't lose history
+        all_metrics_by_name = dict(prev_block_metrics)
     else:
-        all_metrics = []
+        all_metrics_by_name = {}
 
     n_total = len(block_names)
+    n_skipped_converged = 0
     for block_idx, block_name in enumerate(block_names, 1):
         # Skip blocks already completed
         if args.resume and (weights_dir / f"{block_name}.npz").exists():
             print(f"[{block_idx}/{n_total}] SKIP {block_name}: already done (resume mode)")
             continue
+
+        # Skip converged blocks in refine mode
+        if args.refine and args.refine_skip_converged is not None:
+            prior_m = prev_block_metrics.get(block_name)
+            if prior_m is not None:
+                hist = prior_m.get("loss_history_stride100", [])
+                if len(hist) >= 5:
+                    # Check improvement over last 20% of history
+                    tail_start = max(0, len(hist) - len(hist) // 5)
+                    tail = hist[tail_start:]
+                    tail_first = tail[0]
+                    tail_last = tail[-1]
+                    if tail_first > 0:
+                        tail_improvement_pct = 100.0 * (tail_first - tail_last) / tail_first
+                    else:
+                        tail_improvement_pct = 0.0
+                    if tail_improvement_pct < args.refine_skip_converged:
+                        print(
+                            f"[{block_idx}/{n_total}] SKIP {block_name}: "
+                            f"converged (tail improvement {tail_improvement_pct:.2f}% "
+                            f"< {args.refine_skip_converged}%)"
+                        )
+                        n_skipped_converged += 1
+                        continue
 
         # Determine block object and type
         is_mm = block_name.startswith("mm")
@@ -1367,6 +1635,11 @@ def main() -> None:
         prior_npz = weights_dir / f"{block_name}.npz"
         if args.refine and prior_npz.exists():
             linears = get_block_linears(block, is_mm)
+            if exclude_set:
+                linears = [
+                    (p, l, g) for p, l, g in linears
+                    if _path_to_poly_key(block_name, is_mm, p) not in exclude_set
+                ]
             lp = [p for p, _, _ in linears]
             ll = [l for _, l, _ in linears]
             wfp = [np.array(l.weight) for l in ll]
@@ -1407,6 +1680,10 @@ def main() -> None:
             mmdit=mmdit,
             sample_pooled=block_sample_pooled,
             activation_dtype=pipeline.activation_dtype,
+            sigma_weighted=args.sigma_weighted,
+            sigma_weight_offset=args.sigma_weight_offset,
+            exclude_keys=exclude_set if exclude_set else None,
+            asymmetric_act=args.asymmetric_act,
         )
         if metrics.get("refined") and metrics["initial_loss"] is not None:
             improvement = metrics["initial_loss"] - metrics["final_loss"]
@@ -1419,10 +1696,11 @@ def main() -> None:
             print(f"  {block_name} done — final_loss={metrics['final_loss']:.4f}")
 
         linear_paths = _save_block_weights(
-            weights_dir, block_name, block, is_mm, params, args.bits_w
+            weights_dir, block_name, block, is_mm, params, args.bits_w,
+            block_exclude_keys=exclude_set if exclude_set else None,
         )
         metrics["quant_paths"] = linear_paths
-        all_metrics.append(metrics)
+        all_metrics_by_name[block_name] = metrics
 
         # Free calibration data
         del block_data
@@ -1430,6 +1708,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Save config
     # ------------------------------------------------------------------
+    # Emit metrics in block order (preserves prior metrics for untouched blocks)
+    all_metrics = [
+        all_metrics_by_name[bn] for bn in block_names
+        if bn in all_metrics_by_name
+    ]
     config = {
         "format": "adaround_v1",
         "model_version": "argmaxinc/mlx-stable-diffusion-3-medium",
@@ -1439,6 +1722,10 @@ def main() -> None:
         "batch_size": args.batch_size,
         "w_lr": args.w_lr,
         "a_lr": args.a_lr,
+        "sigma_weighted": args.sigma_weighted,
+        "sigma_weight_offset": args.sigma_weight_offset,
+        "exclude_layers": sorted(exclude_set) if exclude_set else [],
+        "asymmetric_act": args.asymmetric_act,
         "n_blocks_quantised": len(all_metrics),
         "block_metrics": all_metrics,
     }
@@ -1447,6 +1734,8 @@ def main() -> None:
 
     print(f"\n=== Done ===")
     print(f"  {len(all_metrics)} blocks quantised")
+    if n_skipped_converged > 0:
+        print(f"  {n_skipped_converged} blocks skipped (converged, threshold={args.refine_skip_converged}%)")
     print(f"  Config:  {config_path}")
     print(f"  Weights: {weights_dir}")
 

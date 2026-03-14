@@ -206,6 +206,18 @@ class _ActQuantLayer:
             return None, None
         return cfg["scale"], cfg["bits"]
 
+    def _get_poly_shift(self) -> Optional[float]:
+        """Compute polynomial shift center(σ) if shift_coeffs are present."""
+        if self.poly_cfg is None or self.current_sigma is None:
+            return None
+        shift_coeffs = self.poly_cfg.get("shift_coeffs")
+        if shift_coeffs is None:
+            return None
+        sigma = self.current_sigma
+        if self.poly_sigma_range is not None:
+            sigma = max(self.poly_sigma_range[0], min(sigma, self.poly_sigma_range[1]))
+        return float(np.polyval(shift_coeffs, sigma))
+
     def __call__(self, x: mx.array) -> mx.array:
         scale, bits = self._get_scale_and_bits()
         if scale is None or scale < 1e-8:
@@ -217,6 +229,21 @@ class _ActQuantLayer:
                 return self.layer(x)
             scale = cfg["scale"]
             bits = cfg["bits"]
+
+        # Check for asymmetric mode (Module C: poly shift)
+        poly_shift = self._get_poly_shift()
+        if poly_shift is not None:
+            # Asymmetric activation quantization
+            alpha = eval_poly_alpha(self.poly_cfg["coeffs"], self.current_sigma, self.poly_sigma_range)
+            qmin = -(2 ** (bits - 1))
+            qmax = 2 ** (bits - 1) - 1
+            min_val = poly_shift - alpha
+            max_val = poly_shift + alpha
+            asym_scale = (max_val - min_val) / (qmax - qmin) + 1e-8
+            zero_point = mx.round(mx.array(-min_val / asym_scale))
+            x_q = mx.clip(mx.round(x / asym_scale) + zero_point, qmin, qmax)
+            x = (x_q - zero_point) * asym_scale
+            return self.layer(x)
 
         # Get shift from static config if available (poly doesn't replace shift)
         cfg = self.per_timestep.get(str(self.current_step_key), {})
@@ -262,6 +289,7 @@ def apply_act_quant_hooks(
     per_timestep: Dict,
     outlier_config: Dict,
     poly_schedule: Optional[Dict] = None,
+    exclude_layers: Optional[set] = None,
 ) -> Tuple[List, List]:
     """
     Walk the MMDiT block hierarchy and wrap each nn.Linear whose name appears
@@ -306,6 +334,9 @@ def apply_act_quant_hooks(
         if layer is None:
             return
         if full_name not in quant_layer_names and poly_key is None:
+            return
+        # Skip excluded layers (Module B: they stay FP16 end-to-end)
+        if exclude_layers and poly_key and poly_key in exclude_layers:
             return
         per_ts = {sk: per_timestep[sk][full_name]
                   for sk in per_timestep if full_name in per_timestep[sk]}
@@ -464,6 +495,9 @@ def load_adaround_weights(
         paths = bm.get("quant_paths", [])
         if bname and paths:
             path_lookup[bname] = paths
+
+    # Load excluded layers from config (Module B: FP16 exclusion)
+    exclude_layers = set(config.get("exclude_layers", []))
 
     quant_weights: Dict[str, Dict[str, Dict]] = {}
 
@@ -902,8 +936,12 @@ def main() -> None:
 
         step_keys_sorted = sorted(int(k) for k in per_timestep.keys()) if per_timestep else list(range(28))
 
+        # Get exclude_layers from the AdaRound config (Module B)
+        cfg_exclude = set(config.get("exclude_layers", []))
+
         proxies, act_quant_patches = apply_act_quant_hooks(
-            pipeline.mmdit, per_timestep, outlier_config, poly_schedule
+            pipeline.mmdit, per_timestep, outlier_config, poly_schedule,
+            exclude_layers=cfg_exclude if cfg_exclude else None,
         )
 
         # Count bits distribution
