@@ -1189,6 +1189,8 @@ def main() -> None:
                         help="Skip blocks whose .npz already exists in the output weights dir")
     parser.add_argument("--refine", action="store_true",
                         help="Warm-start from existing weights (polish previous results with more iters)")
+    parser.add_argument("--force-refine", action="store_true",
+                        help="Override refine config mismatch safety check (use with caution)")
     parser.add_argument("--htg-groups", type=Path, default=None,
                         help="htg_groups.json from src.htg_cluster; enables per-group optimization")
     parser.add_argument("--bb-config", type=Path, default=None,
@@ -1574,6 +1576,67 @@ def main() -> None:
             prev_block_metrics[m["block_name"]] = m
         if args.resume:
             print(f"  Resuming: {len(prev_metrics_list)} blocks already done")
+
+        # Safety check: warn if refine flags don't match the prior run's config.
+        # Mismatched settings (e.g. adding --poly-schedule to weights trained
+        # without it) cause catastrophic divergence — the rounding decisions are
+        # optimized for a different quantization grid.
+        if args.refine:
+            mismatches = []
+            prev_had_poly = bool(prev_config.get("poly_schedule"))
+            now_has_poly = poly_schedule is not None
+            if now_has_poly and not prev_had_poly:
+                mismatches.append(
+                    "ADDING --poly-schedule: prior weights were trained with static α. "
+                    "Per-σ clipping will invalidate the prior rounding decisions."
+                )
+            elif prev_had_poly and not now_has_poly:
+                mismatches.append(
+                    "REMOVING --poly-schedule: prior weights were trained with per-σ α. "
+                    "Static clipping will invalidate the prior rounding decisions."
+                )
+            prev_sigma_w = prev_config.get("sigma_weighted", False)
+            now_sigma_w = getattr(args, "sigma_weighted", False)
+            if now_sigma_w and not prev_sigma_w:
+                # This is less dangerous (just reweighting), note it but don't block
+                mismatches.append(
+                    "ADDING --sigma-weighted: prior weights were trained with uniform loss weighting. "
+                    "This is usually safe but will shift optimization emphasis."
+                )
+            prev_asym = prev_config.get("asymmetric_act", False)
+            now_asym = getattr(args, "asymmetric_act", False)
+            if now_asym != prev_asym:
+                mismatches.append(
+                    f"CHANGING --asymmetric-act: prior={prev_asym}, now={now_asym}. "
+                    "Activation quantization mode mismatch will corrupt rounding decisions."
+                )
+            if mismatches:
+                print("\n" + "=" * 70)
+                print("WARNING: Refine config mismatch detected!")
+                print("=" * 70)
+                for m in mismatches:
+                    print(f"  • {m}")
+                print()
+                # Block on dangerous mismatches (poly/asymmetric changes)
+                dangerous = any(
+                    "poly-schedule" in m or "asymmetric-act" in m
+                    for m in mismatches
+                    if "usually safe" not in m
+                )
+                if dangerous:
+                    print(
+                        "This will likely cause catastrophic divergence. The prior rounding\n"
+                        "decisions were optimized for a different quantization grid.\n"
+                        "\n"
+                        "Options:\n"
+                        "  1. Train from scratch (without --refine) into a new output dir\n"
+                        "  2. Use --force-refine to override this safety check\n"
+                    )
+                    if not getattr(args, "force_refine", False):
+                        raise SystemExit(1)
+                    print("--force-refine set, proceeding despite mismatch...\n")
+                print("=" * 70 + "\n")
+
     if args.resume:
         all_metrics_by_name = dict(prev_block_metrics)
     elif args.refine:
@@ -1724,6 +1787,7 @@ def main() -> None:
         "batch_size": args.batch_size,
         "w_lr": args.w_lr,
         "a_lr": args.a_lr,
+        "poly_schedule": str(args.poly_schedule) if args.poly_schedule else None,
         "sigma_weighted": args.sigma_weighted,
         "sigma_weight_offset": args.sigma_weight_offset,
         "exclude_layers": sorted(exclude_set) if exclude_set else [],

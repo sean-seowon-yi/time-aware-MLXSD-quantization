@@ -14,8 +14,7 @@ against standard FP16, using MS-COCO val prompts as the evaluation set.
 | Pooled embeddings for calibration images | ✅ Cached (`calibration_data_100/pooled/`) |
 | FP16 reference benchmark | ✅ Done (50 images, 28 steps, CFG 1.5, seed 42) |
 | MS-COCO prompts CSV | ✅ Ready (`coco_prompts.csv`, 5040 captions) |
-| AdaRound optimization — mm0–mm3 | ⚠️ Started but produced NaN (bad `a_scale` init — now fixed) |
-| AdaRound optimization — mm4–mm37, uni0–uni23 | ❌ Not started |
+| AdaRound optimization | 🔄 Running (NaN fixed — float32 backward pass) |
 | Poly-clipping benchmark run | ❌ Not started |
 | σ-weighted AdaRound loss | ❌ Not started |
 
@@ -25,12 +24,17 @@ against standard FP16, using MS-COCO val prompts as the evaluation set.
 
 **Goal**: Produce fully optimized W4A8 weights for all 24 MM blocks + 24 Uni blocks (SD3 has 24 MM + 24 Uni = 48 total? check exact count) using polynomial activation clipping.
 
-**Fixes applied (commit 9a22c47)**:
-- `a_scale` now initializes from `alpha(σ_median) / 127` instead of 1.0
-- Gradient clipping `[-1, 1]` on `a_scale` grads prevents NaN
-- Cosine LR annealing now correctly reduces LR (was computing but discarding the scaled grads)
+**Fixes applied** (commits 9a22c47 → 39bf47f):
+- `a_scale` initializes from poly schedule `alpha(σ) / 127` instead of 1.0
+- Gradient clipping on both alpha (±0.1) and a_scale (±1.0)
+- Cosine LR annealing for a_scale (was computing but discarding scaled grads)
+- Excluded samples with missing pooled embeddings (images 20, 60)
+- **Critical: forced float32 computation in block_loss_fn** — bfloat16 backward
+  through attention/RMSNorm produced NaN gradients when quantized Q/K vectors
+  were near-zero. This was the persistent NaN root cause.
+- NaN guard on accumulated gradients (skips optimizer step if any grad is NaN)
 
-**Command** (restart from scratch, mm0–mm3 weights are suspect from NaN runs):
+**Command**:
 ```bash
 conda run -n diffusionkit python -m src.adaround_optimize \
   --adaround-cache calibration_data_100 \
@@ -42,9 +46,9 @@ conda run -n diffusionkit python -m src.adaround_optimize \
 
 Add `--resume` if the run is interrupted partway through.
 
-**Expected**: Initial loss should drop from ~900K to ~1K–10K range. Monitor the
-`a_scale init from poly @ σ=...` line — values should be in the range [0.5, 50]
-(not 1.0 for all layers). If loss at iter 0 is still >100K, something is wrong.
+**Expected**: Initial loss ~900K (normal for W4 block reconstruction — lp_loss sums
+over ~236K elements). Loss should decrease over 1000 iterations. The high absolute
+value reflects `sum(|pred-tgt|^2)` over the full hidden dimension, not per-element error.
 
 **Estimated output**: `quantized_weights_poly/weights/{block_name}.npz` for each block,
 plus `quantized_weights_poly/quant_config.json`.
