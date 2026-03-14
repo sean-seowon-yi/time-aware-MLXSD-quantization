@@ -37,6 +37,10 @@ coverage.xml
 .DS_Store
 .vscode/
 .idea/
+.cursor/
+*.swp
+*.swo
+*~
 
 # ----------------------------------------------------------------------
 # ML / model artifacts
@@ -62,6 +66,7 @@ coverage.xml
 
 # Calibration and diagnostics data
 *.npz
+*.npy
 
 # Plots and diagnostics output
 activation_plots/
