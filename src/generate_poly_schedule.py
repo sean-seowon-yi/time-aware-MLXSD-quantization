@@ -6,7 +6,7 @@ outputting a compact JSON schedule that replaces static per-timestep scale looku
 with continuous polynomial evaluation.
 
 Degree selection tiers:
-  CV < 0.10           → static (single float, degree 0)
+  All layers          → degree 2 minimum (CV gate removed for cross-group consistency)
   Quadratic R² > 0.85 → degree 2
   Cubic R² gain > 0.15 over quad → degree 3
   Quartic R² gain > 0.10 over cubic → degree 4
@@ -30,7 +30,7 @@ from src.explore_curve_fits import load_percentile_trajectories, poly_r2
 # Degree selection
 # ---------------------------------------------------------------------------
 
-CV_STATIC_THRESHOLD = 0.10
+CV_STATIC_THRESHOLD = 0.07
 QUAD_R2_THRESHOLD = 0.85
 CUBIC_R2_GAIN_THRESHOLD = 0.15
 QUARTIC_R2_GAIN_THRESHOLD = 0.10
@@ -48,11 +48,7 @@ def select_degree(sigmas: np.ndarray, vals: np.ndarray):
     """
     cv = float(np.std(vals) / np.mean(vals)) if np.mean(vals) > 0 else 0.0
 
-    # Tier 0: static — activation barely changes across σ
-    if cv < CV_STATIC_THRESHOLD:
-        return 0, [float(np.mean(vals))], 1.0, cv
-
-    # Tier 1: quadratic
+    # Tier 1: quadratic (always — CV gate removed to ensure consistent degree across groups)
     r2_q, coeffs_q = poly_r2(sigmas, vals, 2)
 
     # Tier 2: cubic (only if quad isn't good enough or cubic gains significantly)

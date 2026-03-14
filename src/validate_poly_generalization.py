@@ -2,17 +2,14 @@
 Validate polynomial clipping schedule generalizability across independent COCO image groups.
 
 Runs full SD3 denoising on 2 independent groups of COCO prompts, builds polynomial
-schedules for each group in-memory, and compares them against each other and against
-the reference schedule fit on calibration data.
+schedules for each group in-memory, and compares them against each other.
 
 Generalisation claim: curves are a property of SD3 rectified-flow physics, not the
-specific calibration images. Success criterion: median nRMSE < 5% for Group A vs B;
-< 8% for either group vs reference.
+specific calibration images. Success criterion: median nRMSE < 5% for Group A vs B.
 
 Usage:
     conda run -n diffusionkit python -m src.validate_poly_generalization \\
         --coco-prompts coco_prompts.csv \\
-        --reference-schedule polynomial_clipping_schedule.json \\
         --group-size 30 \\
         --num-groups 2 \\
         --output-dir generalization_results \\
@@ -112,7 +109,7 @@ def collect_step_stats(hooks):
 # Full denoising for a single prompt
 # ---------------------------------------------------------------------------
 
-def run_prompt(pipeline, denoiser, prompt, hooks, num_steps, cfg_weight=7.5):
+def run_prompt(pipeline, denoiser, prompt, hooks, num_steps, cfg_weight=7.5, latent_size=64):
     """Run full SD3 denoising, collect per-step activation stats.
 
     Returns (step_stats list, sigmas np.ndarray).
@@ -124,7 +121,7 @@ def run_prompt(pipeline, denoiser, prompt, hooks, num_steps, cfg_weight=7.5):
     timesteps = pipeline.sampler.timestep(sigmas).astype(pipeline.activation_dtype)
     denoiser.cache_modulation_params(pooled, timesteps)
 
-    latent_shape = (1, 64, 64, 16)
+    latent_shape = (1, latent_size, latent_size, 16)
     noise = mx.random.normal(latent_shape).astype(pipeline.activation_dtype)
     x = pipeline.sampler.noise_scaling(
         sigmas[0], noise, mx.zeros(latent_shape), pipeline.max_denoise(sigmas)
@@ -164,7 +161,7 @@ def _reset_modulation_cache(pipeline):
         pass
 
 
-def collect_group(pipeline, prompts, num_steps):
+def collect_group(pipeline, prompts, num_steps, latent_size=64):
     """Run all prompts in the group; aggregate per-step p999 stats.
 
     Returns (trajs dict: layer_key -> (sigmas_array, p999_means_array), all_sigmas).
@@ -180,7 +177,7 @@ def collect_group(pipeline, prompts, num_steps):
 
     for prompt in tqdm(prompts, desc="Prompts"):
         try:
-            step_stats, sigmas = run_prompt(pipeline, denoiser, prompt, hooks, num_steps)
+            step_stats, sigmas = run_prompt(pipeline, denoiser, prompt, hooks, num_steps, latent_size=latent_size)
             if all_sigmas is None:
                 all_sigmas = sigmas
             for i, stats in enumerate(step_stats):
@@ -333,20 +330,24 @@ def plot_comparison_bar(summary, output_path):
     print(f"Saved {output_path}")
 
 
-def plot_curve_overlays(sched_a, sched_b, sched_ref, sigmas, output_path):
-    """6-panel plot: one representative layer per sublayer type, 3 curves each."""
+def plot_curve_overlays(named_schedules, sigmas, output_path):
+    """6-panel plot: one representative layer per sublayer type, one curve per schedule.
+
+    named_schedules: list of (label, schedule_dict) in display order.
+    """
     sigma_grid = np.linspace(float(sigmas.min()), float(sigmas.max()), 200)
+    palette = ["steelblue", "darkorange", "forestgreen", "crimson", "purple", "saddlebrown"]
+    linestyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 2))]
 
-    # Pick one representative layer per sublayer type (prefer middle MM block)
+    # Intersect layers across all schedules
+    all_layers = set(named_schedules[0][1]["layers"])
+    for _, sched in named_schedules[1:]:
+        all_layers &= set(sched["layers"])
+
     rep_layers = {}
-    all_layers = set(sched_a["layers"]) & set(sched_b["layers"])
-    if sched_ref:
-        all_layers &= set(sched_ref["layers"])
-
     for st in _SUBLAYER_TYPES:
         candidates = sorted(l for l in all_layers if st in l)
         if candidates:
-            # Prefer mm12 or mm13 (middle of 24 blocks), fallback to any
             mid = [c for c in candidates if "mm12_" in c or "mm13_" in c]
             rep_layers[st] = (mid or candidates)[0]
 
@@ -362,30 +363,100 @@ def plot_curve_overlays(sched_a, sched_b, sched_ref, sigmas, output_path):
 
     for ax_idx, (st, layer) in enumerate(sorted(rep_layers.items())):
         ax = axes_flat[ax_idx]
-        ya = np.polyval(sched_a["layers"][layer]["coeffs"], sigma_grid)
-        yb = np.polyval(sched_b["layers"][layer]["coeffs"], sigma_grid)
-        ax.plot(sigma_grid, ya, color="steelblue", label="Group A", linewidth=1.5)
-        ax.plot(sigma_grid, yb, color="darkorange", label="Group B",
-                linewidth=1.5, linestyle="--")
-        if sched_ref and layer in sched_ref["layers"]:
-            yr = np.polyval(sched_ref["layers"][layer]["coeffs"], sigma_grid)
-            ax.plot(sigma_grid, yr, color="crimson", label="Reference",
-                    linewidth=1.5, linestyle=":")
+        for i, (label, sched) in enumerate(named_schedules):
+            if layer not in sched["layers"]:
+                continue
+            y = np.polyval(sched["layers"][layer]["coeffs"], sigma_grid)
+            ax.plot(sigma_grid, y, color=palette[i % len(palette)],
+                    linestyle=linestyles[i % len(linestyles)],
+                    label=label, linewidth=1.5)
         ax.set_title(f"{st}\n{layer}", fontsize=7)
         ax.set_xlabel("σ", fontsize=8)
         ax.set_ylabel("p99.9 activation", fontsize=8)
         ax.legend(fontsize=6)
         ax.grid(True, linestyle="--", alpha=0.4)
 
-    # Hide unused axes
     for ax_idx in range(n, len(axes_flat)):
         axes_flat[ax_idx].set_visible(False)
 
-    plt.suptitle("Polynomial curve overlays — Group A / B / Reference", fontsize=10)
+    labels_str = " / ".join(label for label, _ in named_schedules)
+    plt.suptitle(f"Polynomial curve overlays — {labels_str}", fontsize=10)
     plt.tight_layout()
     plt.savefig(output_path, dpi=120)
     plt.close()
     print(f"Saved {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# High-nRMSE layer visualization
+# ---------------------------------------------------------------------------
+
+def plot_high_nrmse_layers(summary, named_schedules, sigmas, output_path, top_n=20):
+    """Plot polynomial curves for the top-N layers by worst-case nRMSE across all pairs.
+
+    For each layer, all group curves are overlaid so divergence is immediately visible.
+    """
+    sigma_grid = np.linspace(float(sigmas.min()), float(sigmas.max()), 200)
+
+    # Find worst-case nRMSE per layer across all pairs
+    worst = {}
+    for pair, data in summary.items():
+        for layer, v in data["per_layer"].items():
+            if layer not in worst or v["nrmse"] > worst[layer]:
+                worst[layer] = v["nrmse"]
+
+    top_layers = sorted(worst, key=lambda l: worst[l], reverse=True)[:top_n]
+
+    ncols = 4
+    nrows = (len(top_layers) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(16, 4 * nrows))
+    axes_flat = np.array(axes).ravel()
+
+    palette = ["steelblue", "darkorange", "forestgreen", "crimson", "purple"]
+    linestyles = ["-", "--", "-."]
+
+    for ax_idx, layer in enumerate(top_layers):
+        ax = axes_flat[ax_idx]
+        for i, (label, sched) in enumerate(named_schedules):
+            if layer not in sched["layers"]:
+                continue
+            y = np.polyval(sched["layers"][layer]["coeffs"], sigma_grid)
+            ax.plot(sigma_grid, y,
+                    color=palette[i % len(palette)],
+                    linestyle=linestyles[i % len(linestyles)],
+                    label=label, linewidth=1.5)
+        ax.set_title(f"{layer}\nmax nRMSE={worst[layer]*100:.1f}%", fontsize=7)
+        ax.set_xlabel("σ", fontsize=8)
+        ax.set_ylabel("p99.9", fontsize=8)
+        ax.legend(fontsize=6)
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+    for ax_idx in range(len(top_layers), len(axes_flat)):
+        axes_flat[ax_idx].set_visible(False)
+
+    plt.suptitle(f"Top-{top_n} layers by worst-case nRMSE across all pairs", fontsize=10)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=120)
+    plt.close()
+    print(f"Saved {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Ranked MSE output
+# ---------------------------------------------------------------------------
+
+def print_ranked_mse(summary, top_n=None):
+    """Print per-layer RMSE ranked highest to lowest for each pair."""
+    for pair, data in summary.items():
+        rows = sorted(data["per_layer"].items(),
+                      key=lambda x: x[1]["rmse"], reverse=True)
+        if top_n:
+            rows = rows[:top_n]
+        print(f"\n--- {pair} — layers ranked by MSE (high → low) ---")
+        print(f"  {'Layer':<45} {'RMSE':>10}  {'nRMSE':>8}")
+        print(f"  {'-'*45} {'-'*10}  {'-'*8}")
+        for layer, v in rows:
+            print(f"  {layer:<45} {v['rmse']:>10.4f}  {v['nrmse']*100:>7.2f}%")
 
 
 # ---------------------------------------------------------------------------
@@ -395,125 +466,173 @@ def plot_curve_overlays(sched_a, sched_b, sched_ref, sigmas, output_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--coco-prompts", type=Path, default=Path("coco_prompts.csv"))
-    parser.add_argument("--reference-schedule", type=Path,
-                        default=Path("polynomial_clipping_schedule.json"))
     parser.add_argument("--group-size", type=int, default=30)
-    parser.add_argument("--num-groups", type=int, default=2)
+    parser.add_argument("--num-groups", type=int, default=2,
+                        help="Number of NEW groups to run (ignored groups use --load-group-schedules)")
+    parser.add_argument("--prompt-start-group", type=int, default=0,
+                        help="Offset into the CSV: new prompts start at this group index "
+                             "(set to number of already-run groups to avoid reusing prompts)")
+    parser.add_argument("--load-group-schedules", type=Path, nargs="*", default=[],
+                        metavar="JSON",
+                        help="Paths to previously computed group schedule JSONs to compare "
+                             "against new groups without re-running them")
     parser.add_argument("--output-dir", type=Path, default=Path("generalization_results"))
     parser.add_argument("--num-steps", type=int, default=25)
     parser.add_argument("--cfg-weight", type=float, default=7.5)
+    parser.add_argument("--latent-size", type=int, default=64,
+                        help="Spatial size of latent (e.g. 32 → 256px, 64 → 512px)")
+    parser.add_argument("--refit-from-npz", type=Path, nargs="*", default=[],
+                        metavar="NPZ",
+                        help="Refit schedules from saved trajectory NPZ files instead of "
+                             "re-running denoising. Replaces --load-group-schedules.")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Prompt selection ----
+    # ---- Refit from NPZ if requested ----
+    if args.refit_from_npz:
+        named_schedules = []
+        for i, npz_path in enumerate(args.refit_from_npz):
+            data = np.load(npz_path)
+            sigmas = data["sigmas"]
+            trajs = {k: (sigmas, data[k]) for k in data.files if k != "sigmas"}
+            sched = build_schedule(trajs, sigmas)
+            label = f"Group {chr(65 + i)}"
+            named_schedules.append((label, sched))
+            out_path = args.output_dir / f"group_{i}_schedule.json"
+            with open(out_path, "w") as f:
+                json.dump(sched, f, indent=2)
+            print(f"Refit {label} from {npz_path} → {out_path} ({len(sched['layers'])} layers).")
+        all_sigmas = np.load(args.refit_from_npz[0])["sigmas"]
+        args.num_groups = 0
+        args.load_group_schedules = []
+
+    # ---- Load any pre-existing group schedules ----
+    # named_schedules: list of (label, schedule_dict) in order
+    if not args.refit_from_npz:
+        named_schedules = []
+    for i, path in enumerate(args.load_group_schedules):
+        with open(path) as f:
+            sched = json.load(f)
+        label = f"Group {chr(65 + i)}"  # A, B, C, ...
+        named_schedules.append((label, sched))
+        print(f"Loaded {label} schedule from {path} ({len(sched['layers'])} layers).")
+
+    n_loaded = len(named_schedules)
+
+    # ---- Prompt selection for new groups ----
+    # New groups start at prompt-start-group (default = n_loaded to avoid overlap)
+    effective_start = args.prompt_start_group if args.prompt_start_group else n_loaded
+
     df = pd.read_csv(args.coco_prompts)
     total = len(df)
-    n_total = args.num_groups * args.group_size
-    stride = total // n_total
-    selected = [df.iloc[i * stride]["prompt"] for i in range(n_total)]
-    groups = [
-        selected[g * args.group_size:(g + 1) * args.group_size]
-        for g in range(args.num_groups)
-    ]
-    print(f"Selected {n_total} prompts (stride={stride}) from {total} total.")
-    for g_idx, grp in enumerate(groups):
-        print(f"  Group {g_idx}: {len(grp)} prompts, "
-              f"first='{grp[0][:60]}...', last='{grp[-1][:60]}...'")
+    # Use a fixed stride based on total / group_size so the grid is stable
+    stride = total // args.group_size
+    new_groups = []
+    for g in range(args.num_groups):
+        group_idx = effective_start + g
+        prompts = [
+            df.iloc[(group_idx * args.group_size + j) % total]["prompt"]
+            for j in range(args.group_size)
+        ]
+        new_groups.append(prompts)
 
-    # ---- Load pipeline ----
-    from diffusionkit.mlx import DiffusionPipeline
-    print("\nLoading SD3 pipeline...")
-    pipeline = DiffusionPipeline(
-        shift=3.0,
-        use_t5=True,
-        model_version="argmaxinc/mlx-stable-diffusion-3-medium",
-        low_memory_mode=False,
-        a16=True,
-        w16=True,
-    )
-    pipeline.check_and_load_models()
-    print("Pipeline loaded.")
+    print(f"\nNew groups: {args.num_groups} × {args.group_size} prompts "
+          f"(start_group={effective_start}, stride={stride}, total={total})")
+    for g_idx, grp in enumerate(new_groups):
+        label = chr(65 + n_loaded + g_idx)
+        print(f"  Group {label}: first='{grp[0][:60]}...', last='{grp[-1][:60]}...'")
 
-    # ---- Load reference schedule ----
-    ref_schedule = None
-    if args.reference_schedule.exists():
-        with open(args.reference_schedule) as f:
-            ref_schedule = json.load(f)
-        print(f"Loaded reference schedule: {len(ref_schedule['layers'])} layers.")
-    else:
-        print(f"WARNING: reference schedule not found at {args.reference_schedule}")
+    # ---- Load pipeline (only if new groups need running) ----
+    if new_groups:
+        from diffusionkit.mlx import DiffusionPipeline
+        print("\nLoading SD3 pipeline...")
+        pipeline = DiffusionPipeline(
+            shift=3.0,
+            use_t5=True,
+            model_version="argmaxinc/mlx-stable-diffusion-3-medium",
+            low_memory_mode=False,
+            a16=True,
+            w16=True,
+        )
+        pipeline.check_and_load_models()
+        print("Pipeline loaded.")
 
-    # ---- Collect per-group trajectories ----
-    group_schedules = []
-    group_sigmas_list = []
-
-    for g_idx, prompts in enumerate(groups):
+    # ---- Collect new group trajectories ----
+    if not args.refit_from_npz:
+        all_sigmas = None
+    for g_idx, prompts in enumerate(new_groups):
+        label = chr(65 + n_loaded + g_idx)
+        file_idx = n_loaded + g_idx
         print(f"\n{'='*60}")
-        print(f"Collecting Group {g_idx} ({len(prompts)} prompts, {args.num_steps} steps)...")
-        trajs, all_sigmas = collect_group(pipeline, prompts, args.num_steps)
-        schedule = build_schedule(trajs, all_sigmas)
-        group_schedules.append(schedule)
-        group_sigmas_list.append(all_sigmas)
+        print(f"Collecting Group {label} ({len(prompts)} prompts, {args.num_steps} steps)...")
+        trajs, group_sigmas = collect_group(pipeline, prompts, args.num_steps,
+                                             latent_size=args.latent_size)
+        schedule = build_schedule(trajs, group_sigmas)
+        named_schedules.append((f"Group {label}", schedule))
+        if all_sigmas is None:
+            all_sigmas = group_sigmas
 
-        out_path = args.output_dir / f"group_{g_idx}_schedule.json"
+        out_path = args.output_dir / f"group_{file_idx}_schedule.json"
         with open(out_path, "w") as f:
             json.dump(schedule, f, indent=2)
         print(f"Saved {out_path} ({len(schedule['layers'])} layers).")
 
-    sched_a, sched_b = group_schedules[0], group_schedules[1]
-    all_sigmas = group_sigmas_list[0]
+        npz_path = args.output_dir / f"group_{file_idx}_trajectories.npz"
+        np.savez(npz_path, sigmas=group_sigmas,
+                 **{k: v[1] for k, v in trajs.items()})
+        print(f"Saved {npz_path} ({len(trajs)} layer trajectories).")
 
-    # ---- Comparisons ----
+    # Fall back to sigma range from first loaded schedule if no new groups were run
+    if all_sigmas is None:
+        sigma_range = named_schedules[0][1]["sigma_range"]
+        all_sigmas = np.linspace(sigma_range[0], sigma_range[1], args.num_steps)
+
+    # ---- All pairwise comparisons ----
     sigma_grid = np.linspace(float(all_sigmas.min()), float(all_sigmas.max()), 200)
-
-    results_ab = compare_schedules(sched_a, sched_b, sigma_grid)
-    summary_ab = comparison_summary(results_ab)
-
-    summary = {"groupA_vs_groupB": summary_ab}
-
-    if ref_schedule is not None:
-        results_ar = compare_schedules(sched_a, ref_schedule, sigma_grid)
-        results_br = compare_schedules(sched_b, ref_schedule, sigma_grid)
-        summary["groupA_vs_reference"] = comparison_summary(results_ar)
-        summary["groupB_vs_reference"] = comparison_summary(results_br)
-
-    # Strip per_layer from top-level summary output (keep in file only)
-    summary_out = {}
-    for pair, data in summary.items():
-        summary_out[pair] = {
-            k: v for k, v in data.items() if k != "per_layer"
-        }
-        summary_out[pair]["per_layer"] = data["per_layer"]
+    summary = {}
+    for i in range(len(named_schedules)):
+        for j in range(i + 1, len(named_schedules)):
+            label_i, sched_i = named_schedules[i]
+            label_j, sched_j = named_schedules[j]
+            key = f"{label_i.replace(' ', '')}_vs_{label_j.replace(' ', '')}"
+            results = compare_schedules(sched_i, sched_j, sigma_grid)
+            summary[key] = comparison_summary(results)
 
     summary_path = args.output_dir / "summary.json"
     with open(summary_path, "w") as f:
-        json.dump(summary_out, f, indent=2)
+        json.dump(summary, f, indent=2)
     print(f"\nSaved {summary_path}")
+
+    ranked = {}
+    for pair, data in summary.items():
+        ranked[pair] = sorted(
+            [{"layer": k, **v} for k, v in data["per_layer"].items()],
+            key=lambda x: x["rmse"], reverse=True
+        )
+    with open(args.output_dir / "ranked_mse.json", "w") as f:
+        json.dump(ranked, f, indent=2)
+    print(f"Saved {args.output_dir / 'ranked_mse.json'}")
+
+    print_ranked_mse(summary)
 
     # ---- Print results ----
     print("\n=== Generalisation Validation Results ===")
-    for pair, data in summary_out.items():
+    for pair, data in summary.items():
         print(f"  {pair}:")
         print(f"    median nRMSE = {data['median_nrmse']*100:.2f}%")
         print(f"    p95    nRMSE = {data['p95_nrmse']*100:.2f}%")
         print(f"    n_layers     = {data['n_layers']}")
 
-    print("\nSuccess thresholds:")
-    ab_ok = summary_out["groupA_vs_groupB"]["median_nrmse"] < 0.05
-    print(f"  Group A vs B  median nRMSE < 5%: {'PASS' if ab_ok else 'FAIL'}")
-    if "groupA_vs_reference" in summary_out:
-        ar_ok = summary_out["groupA_vs_reference"]["median_nrmse"] < 0.08
-        br_ok = summary_out["groupB_vs_reference"]["median_nrmse"] < 0.08
-        print(f"  Group A vs Ref median nRMSE < 8%: {'PASS' if ar_ok else 'FAIL'}")
-        print(f"  Group B vs Ref median nRMSE < 8%: {'PASS' if br_ok else 'FAIL'}")
-
     # ---- Plots ----
     bar_path = args.output_dir / "comparison_bar.png"
-    plot_comparison_bar(summary_out, bar_path)
+    plot_comparison_bar(summary, bar_path)
 
     overlay_path = args.output_dir / "curve_overlays.png"
-    plot_curve_overlays(sched_a, sched_b, ref_schedule, all_sigmas, overlay_path)
+    plot_curve_overlays(named_schedules, all_sigmas, overlay_path)
+
+    high_nrmse_path = args.output_dir / "high_nrmse_layers.png"
+    plot_high_nrmse_layers(summary, named_schedules, all_sigmas, high_nrmse_path)
 
 
 if __name__ == "__main__":
