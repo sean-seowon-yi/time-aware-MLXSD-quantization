@@ -153,9 +153,18 @@ def remove_block_hooks(pipeline, hooks: List[BlockHook]) -> None:
 # ---------------------------------------------------------------------------
 
 def _to_numpy(val: Any) -> Any:
-    """Convert an mx.array to numpy; pass through everything else."""
+    """Convert an mx.array to numpy as float16; pass through everything else.
+
+    MLX bfloat16 arrays upcast to float32 when converted via np.array() since
+    numpy has no bfloat16 dtype. Explicitly downcast to float16 to halve file
+    size. The adaround optimizer recasts to float32 for the backward pass so
+    float16 storage is safe.
+    """
     if isinstance(val, mx.array):
-        return np.array(val)
+        arr = np.array(val)
+        if arr.dtype == np.float32:
+            arr = arr.astype(np.float16)
+        return arr
     return val
 
 
