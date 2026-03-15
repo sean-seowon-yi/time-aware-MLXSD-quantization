@@ -265,24 +265,23 @@ def pack_sample(block_data: Dict[str, Optional[Dict]]) -> Dict[str, np.ndarray]:
 def load_block_data(
     block_name: str,
     sample_files: List[Path],
-) -> Dict[str, np.ndarray]:
+) -> List[Dict[str, np.ndarray]]:
     """
-    Load and stack all per-sample data for a single block.
+    Load per-sample data for a single block as a list of mmap-backed dicts.
 
-    Returns a dict with stacked arrays:
-        'arg0', 'arg1', ...     shape (N_samples, *original_shape)
-        'kw_positional_encodings', ...
-        'out0', 'out1', ...
+    Returns a list of dicts, one per sample:
+        [{'arg0': array, 'arg1': array, 'out0': array, ...}, ...]
 
-    Only keys present in ALL sample files are returned (handles missing data
-    gracefully by skipping that sample).
+    Uses mmap_mode='r' so only the accessed keys are read from disk — the
+    full NPZ (which contains all blocks) is never loaded into RAM at once.
+    Caller accesses sample i key k as: block_data[i][k]
     """
     safe = block_name.replace(".", "_")
     prefix = safe + "__"
 
     per_sample: List[Dict[str, np.ndarray]] = []
     for path in sample_files:
-        npz = np.load(path)
+        npz = np.load(path, mmap_mode="r")
         sample = {
             k[len(prefix):]: npz[k]
             for k in npz.files
@@ -291,15 +290,7 @@ def load_block_data(
         if sample:
             per_sample.append(sample)
 
-    if not per_sample:
-        return {}
-
-    # Find keys common to all samples
-    common_keys = set(per_sample[0].keys())
-    for s in per_sample[1:]:
-        common_keys &= set(s.keys())
-
-    return {k: np.stack([s[k] for s in per_sample]) for k in sorted(common_keys)}
+    return per_sample
 
 
 # ---------------------------------------------------------------------------
