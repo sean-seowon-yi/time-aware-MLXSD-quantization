@@ -1140,12 +1140,12 @@ def optimize_block(
             accum_n_valid += n_valid
 
             if accum_alpha_grads is None:
-                accum_alpha_grads = [np.array(g) for g in total_grads["alphas"]]
-                accum_ascale_grads = [np.array(g) for g in total_grads["a_scales"]]
+                accum_alpha_grads = [np.array(g, dtype=np.float64) for g in total_grads["alphas"]]
+                accum_ascale_grads = [np.array(g, dtype=np.float64) for g in total_grads["a_scales"]]
             else:
                 for i in range(len(params.alphas)):
-                    accum_alpha_grads[i] = accum_alpha_grads[i] + np.array(total_grads["alphas"][i])
-                    accum_ascale_grads[i] = accum_ascale_grads[i] + np.array(total_grads["a_scales"][i])
+                    accum_alpha_grads[i] = accum_alpha_grads[i] + np.array(total_grads["alphas"][i], dtype=np.float64)
+                    accum_ascale_grads[i] = accum_ascale_grads[i] + np.array(total_grads["a_scales"][i], dtype=np.float64)
 
         # --- Step-level handling (replaces old eval + NaN check) ---
         if accum_alpha_grads is None or step_has_nan:
