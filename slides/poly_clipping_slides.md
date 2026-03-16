@@ -567,11 +567,39 @@ A high ratio means channels live in systematically different regimes — per-ten
 | mm20 txt fc1/fc2_in | 3.1–3.3× | 42–43 units | Moderate |
 | All other 182 layers | < 3× | < 9 units | No |
 
-**Key finding:** The extreme per-channel variance is not a widespread problem — it is almost entirely concentrated in the same mm22/21 adaLN-shift layers already identified for FP16 exclusion. The pattern is consistent: adaLN-induced distribution displacement breaks both the clipping range (fixed by α(σ)) and the assumption of channel homogeneity (broken by adaLN shift).
+**Key finding:** The extreme inter-channel spread is not a widespread problem — it is almost entirely concentrated in the same mm22/21 adaLN-shift layers already identified for FP16 exclusion. The pattern is consistent: adaLN-induced distribution displacement breaks both the clipping width (fixed by α(σ)) and the assumption of channel homogeneity (the inter-channel spread).
 
 **New concern: mm22/21 fc1_in are currently being quantized**
 
-The fc1_in layers (inputs to the FFN) also show extreme per-channel variance despite not being excluded. Per-channel max shifts of 280/122 units mean the same INT8 waste applies to the layer *before* the already-excluded fc2. These should be added to the exclusion set (or treated with per-channel scales).
+The fc1_in layers (inputs to the FFN) also show extreme inter-channel spread despite not being excluded. Per-channel max shifts of 280/122 units mean the same INT8 resolution waste applies to the layer *before* the already-excluded fc2. These should be added to the exclusion set.
+
+---
+
+**Critical distinction: two separate problems, two separate fixes**
+
+The adaLN-affected layers suffer from two independent failure modes that are easy to conflate:
+
+**Problem 1 — Temporal shift (intra-channel, over time):**
+The whole distribution drifts as σ changes. Channel 744 might be at +320 at σ=1.0 and +356 at σ=0.1.
+→ Fix: **asymmetric shift(σ) polynomial** — one time-varying zero-point per layer tracks the distribution center over denoising.
+
+**Problem 2 — Spatial spread (inter-channel, across channels):**
+Different channels permanently live at different offsets. Channel 0 has mean ≈ +5, channel 744 has mean ≈ +356 — regardless of timestep.
+→ Fix: **per-channel zero-points** — each channel gets its own scale and zero-point.
+
+**A single asymmetric zero-point does not fix Problem 2.** It can only pick one center for all channels. If channels span 0→356 units, the zero-point centers the average but channel 0 and channel 744 are still both poorly served.
+
+| Approach | Fixes temporal shift (Problem 1) | Fixes inter-channel spread (Problem 2) |
+|----------|----------------------------------|----------------------------------------|
+| Symmetric per-tensor (current) | No | No |
+| Asymmetric per-tensor + shift(σ) | Yes | No |
+| Per-channel symmetric | No | Yes |
+| Per-channel asymmetric | Yes | Yes |
+| FP16 exclusion | — (no quant) | — (no quant) |
+
+The asymmetric quant work in Slide 17 addresses Problem 1 for layers we *do* quantize. It will not rescue mm22/21 from Problem 2 — those layers need per-channel treatment or FP16 exclusion.
+
+**Per-channel activation quant is hardware-demanding** — most accelerators (including Apple Neural Engine) only support per-tensor activation scales. The polynomial overhead also scales from 3 coefficients/layer to 3D coefficients/layer. For 5 extreme layers costing 3.7% of total savings, FP16 exclusion is the pragmatic choice.
 
 **Per-tensor vs Per-channel comparison:**
 
@@ -579,15 +607,16 @@ The fc1_in layers (inputs to the FFN) also show extreme per-channel variance des
 |----------|-----------|-------------|
 | Storage overhead | 1 scalar/layer | D scalars/layer (D = hidden dim) |
 | Runtime overhead | 1 multiply | channel-wise multiply |
-| Hardware support | Universal | Varies (some accelerators only support per-tensor) |
-| Polynomial overhead | 3 coefficients/layer | 3D coefficients/layer |
-| Handles mm22/21 shift | No | Yes |
-| Needed for most layers | — | No (ratio < 3) |
+| Hardware support | Universal | Limited (not all accelerators) |
+| Polynomial overhead | 3 coefficients/layer | 3×D coefficients/layer |
+| Fixes Problem 1 (temporal) | No (needs asymmetric) | No (needs asymmetric) |
+| Fixes Problem 2 (inter-channel) | No | Yes |
+| Needed for most layers | — | No (ratio < 3 for 182/188 layers) |
 
 **Recommended path:**
 - Keep per-tensor for all 182 normal layers (ratio < 3)
 - Add mm22/21 fc1_in to the FP16 exclusion set (+2 layers, +27 MB forfeit, total 67.5 MB / 3.7%)
-- Or implement per-channel activation quant for the 4 extreme layers, recoverable with per-channel α(σ) polynomials
+- Apply asymmetric shift(σ) polynomials to mm20 and other layers that remain quantized (fixes Problem 1 only)
 
 ---
 
