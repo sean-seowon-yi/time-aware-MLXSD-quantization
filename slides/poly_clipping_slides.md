@@ -528,7 +528,29 @@ Each layer has a single scalar `a_scale` that controls the INT8 clipping range a
 
 **The question:** Does channel-to-channel variance within a layer justify per-channel activation scales?
 
-**Metric:** For each layer, compare channel-to-channel std (how different channels' means are from each other) to within-channel std (how much each channel varies over time). A high ratio means channels live in systematically different regimes — per-tensor quantization wastes resolution.
+**Metric: channel-to-channel std / within-channel std**
+
+For each layer we collect per-channel statistics across all calibration timesteps. Let `μ_d(t)` be the mean activation value for channel `d` at timestep `t`:
+
+```
+within-channel std  =  mean over all channels d of:  std_t[ μ_d(t) ]
+                     → how much a single channel's mean drifts across timesteps
+
+channel-to-channel std  =  std over channels d of:  mean_t[ μ_d(t) ]
+                          → how different the time-averaged means are across channels
+```
+
+Concretely for a layer with hidden dimension D and T calibration timesteps:
+1. Compute the D×T matrix of per-channel means
+2. **Within-channel std**: average the row-wise standard deviations (each row = one channel over time)
+3. **Ch-ch std**: take the std of the column-wise means (each column = one timestep, averaged; then std across channels)
+4. **Ratio** = ch-ch std / within-channel std
+
+**Interpretation:**
+- **Ratio ≈ 1**: channels behave similarly — per-tensor quantization is fine
+- **Ratio >> 1**: channels sit at systematically different offsets — a single scale clips some channels while wasting resolution on others; per-channel scales would help
+
+A high ratio means channels live in systematically different regimes — per-tensor quantization wastes resolution.
 
 ![Per-channel vs within-channel variance across all 188 layers](per_channel_variance.png)
 
