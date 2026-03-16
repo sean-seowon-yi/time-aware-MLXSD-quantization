@@ -127,6 +127,10 @@ import mlx.optimizers as optim
 
 from src.cache_adaround_data import load_block_data
 
+# Fake timestep key for batched modulation injection.
+# 16384.0 is representable in float16 and never appears as a real SD3 timestep (range [0.03, 1.0]).
+_FAKE_TS_KEY = 16384.0
+
 
 def _stack_block_data(
     per_sample: List[Dict[str, np.ndarray]],
@@ -200,6 +204,101 @@ def set_block_modulation_params(
             tb._modulation_params = {}
         tb._modulation_params[timestep_key] = tb.adaLN_modulation(modulation_inputs)
         mx.eval(tb._modulation_params[timestep_key])
+
+
+def precompute_block_mod_params(
+    block,
+    is_mm: bool,
+    mmdit,
+    n_samples: int,
+    block_data: Dict[str, np.ndarray],
+    sample_pooled: np.ndarray,
+    activation_dtype,
+) -> Optional[Tuple[np.ndarray, ...]]:
+    """
+    Pre-compute adaLN modulation params for all N calibration samples.
+
+    Returns a tuple of numpy arrays:
+      - MM blocks: (img_mod_np, txt_mod_np) each shape [N, 1, 1, 6D]
+      - Uni blocks: (uni_mod_np,) shape [N, 1, 1, 6D]
+      - None if sample_pooled is None or mmdit is None
+
+    Call once per block before the training loop. During training, inject
+    batched params under _FAKE_TS_KEY instead of calling set_block_modulation_params.
+    """
+    if sample_pooled is None or mmdit is None or activation_dtype is None:
+        return None
+
+    ts_arg_key = "arg2" if is_mm else "arg1"
+
+    if is_mm:
+        img_tb = block.image_transformer_block
+        txt_tb = block.text_transformer_block
+        all_img: List[np.ndarray] = []
+        all_txt: List[np.ndarray] = []
+        for si in range(n_samples):
+            pooled_mx = mx.array(sample_pooled[si]).astype(activation_dtype)
+            timestep_val = float(block_data[ts_arg_key][si].flat[0])
+            ts_mx = mx.array([timestep_val]).astype(activation_dtype)
+            mod_input = mmdit.y_embedder(pooled_mx)[:, None, None, :] + mmdit.t_embedder(ts_mx)
+            img_mod = img_tb.adaLN_modulation(mod_input)
+            txt_mod = txt_tb.adaLN_modulation(mod_input)
+            mx.eval(img_mod, txt_mod)
+            all_img.append(np.array(img_mod))   # [1, 1, 1, 6D]
+            all_txt.append(np.array(txt_mod))
+        return (np.concatenate(all_img, axis=0), np.concatenate(all_txt, axis=0))
+    else:
+        tb = block.transformer_block
+        all_uni: List[np.ndarray] = []
+        for si in range(n_samples):
+            pooled_mx = mx.array(sample_pooled[si]).astype(activation_dtype)
+            timestep_val = float(block_data[ts_arg_key][si].flat[0])
+            ts_mx = mx.array([timestep_val]).astype(activation_dtype)
+            mod_input = mmdit.y_embedder(pooled_mx)[:, None, None, :] + mmdit.t_embedder(ts_mx)
+            uni_mod = tb.adaLN_modulation(mod_input)
+            mx.eval(uni_mod)
+            all_uni.append(np.array(uni_mod))
+        return (np.concatenate(all_uni, axis=0),)
+
+
+def inject_batched_mod_params(
+    block,
+    is_mm: bool,
+    precomputed_mods: Tuple[np.ndarray, ...],
+    chunk_idx: np.ndarray,
+) -> None:
+    """
+    Inject batched modulation params under _FAKE_TS_KEY for a chunk of samples.
+
+    Builds [2B, 1, 1, 6D] by repeating each sample's [1, 1, 1, 6D] twice (for CFG).
+    """
+    B = len(chunk_idx)
+    if is_mm:
+        img_mod_np, txt_mod_np = precomputed_mods
+        # Each sample needs its params repeated for the CFG pair
+        img_batch = np.concatenate(
+            [np.repeat(img_mod_np[si:si+1], 2, axis=0) for si in chunk_idx], axis=0
+        )  # [2B, 1, 1, 6D]
+        txt_batch = np.concatenate(
+            [np.repeat(txt_mod_np[si:si+1], 2, axis=0) for si in chunk_idx], axis=0
+        )
+        block.image_transformer_block._modulation_params[_FAKE_TS_KEY] = mx.array(img_batch)
+        block.text_transformer_block._modulation_params[_FAKE_TS_KEY] = mx.array(txt_batch)
+    else:
+        (uni_mod_np,) = precomputed_mods
+        uni_batch = np.concatenate(
+            [np.repeat(uni_mod_np[si:si+1], 2, axis=0) for si in chunk_idx], axis=0
+        )
+        block.transformer_block._modulation_params[_FAKE_TS_KEY] = mx.array(uni_batch)
+
+
+def clear_batched_mod_params(block, is_mm: bool) -> None:
+    """Remove the injected fake-key entry from modulation param dicts."""
+    if is_mm:
+        block.image_transformer_block._modulation_params.pop(_FAKE_TS_KEY, None)
+        block.text_transformer_block._modulation_params.pop(_FAKE_TS_KEY, None)
+    else:
+        block.transformer_block._modulation_params.pop(_FAKE_TS_KEY, None)
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +748,110 @@ def block_loss_fn(
     return rec + ROUND_WEIGHT * rnd
 
 
+def batched_block_reconstruction_loss_fn(
+    params: "AdaRoundParams",
+    block: Any,
+    is_mm: bool,
+    linear_paths: List[str],
+    linear_layers: List[Any],
+    W_fps_np: List[np.ndarray],
+    w_scales_np: List[np.ndarray],
+    s_inputs: List[mx.array],    # each [2B, ...]
+    s_kwargs: Dict[str, mx.array],
+    s_outputs: List[mx.array],   # each [2B, ...]
+    b_val: float,
+    poly_alphas: Optional[List[float]],
+    poly_shifts: Optional[List[Optional[float]]],
+    batch_n: int,                # B (number of samples in batch)
+    sample_weights_batch: Optional[mx.array],  # [B] weights or None
+) -> Tuple[mx.array, mx.array]:  # (weighted_loss, unweighted_loss)
+    """
+    Single batched forward pass for B samples stacked along the batch axis.
+
+    Replaces B sequential calls to block_loss_fn.
+    Returns (weighted_loss, unweighted_loss) both as scalars.
+
+    Inputs s_inputs, s_outputs are stacked as [2B, ...] where each sample's
+    CFG pair (conditional + unconditional) occupies two consecutive rows.
+    The timestep arg is replaced with _FAKE_TS_KEY so the block uses the
+    pre-injected batched modulation params.
+    """
+    n = len(linear_paths)
+
+    # Cast inputs/targets to float32 — same reasoning as block_loss_fn:
+    # bfloat16 backward passes produce NaN gradients through RMSNorm/attention.
+    s_inputs = [inp.astype(mx.float32) for inp in s_inputs]
+    s_kwargs = {k: v.astype(mx.float32) for k, v in s_kwargs.items()}
+    s_outputs = [out.astype(mx.float32) for out in s_outputs]
+
+    # Build soft-quantised weights (in computation graph via params.alphas)
+    soft_weights: List[mx.array] = []
+    for i in range(n):
+        W_fp_mx = mx.array(W_fps_np[i])       # constant — no gradient
+        s_mx = mx.array(w_scales_np[i])        # constant — no gradient
+        r = rectified_sigmoid(params.alphas[i])
+        W_floor = mx.floor(W_fp_mx / s_mx)
+        soft_w = mx.clip(W_floor + r, params.qmin_w, params.qmax_w) * s_mx
+        soft_weights.append(soft_w)
+
+    # Patch: replace each linear with a _QuantProxy
+    original_layers = []
+    for i, path in enumerate(linear_paths):
+        original_layers.append((path, _get_nested(block, path)))
+        pa = poly_alphas[i] if poly_alphas is not None else None
+        ps = poly_shifts[i] if poly_shifts is not None else None
+        proxy = _QuantProxy(
+            linear_layers[i],
+            soft_weights[i],
+            params.a_scales[i],
+            params.qmin_a,
+            params.qmax_a,
+            poly_alpha=pa,
+            poly_shift=ps,
+        )
+        _set_nested(block, path, proxy)
+
+    try:
+        if s_kwargs:
+            output = block(*s_inputs, **s_kwargs)
+        else:
+            output = block(*s_inputs)
+
+        # Extract the image-stream (or only) output tensor
+        if isinstance(output, (list, tuple)):
+            out_q = output[0]  # image stream output [2B, img_seq, 1, D]
+        else:
+            out_q = output
+
+        target = s_outputs[0]  # [2B, ...]
+
+        sq_err = (out_q - target) ** 2  # [2B, ...]
+
+        # Per-sample loss: each sample occupies 2 consecutive rows (CFG pair).
+        # Reshape [2B, ...] -> [B, 2*rest], mean over last dim -> [B]
+        flat = sq_err.reshape(batch_n, -1)   # [B, 2*seq*1*D]
+        per_sample = flat.mean(axis=1)       # [B]
+
+        # Round loss (annealed regularisation) — same as in block_loss_fn
+        rnd = _round_loss(params.alphas, b_val)
+        # Distribute round loss equally across samples
+        per_sample = per_sample + ROUND_WEIGHT * rnd / batch_n
+
+        if sample_weights_batch is not None:
+            w_sum = sample_weights_batch.sum()
+            weighted_loss = (per_sample * sample_weights_batch).sum() / mx.maximum(w_sum, mx.array(1e-8))
+        else:
+            weighted_loss = per_sample.mean()
+
+        unweighted_loss = per_sample.mean()
+
+    finally:
+        for path, orig in original_layers:
+            _set_nested(block, path, orig)
+
+    return weighted_loss, unweighted_loss
+
+
 # ---------------------------------------------------------------------------
 # Main optimisation loop for one block
 # ---------------------------------------------------------------------------
@@ -960,14 +1163,21 @@ def optimize_block(
         prior_alphas=prior_alphas, prior_a_scales=init_a_scales,
     )
 
+    # Unpack all calibration samples
+    n_samples = block_data["arg0"].shape[0]
+
+    # Pre-compute modulation params for all samples (eliminates per-iter sync overhead)
+    precomputed_mods = precompute_block_mod_params(
+        block, is_mm, mmdit, n_samples, block_data, sample_pooled, activation_dtype
+    )
+    if precomputed_mods is not None:
+        print(f"  Modulation params pre-computed for {n_samples} samples", flush=True)
+
     # Two optimisers: Adam for alpha (w_lr), Adam+cosine for a_scale (a_lr)
     w_opt = optim.Adam(learning_rate=w_lr)
     a_opt = optim.Adam(learning_rate=a_lr)
 
     temp_decay = LinearTempDecay(t_max=iters, warm_up=0.2, start_b=20.0, end_b=2.0)
-
-    # Unpack all calibration samples
-    n_samples = block_data["arg0"].shape[0]
 
     # Precompute per-sample sigma weights
     sample_weights = None
@@ -1031,121 +1241,213 @@ def optimize_block(
 
         for chunk_start in range(0, logical_n, batch_size):
             chunk_idx = idx[chunk_start : chunk_start + batch_size]
+            B = len(chunk_idx)
 
-            total_loss = mx.array(0.0)
-            total_loss_uw = mx.array(0.0)  # unweighted loss (for logging)
-            total_grads = None
-            n_valid = 0
-            weight_sum = 0.0
-
-            for si in chunk_idx:
-                # Build input tensors for this sample
-                s_inputs: List[mx.array] = []
-                s_kwargs: Dict[str, mx.array] = {}
-                s_outputs: List[mx.array] = []
-
-                # Positional args: arg0, arg1, arg2, ...
+            if precomputed_mods is not None:
+                # --- BATCHED PATH ---
+                # Stack all B samples along batch axis: [2B, seq, 1, D]
+                s_inputs_b: List[mx.array] = []
                 for key in sorted(k for k in block_data if k.startswith("arg")):
-                    s_inputs.append(mx.array(block_data[key][si]))
-
-                # Keyword args
+                    s_inputs_b.append(mx.array(
+                        np.concatenate([block_data[key][si] for si in chunk_idx], axis=0)
+                    ))
+                s_kwargs_b: Dict[str, mx.array] = {}
                 for key in (k for k in block_data if k.startswith("kw_")):
-                    kw_name = key[3:]  # strip "kw_" prefix
-                    s_kwargs[kw_name] = mx.array(block_data[key][si])
-
-                # Target outputs
-                for key in sorted(k for k in block_data if k.startswith("out")):
-                    s_outputs.append(mx.array(block_data[key][si]))
-
-                # Set correct per-sample modulation params if pooled embeddings available
-                if sample_pooled is not None and mmdit is not None and activation_dtype is not None:
-                    # timestep is arg1 for Uni, arg2 for MM
-                    ts_key = "arg2" if is_mm else "arg1"
-                    timestep_val = float(block_data[ts_key][si].flat[0])
-                    set_block_modulation_params(
-                        block, is_mm, mmdit,
-                        sample_pooled[si], timestep_val, activation_dtype,
+                    kw_name = key[3:]
+                    s_kwargs_b[kw_name] = mx.array(
+                        np.concatenate([block_data[key][si] for si in chunk_idx], axis=0)
                     )
+                s_outputs_b: List[mx.array] = []
+                for key in sorted(k for k in block_data if k.startswith("out")):
+                    s_outputs_b.append(mx.array(
+                        np.concatenate([block_data[key][si] for si in chunk_idx], axis=0)
+                    ))
 
-                # Compute poly alphas (and shifts for asymmetric mode) for this sample's sigma
-                poly_alphas = None
-                poly_shifts = None
+                # Replace timestep arg with fake key
+                ts_arg_idx = 2 if is_mm else 1
+                s_inputs_b[ts_arg_idx] = mx.array(
+                    [_FAKE_TS_KEY] * (2 * B), dtype=s_inputs_b[0].dtype
+                )
+
+                # Inject batched mod params
+                inject_batched_mod_params(block, is_mm, precomputed_mods, chunk_idx)
+
+                # Compute poly alphas at mean sigma for the batch
+                poly_alphas_b = None
+                poly_shifts_b = None
                 if poly_schedule is not None and sample_sigmas is not None:
-                    sigma_val = float(sample_sigmas[si])
-                    poly_alphas = _compute_poly_alphas_for_sample(
-                        poly_schedule, block_name, is_mm, linear_paths, sigma_val
+                    mean_sigma = float(np.mean([sample_sigmas[si] for si in chunk_idx]))
+                    poly_alphas_b = _compute_poly_alphas_for_sample(
+                        poly_schedule, block_name, is_mm, linear_paths, mean_sigma
                     )
                     if asymmetric_act:
-                        poly_shifts = _compute_poly_shifts_for_sample(
-                            poly_schedule, block_name, is_mm, linear_paths, sigma_val
+                        poly_shifts_b = _compute_poly_shifts_for_sample(
+                            poly_schedule, block_name, is_mm, linear_paths, mean_sigma
                         )
 
-                loss_i, grads_i = loss_and_grad_fn(
-                    params, block, is_mm,
-                    linear_paths, linear_layers,
-                    W_fps_np, w_scales_np,
-                    s_inputs, s_kwargs, s_outputs,
-                    b_val, poly_alphas, poly_shifts,
-                )
-                # NO mx.eval here — keep everything lazy within the chunk.
-                # Accumulate loss and grads in the computation graph so MLX can
-                # fuse all batch_size forward+backward passes into one evaluation.
+                # Build per-sample weights for this batch
+                if sample_weights is not None:
+                    w_batch = mx.array([float(sample_weights[si]) for si in chunk_idx])
+                    weight_sum_b = float(w_batch.sum())
+                else:
+                    w_batch = None
+                    weight_sum_b = float(B)
 
-                w_i = float(sample_weights[si]) if sample_weights is not None else 1.0
-                total_loss = total_loss + w_i * loss_i
-                total_loss_uw = total_loss_uw + loss_i
-                weight_sum += w_i
-                n_valid += 1
+                # Single batched forward+backward
+                try:
+                    (total_loss_b, total_loss_uw_b), total_grads_b = mx.value_and_grad(
+                        batched_block_reconstruction_loss_fn, argnums=0
+                    )(
+                        params, block, is_mm,
+                        linear_paths, linear_layers, W_fps_np, w_scales_np,
+                        s_inputs_b, s_kwargs_b, s_outputs_b,
+                        b_val, poly_alphas_b, poly_shifts_b, B, w_batch,
+                    )
+                finally:
+                    clear_batched_mod_params(block, is_mm)
 
-                if total_grads is None:
-                    if w_i != 1.0:
-                        total_grads = {
-                            "alphas": [g * w_i for g in grads_i["alphas"]],
-                            "a_scales": [g * w_i for g in grads_i["a_scales"]],
-                        }
-                    else:
-                        total_grads = grads_i
+                all_grad_arrays_b = total_grads_b["alphas"] + total_grads_b["a_scales"]
+                mx.eval(total_loss_b, total_loss_uw_b, *all_grad_arrays_b)
+
+                chunk_loss_val = float(total_loss_b)
+                chunk_loss_uw_val = float(total_loss_uw_b)
+                if math.isnan(chunk_loss_val) or math.isinf(chunk_loss_val):
+                    step_has_nan = True
+                    continue
+                has_nan_grad = any(mx.isnan(g).any().item() for g in all_grad_arrays_b)
+                if has_nan_grad:
+                    step_has_nan = True
+                    continue
+
+                accum_loss_val += chunk_loss_val
+                accum_loss_uw_val += chunk_loss_uw_val
+                accum_weight_sum += weight_sum_b
+                accum_n_valid += B
+
+                if accum_alpha_grads is None:
+                    accum_alpha_grads = [np.array(g, dtype=np.float64) for g in total_grads_b["alphas"]]
+                    accum_ascale_grads = [np.array(g, dtype=np.float64) for g in total_grads_b["a_scales"]]
                 else:
                     for i in range(len(params.alphas)):
-                        total_grads["alphas"][i] = (
-                            total_grads["alphas"][i] + w_i * grads_i["alphas"][i]
-                        )
-                        total_grads["a_scales"][i] = (
-                            total_grads["a_scales"][i] + w_i * grads_i["a_scales"][i]
-                        )
+                        accum_alpha_grads[i] = accum_alpha_grads[i] + np.array(total_grads_b["alphas"][i], dtype=np.float64)
+                        accum_ascale_grads[i] = accum_ascale_grads[i] + np.array(total_grads_b["a_scales"][i], dtype=np.float64)
 
-            if total_grads is None:
-                step_has_nan = True
-                continue
-
-            # Eval this chunk (graph depth = batch_size, never larger)
-            all_grad_arrays = total_grads["alphas"] + total_grads["a_scales"]
-            mx.eval(total_loss, total_loss_uw, *all_grad_arrays)
-
-            chunk_loss_val = float(total_loss)
-            chunk_loss_uw_val = float(total_loss_uw)
-            if math.isnan(chunk_loss_val) or math.isinf(chunk_loss_val):
-                step_has_nan = True
-                continue
-
-            has_nan_grad = any(mx.isnan(g).any().item() for g in all_grad_arrays)
-            if has_nan_grad:
-                step_has_nan = True
-                continue
-
-            # Accumulate chunk gradients into numpy
-            accum_loss_val += chunk_loss_val
-            accum_loss_uw_val += chunk_loss_uw_val
-            accum_weight_sum += weight_sum
-            accum_n_valid += n_valid
-
-            if accum_alpha_grads is None:
-                accum_alpha_grads = [np.array(g, dtype=np.float64) for g in total_grads["alphas"]]
-                accum_ascale_grads = [np.array(g, dtype=np.float64) for g in total_grads["a_scales"]]
             else:
-                for i in range(len(params.alphas)):
-                    accum_alpha_grads[i] = accum_alpha_grads[i] + np.array(total_grads["alphas"][i], dtype=np.float64)
-                    accum_ascale_grads[i] = accum_ascale_grads[i] + np.array(total_grads["a_scales"][i], dtype=np.float64)
+                # --- SEQUENTIAL FALLBACK (original code) ---
+                total_loss = mx.array(0.0)
+                total_loss_uw = mx.array(0.0)  # unweighted loss (for logging)
+                total_grads = None
+                n_valid = 0
+                weight_sum = 0.0
+
+                for si in chunk_idx:
+                    # Build input tensors for this sample
+                    s_inputs: List[mx.array] = []
+                    s_kwargs: Dict[str, mx.array] = {}
+                    s_outputs: List[mx.array] = []
+
+                    # Positional args: arg0, arg1, arg2, ...
+                    for key in sorted(k for k in block_data if k.startswith("arg")):
+                        s_inputs.append(mx.array(block_data[key][si]))
+
+                    # Keyword args
+                    for key in (k for k in block_data if k.startswith("kw_")):
+                        kw_name = key[3:]  # strip "kw_" prefix
+                        s_kwargs[kw_name] = mx.array(block_data[key][si])
+
+                    # Target outputs
+                    for key in sorted(k for k in block_data if k.startswith("out")):
+                        s_outputs.append(mx.array(block_data[key][si]))
+
+                    # Set correct per-sample modulation params if pooled embeddings available
+                    if sample_pooled is not None and mmdit is not None and activation_dtype is not None:
+                        # timestep is arg1 for Uni, arg2 for MM
+                        ts_key = "arg2" if is_mm else "arg1"
+                        timestep_val = float(block_data[ts_key][si].flat[0])
+                        set_block_modulation_params(
+                            block, is_mm, mmdit,
+                            sample_pooled[si], timestep_val, activation_dtype,
+                        )
+
+                    # Compute poly alphas (and shifts for asymmetric mode) for this sample's sigma
+                    poly_alphas = None
+                    poly_shifts = None
+                    if poly_schedule is not None and sample_sigmas is not None:
+                        sigma_val = float(sample_sigmas[si])
+                        poly_alphas = _compute_poly_alphas_for_sample(
+                            poly_schedule, block_name, is_mm, linear_paths, sigma_val
+                        )
+                        if asymmetric_act:
+                            poly_shifts = _compute_poly_shifts_for_sample(
+                                poly_schedule, block_name, is_mm, linear_paths, sigma_val
+                            )
+
+                    loss_i, grads_i = loss_and_grad_fn(
+                        params, block, is_mm,
+                        linear_paths, linear_layers,
+                        W_fps_np, w_scales_np,
+                        s_inputs, s_kwargs, s_outputs,
+                        b_val, poly_alphas, poly_shifts,
+                    )
+                    # NO mx.eval here — keep everything lazy within the chunk.
+                    # Accumulate loss and grads in the computation graph so MLX can
+                    # fuse all batch_size forward+backward passes into one evaluation.
+
+                    w_i = float(sample_weights[si]) if sample_weights is not None else 1.0
+                    total_loss = total_loss + w_i * loss_i
+                    total_loss_uw = total_loss_uw + loss_i
+                    weight_sum += w_i
+                    n_valid += 1
+
+                    if total_grads is None:
+                        if w_i != 1.0:
+                            total_grads = {
+                                "alphas": [g * w_i for g in grads_i["alphas"]],
+                                "a_scales": [g * w_i for g in grads_i["a_scales"]],
+                            }
+                        else:
+                            total_grads = grads_i
+                    else:
+                        for i in range(len(params.alphas)):
+                            total_grads["alphas"][i] = (
+                                total_grads["alphas"][i] + w_i * grads_i["alphas"][i]
+                            )
+                            total_grads["a_scales"][i] = (
+                                total_grads["a_scales"][i] + w_i * grads_i["a_scales"][i]
+                            )
+
+                if total_grads is None:
+                    step_has_nan = True
+                    continue
+
+                # Eval this chunk (graph depth = batch_size, never larger)
+                all_grad_arrays = total_grads["alphas"] + total_grads["a_scales"]
+                mx.eval(total_loss, total_loss_uw, *all_grad_arrays)
+
+                chunk_loss_val = float(total_loss)
+                chunk_loss_uw_val = float(total_loss_uw)
+                if math.isnan(chunk_loss_val) or math.isinf(chunk_loss_val):
+                    step_has_nan = True
+                    continue
+
+                has_nan_grad = any(mx.isnan(g).any().item() for g in all_grad_arrays)
+                if has_nan_grad:
+                    step_has_nan = True
+                    continue
+
+                # Accumulate chunk gradients into numpy
+                accum_loss_val += chunk_loss_val
+                accum_loss_uw_val += chunk_loss_uw_val
+                accum_weight_sum += weight_sum
+                accum_n_valid += n_valid
+
+                if accum_alpha_grads is None:
+                    accum_alpha_grads = [np.array(g, dtype=np.float64) for g in total_grads["alphas"]]
+                    accum_ascale_grads = [np.array(g, dtype=np.float64) for g in total_grads["a_scales"]]
+                else:
+                    for i in range(len(params.alphas)):
+                        accum_alpha_grads[i] = accum_alpha_grads[i] + np.array(total_grads["alphas"][i], dtype=np.float64)
+                        accum_ascale_grads[i] = accum_ascale_grads[i] + np.array(total_grads["a_scales"][i], dtype=np.float64)
 
         # --- Step-level handling (replaces old eval + NaN check) ---
         if accum_alpha_grads is None or step_has_nan:
