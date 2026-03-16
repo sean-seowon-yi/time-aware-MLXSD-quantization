@@ -440,7 +440,136 @@ x_q = fake_quant(x, scale)                # quantize activations
 
 ---
 
-## Slide 17: Results — Schedule Generalization
+## Slide 17: Mixed-Precision — Surgically Keeping 4 Layers in FP16
+
+**Not every layer should be quantized. Knowing which ones to skip is part of the method.**
+
+**The problem: adaLN-induced distribution shift**
+
+SD3's adaptive layer normalization injects a timestep-conditioned shift into activations before the FFN. Across all 188 traced activation points, the shift distribution is highly concentrated — 185 layers sit within ±0.5 units of zero, and 3 layers are dramatic outliers:
+
+![Shift across all 188 layers](shift_all_layers.png)
+
+The per-channel shift distribution reveals the true picture — not just the mean across channels but how many channels are severely displaced:
+
+| Layer | Per-channel max | Channels > 100u | INT8 impact |
+|-------|----------------|-----------------|-------------|
+| mm22 txt mlp_fc2 | **356 units** | 744 / 6144 | Severe — half the grid wasted |
+| mm21 txt mlp_fc2 | **144 units** | 26 / 6144 | Significant |
+| mm20 txt mlp_fc2 | **46 units** | 0 / 6144 | Moderate |
+| mm14 txt mlp_fc2 | **4 units** | 0 / 6144 | ✅ Clean — excluded in error |
+| All other 185 layers | < 5 units | — | Negligible |
+
+**mm14 was incorrectly flagged** in the original analysis. Its per-channel max shift is only 4 units — well within symmetric INT8 range. It has been removed from the exclusion list, recovering another ~13.5 MB.
+
+Symmetric INT8 centers its grid at zero. A distribution centered at +254 means nearly all 256 quantization buckets are allocated to values that never appear. Rounding decisions become essentially random.
+
+**Does the polynomial clipping schedule fix this?**
+
+Partially. The polynomial correctly predicts the right α(σ) at each denoising step — so the clipping *width* is no longer wrong. But symmetric quantization always places the grid around zero, so with a distribution centred at +254, half the INT8 buckets still cover the empty negative side regardless of how accurate α(σ) is:
+
+```
+Polynomial gives α=254:  [-254 ........... 0 ........... +254]
+mm22 activations:                          [+200 .... +308]
+→ 127 of 256 buckets still wasted
+```
+
+**The complete fix: asymmetric shift polynomial**
+
+We model a second polynomial, shift(σ), capturing how the distribution center drifts with σ due to adaLN. The quantization zero point then tracks the distribution:
+
+```
+Asymmetric: [shift(σ) − α(σ) .......... shift(σ) + α(σ)]
+mm22:                         [+25 ......... +35]   ✓ all buckets used
+```
+
+The shift trajectory is smooth and polynomial-amenable — it rises during mid-denoising and falls near σ→0, following the same rectified flow physics as the clipping range:
+
+![Shift trajectories for extreme layers](shift_trajectories.png)
+
+| Layer | Cubic R² | Residual std | Verdict |
+|-------|----------|--------------|---------|
+| mm22 txt mlp_fc2 | 0.76 | 1.1 units | Feasible, ~97% correction |
+| mm21 txt mlp_fc2 | 0.88 | 0.24 units | Good fit |
+| mm20 txt mlp_fc2 | 0.86 | 0.24 units | Good fit |
+
+The shift R² (0.76–0.88) is lower than for the clipping range (median 0.944) because the shift is more sensitive to prompt content than to pure noise-level physics. More calibration data improves it.
+
+This is implemented (infrastructure ready) but not yet benchmarked. **FP16 exclusion is the conservative fallback** — costing only 2.8% of total savings — while asymmetric quant is validated.
+
+Cost of exclusion: **40.5 MB** (3 × 13.5 MB savings forfeited)
+Fraction of total potential savings forfeited: **2.1%** (3 out of 285 layers)
+The rest of those blocks — attention projections, fc1, image stream — are still fully W4A8.
+
+**Do other methods handle this?**
+
+Yes — mixed-precision is a recognized pattern, though our trigger is more principled than most:
+
+| Method | Approach | Granularity |
+|--------|----------|-------------|
+| **LLM.int8()** (Dettmers 2022) | Keep outlier *channels* in FP16, rest INT8 | Per-channel |
+| **SpQR** (Dettmers 2023) | Keep top-k outlier *weights* in FP16 sparse format | Per-weight |
+| **GPTQ sensitivity** | Skip layers whose perplexity degrades past a threshold | Per-layer |
+| **Mixed-precision NAS** | Search for per-layer bit width by sensitivity | Per-layer |
+| **Ours** | Keep layers where adaLN shift >50 units (interpretable cause) | Per-layer |
+
+**What makes our approach different:**
+- The exclusion criterion is *causal* — we know exactly why these layers are unquantizable (adaLN shift displaces the distribution center), not just that they are
+- The threshold is diagnostic and interpretable, not a tuned hyperparameter
+- Asymmetric quantization is a principled path to re-quantizing them without the 2.8% forfeit
+
+---
+
+## Slide 18: Per-Channel Activation Quantization — When It Matters
+
+**Current design: one activation scale per layer (per-tensor)**
+
+Each layer has a single scalar `a_scale` that controls the INT8 clipping range across all output channels. This is the standard and most hardware-friendly approach.
+
+**The question:** Does channel-to-channel variance within a layer justify per-channel activation scales?
+
+**Metric:** For each layer, compare channel-to-channel std (how different channels' means are from each other) to within-channel std (how much each channel varies over time). A high ratio means channels live in systematically different regimes — per-tensor quantization wastes resolution.
+
+![Per-channel vs within-channel variance across all 188 layers](per_channel_variance.png)
+
+**Results across all 188 traced activation points:**
+
+| Layer | ch-ch/within ratio | Max per-channel mean | Per-channel needed? |
+|-------|-------------------|---------------------|---------------------|
+| mm22 txt fc1_in | **18.8×** | 280 units | Yes — currently quantized |
+| mm22 txt fc2_in | **15.0×** | 343 units | Yes — kept FP16 |
+| mm21 txt fc1_in | **12.8×** | 122 units | Yes — currently quantized |
+| mm21 txt fc2_in | **9.7×** | 135 units | Yes — kept FP16 |
+| mm01 txt fc1_in | 6.6× | 18 units | Marginal |
+| mm00 txt fc2_in | 6.0× | 26 units | Marginal |
+| mm20 txt fc1/fc2_in | 3.1–3.3× | 42–43 units | Moderate |
+| All other 182 layers | < 3× | < 9 units | No |
+
+**Key finding:** The extreme per-channel variance is not a widespread problem — it is almost entirely concentrated in the same mm22/21 adaLN-shift layers already identified for FP16 exclusion. The pattern is consistent: adaLN-induced distribution displacement breaks both the clipping range (fixed by α(σ)) and the assumption of channel homogeneity (broken by adaLN shift).
+
+**New concern: mm22/21 fc1_in are currently being quantized**
+
+The fc1_in layers (inputs to the FFN) also show extreme per-channel variance despite not being excluded. Per-channel max shifts of 280/122 units mean the same INT8 waste applies to the layer *before* the already-excluded fc2. These should be added to the exclusion set (or treated with per-channel scales).
+
+**Per-tensor vs Per-channel comparison:**
+
+| Property | Per-tensor | Per-channel |
+|----------|-----------|-------------|
+| Storage overhead | 1 scalar/layer | D scalars/layer (D = hidden dim) |
+| Runtime overhead | 1 multiply | channel-wise multiply |
+| Hardware support | Universal | Varies (some accelerators only support per-tensor) |
+| Polynomial overhead | 3 coefficients/layer | 3D coefficients/layer |
+| Handles mm22/21 shift | No | Yes |
+| Needed for most layers | — | No (ratio < 3) |
+
+**Recommended path:**
+- Keep per-tensor for all 182 normal layers (ratio < 3)
+- Add mm22/21 fc1_in to the FP16 exclusion set (+2 layers, +27 MB forfeit, total 67.5 MB / 3.7%)
+- Or implement per-channel activation quant for the 4 extreme layers, recoverable with per-channel α(σ) polynomials
+
+---
+
+## Slide 19: Results — Schedule Generalization
 
 **Do the polynomial coefficients generalize across different calibration sets?**
 
@@ -457,7 +586,7 @@ The 4 extreme-shift layers (mm14, mm20, mm21, mm22 txt mlp_fc2) are the exceptio
 
 ---
 
-## Slide 18: What's Still To Do
+## Slide 20: What's Still To Do
 
 **Current status and next steps**
 
@@ -467,9 +596,10 @@ The 4 extreme-shift layers (mm14, mm20, mm21, mm22 txt mlp_fc2) are the exceptio
 | Polynomial schedule generation | ✅ Done (227 static, 57 quadratic, 1 cubic) |
 | σ-aware AdaRound with polynomial | ✅ Implemented |
 | σ-weighted loss | ✅ Implemented |
-| 4 extreme layers FP16 exclusion | ✅ Identified |
+| 3 extreme fc2 layers FP16 exclusion | ✅ Implemented |
+| mm22/21 fc1_in per-channel issue | ⚠️ Newly identified — needs exclusion or per-channel scales |
 | Derivative-weighted loss (`\|dα/dσ\|`) | ✅ Implemented |
-| Asymmetric quantization (shift polynomials) | 🔧 Infrastructure ready, not benchmarked |
+| Asymmetric quant — shift polynomials for adaLN layers | 🔧 Infrastructure ready, not benchmarked (would recover the 2.8%) |
 | End-to-end FID evaluation | ⏳ In progress |
 | Comparison vs. TaQ-DiT / HTG baseline | ⏳ Pending |
 
@@ -478,7 +608,7 @@ How much does polynomial clipping improve FID and PSNR vs. standard AdaRound and
 
 ---
 
-## Slide 19: Summary
+## Slide 21: Summary
 
 **What we built:**
 
