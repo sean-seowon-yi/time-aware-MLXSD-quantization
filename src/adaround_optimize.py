@@ -128,6 +128,20 @@ import mlx.optimizers as optim
 from src.cache_adaround_data import load_block_data
 
 
+def _stack_block_data(
+    per_sample: List[Dict[str, np.ndarray]],
+) -> Dict[str, np.ndarray]:
+    """Convert load_block_data's list-of-per-sample-dicts to a stacked dict.
+
+    load_block_data returns List[Dict] (one dict per sample, mmap-backed).
+    The optimizer expects Dict[str, np.ndarray] with shape [N, ...].
+    """
+    if not per_sample:
+        return {}
+    keys = per_sample[0].keys()
+    return {k: np.stack([s[k] for s in per_sample], axis=0) for k in keys}
+
+
 def load_pooled_embeddings(cache_dir: Path) -> Optional[Dict[int, np.ndarray]]:
     """
     Load per-image pooled text embeddings saved by cache_adaround_data.py.
@@ -1554,7 +1568,7 @@ def main() -> None:
                     else mmdit.unified_transformer_blocks[idx]
                 )
 
-                block_data = load_block_data(block_name, group_sample_files)
+                block_data = _stack_block_data(load_block_data(block_name, group_sample_files))
                 if not block_data or "arg0" not in block_data:
                     tqdm.write(f"  SKIP {block_name} (group {group_id}): no data")
                     continue
@@ -1723,7 +1737,7 @@ def main() -> None:
         )
 
         # Load calibration data for this block
-        block_data = load_block_data(block_name, all_sample_files)
+        block_data = _stack_block_data(load_block_data(block_name, all_sample_files))
         if not block_data or "arg0" not in block_data:
             tqdm.write(f"  SKIP {block_name}: no calibration data")
             continue
