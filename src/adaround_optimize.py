@@ -282,14 +282,23 @@ def inject_batched_mod_params(
         txt_batch = np.concatenate(
             [np.repeat(txt_mod_np[si:si+1], 2, axis=0) for si in chunk_idx], axis=0
         )
-        block.image_transformer_block._modulation_params[_FAKE_TS_KEY] = mx.array(img_batch)
-        block.text_transformer_block._modulation_params[_FAKE_TS_KEY] = mx.array(txt_batch)
+        img_tb = block.image_transformer_block
+        txt_tb = block.text_transformer_block
+        if not hasattr(img_tb, "_modulation_params"):
+            img_tb._modulation_params = {}
+        if not hasattr(txt_tb, "_modulation_params"):
+            txt_tb._modulation_params = {}
+        img_tb._modulation_params[_FAKE_TS_KEY] = mx.array(img_batch)
+        txt_tb._modulation_params[_FAKE_TS_KEY] = mx.array(txt_batch)
     else:
         (uni_mod_np,) = precomputed_mods
         uni_batch = np.concatenate(
             [np.repeat(uni_mod_np[si:si+1], 2, axis=0) for si in chunk_idx], axis=0
         )
-        block.transformer_block._modulation_params[_FAKE_TS_KEY] = mx.array(uni_batch)
+        tb = block.transformer_block
+        if not hasattr(tb, "_modulation_params"):
+            tb._modulation_params = {}
+        tb._modulation_params[_FAKE_TS_KEY] = mx.array(uni_batch)
 
 
 def clear_batched_mod_params(block, is_mm: bool) -> None:
@@ -764,12 +773,15 @@ def batched_block_reconstruction_loss_fn(
     poly_shifts: Optional[List[Optional[float]]],
     batch_n: int,                # B (number of samples in batch)
     sample_weights_batch: Optional[mx.array],  # [B] weights or None
+    bits_w: int = 4,
+    bits_a: int = 8,
 ) -> Tuple[mx.array, mx.array]:  # (weighted_loss, unweighted_loss)
     """
     Single batched forward pass for B samples stacked along the batch axis.
 
     Replaces B sequential calls to block_loss_fn.
-    Returns (weighted_loss, unweighted_loss) both as scalars.
+    Returns (weighted_loss, unweighted_loss) both as scalars (sum over batch,
+    matching the sequential path's accumulation semantics).
 
     Inputs s_inputs, s_outputs are stacked as [2B, ...] where each sample's
     CFG pair (conditional + unconditional) occupies two consecutive rows.
@@ -784,14 +796,24 @@ def batched_block_reconstruction_loss_fn(
     s_kwargs = {k: v.astype(mx.float32) for k, v in s_kwargs.items()}
     s_outputs = [out.astype(mx.float32) for out in s_outputs]
 
+    # mx.value_and_grad decomposes nn.Module into a dict — only mx.array
+    # leaves appear; plain int attrs (qmin_w etc.) are dropped. Recompute
+    # quant ranges from bits_w/bits_a passed as non-differentiated args.
+    p_alphas = params["alphas"] if isinstance(params, dict) else params.alphas
+    p_a_scales = params["a_scales"] if isinstance(params, dict) else params.a_scales
+    p_qmin_w = -(2 ** (bits_w - 1))
+    p_qmax_w = 2 ** (bits_w - 1) - 1
+    p_qmin_a = -(2 ** (bits_a - 1))
+    p_qmax_a = 2 ** (bits_a - 1) - 1
+
     # Build soft-quantised weights (in computation graph via params.alphas)
     soft_weights: List[mx.array] = []
     for i in range(n):
         W_fp_mx = mx.array(W_fps_np[i])       # constant — no gradient
         s_mx = mx.array(w_scales_np[i])        # constant — no gradient
-        r = rectified_sigmoid(params.alphas[i])
+        r = rectified_sigmoid(p_alphas[i])
         W_floor = mx.floor(W_fp_mx / s_mx)
-        soft_w = mx.clip(W_floor + r, params.qmin_w, params.qmax_w) * s_mx
+        soft_w = mx.clip(W_floor + r, p_qmin_w, p_qmax_w) * s_mx
         soft_weights.append(soft_w)
 
     # Patch: replace each linear with a _QuantProxy
@@ -803,9 +825,9 @@ def batched_block_reconstruction_loss_fn(
         proxy = _QuantProxy(
             linear_layers[i],
             soft_weights[i],
-            params.a_scales[i],
-            params.qmin_a,
-            params.qmax_a,
+            p_a_scales[i],
+            p_qmin_a,
+            p_qmax_a,
             poly_alpha=pa,
             poly_shift=ps,
         )
@@ -833,17 +855,19 @@ def batched_block_reconstruction_loss_fn(
         per_sample = flat.mean(axis=1)       # [B]
 
         # Round loss (annealed regularisation) — same as in block_loss_fn
-        rnd = _round_loss(params.alphas, b_val)
+        rnd = _round_loss(p_alphas, b_val)
         # Distribute round loss equally across samples
         per_sample = per_sample + ROUND_WEIGHT * rnd / batch_n
 
+        # Return SUM (not mean) over the batch to match the sequential path,
+        # which accumulates sum of per-sample losses.  The caller normalizes
+        # by accum_n_valid after accumulation across grad-accum chunks.
         if sample_weights_batch is not None:
-            w_sum = sample_weights_batch.sum()
-            weighted_loss = (per_sample * sample_weights_batch).sum() / mx.maximum(w_sum, mx.array(1e-8))
+            weighted_loss = (per_sample * sample_weights_batch).sum()
         else:
-            weighted_loss = per_sample.mean()
+            weighted_loss = per_sample.sum()
 
-        unweighted_loss = per_sample.mean()
+        unweighted_loss = per_sample.sum()
 
     finally:
         for path, orig in original_layers:
@@ -1302,6 +1326,7 @@ def optimize_block(
                         linear_paths, linear_layers, W_fps_np, w_scales_np,
                         s_inputs_b, s_kwargs_b, s_outputs_b,
                         b_val, poly_alphas_b, poly_shifts_b, B, w_batch,
+                        params.bits_w, params.bits_a,
                     )
                 finally:
                     clear_batched_mod_params(block, is_mm)
