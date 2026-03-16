@@ -34,13 +34,14 @@ import gc
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Set, Tuple
 
 import numpy as np
 import mlx.core as mx
 
 from .activation_tracer import (
     ActivationTracer,
+    PerLayerTimeStats,
     HISTOGRAM_NUM_BINS,
     HISTOGRAM_RANGE,
     install_tracing,
@@ -125,6 +126,49 @@ def _group_by_prompt(
     return dict(sorted(groups.items()))
 
 
+def _save_tracer_checkpoint(tracer: ActivationTracer, path: Path, done_groups: Set[int]) -> None:
+    """Serialize raw tracer accumulators to a .npz checkpoint."""
+    flat: dict[str, np.ndarray] = {}
+    for layer_id, tdict in tracer.stats.items():
+        for t_key, s in tdict.items():
+            prefix = f"{layer_id}||{t_key}"
+            flat[f"{prefix}||count"]     = np.array(s.count, dtype=np.int64)
+            flat[f"{prefix}||sum"]       = s.sum
+            flat[f"{prefix}||sq_sum"]    = s.sq_sum
+            flat[f"{prefix}||min"]       = s.min
+            flat[f"{prefix}||max"]       = s.max
+            flat[f"{prefix}||histogram"] = s.histogram
+    flat["__done_groups__"] = np.array(sorted(done_groups), dtype=np.int64)
+    np.savez_compressed(path, **flat)
+
+
+def _load_tracer_checkpoint(path: Path) -> Tuple[ActivationTracer, Set[int]]:
+    """Restore a tracer and the set of completed prompt-group indices from a checkpoint."""
+    data = np.load(path)
+    tracer = ActivationTracer()
+    done_groups: Set[int] = set(data["__done_groups__"].tolist())
+
+    for key in data.files:
+        if key == "__done_groups__":
+            continue
+        if not key.endswith("||count"):
+            continue
+        prefix = key[: -len("||count")]
+        layer_id, t_key = prefix.split("||", 1)
+
+        s = PerLayerTimeStats()
+        s.count     = int(data[f"{prefix}||count"])
+        s.sum       = data[f"{prefix}||sum"]
+        s.sq_sum    = data[f"{prefix}||sq_sum"]
+        s.min       = data[f"{prefix}||min"]
+        s.max       = data[f"{prefix}||max"]
+        s.histogram = data[f"{prefix}||histogram"]
+
+        tracer.stats.setdefault(layer_id, {})[t_key] = s
+
+    return tracer, done_groups
+
+
 def _run_single_forward(
     pipeline,
     x_np: np.ndarray,
@@ -161,6 +205,7 @@ def run_diagnostics(
     seed: int,
     low_memory_mode: bool,
     local_ckpt: str | None,
+    checkpoint_path: Path | None = None,
 ) -> Tuple[ActivationTracer, List[float]]:
     """
     Core Phase 2 diagnostic routine.
@@ -188,6 +233,15 @@ def run_diagnostics(
         f"{n_cal} points, profiling {len(sel_idx)} of them."
     )
 
+    # --- Resume: load checkpoint if present ---
+    done_groups: Set[int] = set()
+    if checkpoint_path is not None and checkpoint_path.exists():
+        print(f"  Loading checkpoint from {checkpoint_path} ...")
+        tracer_state, done_groups = _load_tracer_checkpoint(checkpoint_path)
+        print(f"  Resuming: {len(done_groups)} prompt group(s) already done")
+    else:
+        tracer_state = None
+
     pipeline = _load_pipeline(
         model_version=model_version,
         low_memory_mode=low_memory_mode,
@@ -198,23 +252,26 @@ def run_diagnostics(
     print(f"  Grouped into {len(groups)} prompt group(s)")
 
     tracer = install_tracing(pipeline.mmdit)
+
+    # Merge any previously accumulated stats into the fresh tracer
+    if tracer_state is not None:
+        tracer.stats = tracer_state.stats
+
     all_unique_ts: set[float] = set()
     processed = 0
 
     try:
         for group_num, (prompt_idx, cal_indices) in enumerate(groups.items()):
-            # Collect unique timestep values for this prompt group
             group_ts_values = sorted(set(float(ts[i]) for i in cal_indices))
             all_unique_ts.update(group_ts_values)
 
-            # Build conditioning tensors (already on the right dtype from Phase 1)
-            pooled_mx = mx.array(cs_pooled[prompt_idx]).astype(
-                pipeline.activation_dtype
-            )
+            if group_num in done_groups:
+                processed += len(cal_indices)
+                continue
+
+            pooled_mx = mx.array(cs_pooled[prompt_idx]).astype(pipeline.activation_dtype)
             cond_mx = mx.array(cs[prompt_idx]).astype(pipeline.activation_dtype)
 
-            # Cache modulation params for ALL timesteps in this group at once.
-            # This is the same pattern Phase 1 uses.
             ts_mx = mx.array(group_ts_values, dtype=pipeline.activation_dtype)
             pipeline.mmdit.cache_modulation_params(
                 pooled_text_embeddings=pooled_mx,
@@ -224,13 +281,7 @@ def run_diagnostics(
             for cal_idx in cal_indices:
                 x_np = xs[cal_idx]
                 t_value = float(ts[cal_idx])
-
-                _run_single_forward(
-                    pipeline=pipeline,
-                    x_np=x_np,
-                    t_value=t_value,
-                    cond_mx=cond_mx,
-                )
+                _run_single_forward(pipeline=pipeline, x_np=x_np, t_value=t_value, cond_mx=cond_mx)
                 processed += 1
 
                 if processed % 50 == 0 or processed == len(sel_idx):
@@ -240,11 +291,16 @@ def run_diagnostics(
                         f"unique timesteps: {len(all_unique_ts)})"
                     )
 
-            # Restore adaLN weights that cache_modulation_params offloaded,
-            # so the next prompt group starts fresh.
+            # Restore adaLN weights before next group
             pipeline.mmdit.load_weights(
                 pipeline.load_mmdit(only_modulation_dict=True), strict=False
             )
+
+            done_groups.add(group_num)
+            if checkpoint_path is not None:
+                _save_tracer_checkpoint(tracer, checkpoint_path, done_groups)
+                print(f"  Checkpoint saved ({len(done_groups)}/{len(groups)} groups done)")
+
             gc.collect()
 
     finally:
@@ -311,8 +367,15 @@ def main() -> None:
         default="activation_stats_postgelu.npz",
         help="Output path for activation statistics (.npz)",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from checkpoint (saved alongside --output as <output>.ckpt.npz)",
+    )
 
     args = parser.parse_args()
+
+    checkpoint_path = Path(args.output).with_suffix(".ckpt.npz") if args.resume else None
 
     tracer, unique_ts = run_diagnostics(
         calibration_file=args.calibration_file,
@@ -321,6 +384,7 @@ def main() -> None:
         seed=args.seed,
         low_memory_mode=args.low_memory_mode,
         local_ckpt=args.local_ckpt,
+        checkpoint_path=checkpoint_path,
     )
 
     summary = tracer.summarize()
@@ -344,6 +408,10 @@ def main() -> None:
     print(f"  Unique timesteps: {len(unique_ts)}")
     print(f"  Histogram bins: {HISTOGRAM_NUM_BINS} in [{HISTOGRAM_RANGE[0]}, {HISTOGRAM_RANGE[1]}]")
     print("You can now inspect per-layer, per-timestep stats/histograms in a notebook.")
+
+    if checkpoint_path is not None and checkpoint_path.exists():
+        checkpoint_path.unlink()
+        print(f"Removed checkpoint {checkpoint_path}")
 
 
 if __name__ == "__main__":

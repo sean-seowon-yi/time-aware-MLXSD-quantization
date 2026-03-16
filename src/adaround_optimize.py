@@ -33,11 +33,14 @@ Simplifications vs full TaQ-DiT:
 
 Usage:
 --no-capture-output flag is what lets tqdm progress bars stream through)
+--batch-size 4 recommended to help with out of memory issues
     # Basic training
     conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \\
         --adaround-cache /path/to/adaround_cache \\
         --output /path/to/quantized_weights_adaround \\
         [--iters 20000] [--batch-size 16] [--bits-w 4] [--bits-a 8]
+
+conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize --adaround-cache calibration_data_100/adaround_cache --output quantized_weights_baseline --iters 600 --batch-size 4 --resume
 
     # Poly-clipping + σ-weighted loss (Module A)
     conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \\
@@ -51,7 +54,8 @@ Usage:
         --adaround-cache /path/to/adaround_cache \\
         --output /path/to/quantized_weights_poly \\
         --poly-schedule polynomial_clipping_schedule.json \\
-        --refine --refine-skip-converged 0.5 --iters 500
+        --refine --refine-skip-converged 0.5 --iters 500 --batch 8 
+        (batch 8 helps keep iterations at 1 per second)
 
     # FP16 layer exclusion (Module B) — keep extreme-shift layers in FP16
     conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \\
@@ -682,6 +686,65 @@ def _compute_sigma_weights(
     return raw / raw.mean()  # Normalize so mean weight = 1.0
 
 
+def _compute_derivative_weights(
+    poly_schedule: Dict,
+    block_name: str,
+    is_mm: bool,
+    linear_paths: List[str],
+    sample_sigmas: np.ndarray,
+) -> np.ndarray:
+    """Compute per-sample |dα/dσ| weights averaged across linear layers in a block.
+
+    For each sample i, evaluates |dα/dσ|(σ_i) for every linear layer in the block
+    using the polynomial derivative, then averages across layers.
+
+    Degree-0 (static) layers contribute zero derivative — blocks where all layers
+    are static return uniform weights (no amplification, no suppression).
+
+    The returned weights are normalised so mean = 1.0, making them a multiplicative
+    modifier that can be combined with σ-weights:
+        combined_w = sigma_w * deriv_w
+    """
+    poly_layers = poly_schedule.get("layers", {})
+    sigma_range = poly_schedule.get("sigma_range")
+
+    # Collect |dα/dσ| per layer per sample
+    layer_derivs: List[np.ndarray] = []
+    for path in linear_paths:
+        poly_key = _path_to_poly_key(block_name, is_mm, path)
+        layer_cfg = poly_layers.get(poly_key)
+        if layer_cfg is None:
+            continue
+        coeffs = np.array(layer_cfg["coeffs"], dtype=np.float64)
+        degree = len(coeffs) - 1
+        if degree == 0:
+            # Static layer — zero derivative everywhere
+            layer_derivs.append(np.zeros_like(sample_sigmas, dtype=np.float64))
+            continue
+
+        # Derivative coefficients: d/dσ of np.polyval(coeffs, σ)
+        # np.polyval uses descending order: coeffs[0]*σ^n + ... + coeffs[-1]
+        deriv_coeffs = np.polyder(coeffs)
+
+        sigmas = sample_sigmas.astype(np.float64)
+        if sigma_range:
+            sigmas = np.clip(sigmas, sigma_range[0], sigma_range[1])
+
+        layer_derivs.append(np.abs(np.polyval(deriv_coeffs, sigmas)))
+
+    if not layer_derivs:
+        return np.ones_like(sample_sigmas, dtype=np.float64)
+
+    # Average |dα/dσ| across layers
+    mean_deriv = np.mean(np.stack(layer_derivs, axis=0), axis=0)
+
+    # If all layers are static, return uniform weights
+    if mean_deriv.max() == 0.0:
+        return np.ones_like(sample_sigmas, dtype=np.float64)
+
+    return mean_deriv / mean_deriv.mean()  # Normalize so mean weight = 1.0
+
+
 def _init_a_scales_from_poly(
     poly_schedule: Dict,
     block_name: str,
@@ -802,7 +865,7 @@ def optimize_block(
     block: Any,
     block_name: str,
     is_mm: bool,
-    block_data: List[Dict[str, np.ndarray]],  # from load_block_data — list of per-sample dicts
+    block_data: Dict[str, np.ndarray],  # from load_block_data
     iters: int = 20000,
     batch_size: int = 16,
     bits_w: int = 4,
@@ -818,9 +881,9 @@ def optimize_block(
     activation_dtype=None,
     sigma_weighted: bool = False,
     sigma_weight_offset: float = 1.0,
+    derivative_weighted: bool = False,
     exclude_keys: Optional[set] = None,
     asymmetric_act: bool = False,
-    grad_accum_steps: int = 1,
 ) -> Tuple[AdaRoundParams, Dict]:
     """
     Run AdaRound optimisation for a single transformer block.
@@ -889,7 +952,7 @@ def optimize_block(
     temp_decay = LinearTempDecay(t_max=iters, warm_up=0.2, start_b=20.0, end_b=2.0)
 
     # Unpack all calibration samples
-    n_samples = len(block_data)
+    n_samples = block_data["arg0"].shape[0]
 
     # Precompute per-sample sigma weights
     sample_weights = None
@@ -898,6 +961,21 @@ def optimize_block(
         print(
             f"  σ-weighted loss enabled (offset={sigma_weight_offset}): "
             f"weight range [{sample_weights.min():.3f}, {sample_weights.max():.3f}]",
+            flush=True,
+        )
+
+    if derivative_weighted and poly_schedule is not None and sample_sigmas is not None:
+        deriv_w = _compute_derivative_weights(
+            poly_schedule, block_name, is_mm, linear_paths, sample_sigmas
+        )
+        if sample_weights is not None:
+            sample_weights = sample_weights * deriv_w
+            sample_weights = sample_weights / sample_weights.mean()
+        else:
+            sample_weights = deriv_w
+        print(
+            f"  derivative-weighted loss enabled: "
+            f"|dα/dσ| weight range [{sample_weights.min():.3f}, {sample_weights.max():.3f}]",
             flush=True,
         )
 
@@ -922,168 +1000,96 @@ def optimize_block(
 
     for step in range(iters):
         b_val = temp_decay(step)
-        # Cosine LR is computed per optimizer step (not per accum sub-step)
-        cos_factor = 0.5 * (1.0 + math.cos(math.pi * step / iters))
 
-        # --- Gradient accumulation outer loop ---
-        accum_alpha_np = None
-        accum_a_scale_np = None
-        accum_loss = 0.0
-        accum_loss_uw = 0.0
-        accum_weight_sum = 0.0
-        accum_n_used = 0
-        valid_accum_steps = 0
+        # Sample mini-batch
+        idx = np.random.randint(0, n_samples, min(batch_size, n_samples))
 
-        for _accum_i in range(grad_accum_steps):
-            # Sample mini-batch
-            idx = np.random.randint(0, n_samples, min(batch_size, n_samples))
+        # Average loss over sampled indices
+        total_loss = mx.array(0.0)
+        total_loss_uw = mx.array(0.0)  # unweighted loss (for logging)
+        total_grads = None
+        n_valid = 0
+        weight_sum = 0.0
 
-            # Average loss over sampled indices
-            total_loss = mx.array(0.0)
-            total_loss_uw = mx.array(0.0)  # unweighted loss (for logging)
-            total_grads = None
-            n_valid = 0
-            weight_sum = 0.0
+        for si in idx:
+            # Build input tensors for this sample
+            s_inputs: List[mx.array] = []
+            s_kwargs: Dict[str, mx.array] = {}
+            s_outputs: List[mx.array] = []
 
-            for si in idx:
-                # Build input tensors for this sample
-                s_inputs: List[mx.array] = []
-                s_kwargs: Dict[str, mx.array] = {}
-                s_outputs: List[mx.array] = []
+            # Positional args: arg0, arg1, arg2, ...
+            for key in sorted(k for k in block_data if k.startswith("arg")):
+                s_inputs.append(mx.array(block_data[key][si]))
 
-                # Copy mmap arrays into contiguous RAM before passing to MLX.
-                # mmap-backed arrays (from np.load mmap_mode='r') are read-only and
-                # may be non-contiguous; mx.array() can silently produce garbage from them.
-                sample = {k: np.array(v) for k, v in block_data[si].items()}
+            # Keyword args
+            for key in (k for k in block_data if k.startswith("kw_")):
+                kw_name = key[3:]  # strip "kw_" prefix
+                s_kwargs[kw_name] = mx.array(block_data[key][si])
 
-                # Positional args: arg0, arg1, arg2, ...
-                for key in sorted(k for k in sample if k.startswith("arg")):
-                    s_inputs.append(mx.array(sample[key]))
+            # Target outputs
+            for key in sorted(k for k in block_data if k.startswith("out")):
+                s_outputs.append(mx.array(block_data[key][si]))
 
-                # Keyword args
-                for key in (k for k in sample if k.startswith("kw_")):
-                    kw_name = key[3:]  # strip "kw_" prefix
-                    s_kwargs[kw_name] = mx.array(sample[key])
+            # Set correct per-sample modulation params if pooled embeddings available
+            if sample_pooled is not None and mmdit is not None and activation_dtype is not None:
+                # timestep is arg1 for Uni, arg2 for MM
+                ts_key = "arg2" if is_mm else "arg1"
+                timestep_val = float(block_data[ts_key][si].flat[0])
+                set_block_modulation_params(
+                    block, is_mm, mmdit,
+                    sample_pooled[si], timestep_val, activation_dtype,
+                )
 
-                # Target outputs
-                for key in sorted(k for k in sample if k.startswith("out")):
-                    s_outputs.append(mx.array(sample[key]))
-
-                # Set correct per-sample modulation params if pooled embeddings available
-                if sample_pooled is not None and mmdit is not None and activation_dtype is not None:
-                    # timestep is arg1 for Uni, arg2 for MM
-                    ts_key = "arg2" if is_mm else "arg1"
-                    timestep_val = float(sample[ts_key].flat[0])
-                    set_block_modulation_params(
-                        block, is_mm, mmdit,
-                        sample_pooled[si], timestep_val, activation_dtype,
-                    )
-
-                # Compute poly alphas (and shifts for asymmetric mode) for this sample's sigma
-                poly_alphas = None
-                poly_shifts = None
-                if poly_schedule is not None and sample_sigmas is not None:
-                    sigma_val = float(sample_sigmas[si])
-                    poly_alphas = _compute_poly_alphas_for_sample(
+            # Compute poly alphas (and shifts for asymmetric mode) for this sample's sigma
+            poly_alphas = None
+            poly_shifts = None
+            if poly_schedule is not None and sample_sigmas is not None:
+                sigma_val = float(sample_sigmas[si])
+                poly_alphas = _compute_poly_alphas_for_sample(
+                    poly_schedule, block_name, is_mm, linear_paths, sigma_val
+                )
+                if asymmetric_act:
+                    poly_shifts = _compute_poly_shifts_for_sample(
                         poly_schedule, block_name, is_mm, linear_paths, sigma_val
                     )
-                    if asymmetric_act:
-                        poly_shifts = _compute_poly_shifts_for_sample(
-                            poly_schedule, block_name, is_mm, linear_paths, sigma_val
-                        )
 
-                loss_i, grads_i = loss_and_grad_fn(
-                    params, block, is_mm,
-                    linear_paths, linear_layers,
-                    W_fps_np, w_scales_np,
-                    s_inputs, s_kwargs, s_outputs,
-                    b_val, poly_alphas, poly_shifts,
-                )
-                # NO mx.eval here — keep everything lazy.
-                # Accumulate loss and grads in the computation graph so MLX can
-                # fuse all 16 forward+backward passes into one evaluation.
+            loss_i, grads_i = loss_and_grad_fn(
+                params, block, is_mm,
+                linear_paths, linear_layers,
+                W_fps_np, w_scales_np,
+                s_inputs, s_kwargs, s_outputs,
+                b_val, poly_alphas, poly_shifts,
+            )
+            # NO mx.eval here — keep everything lazy.
+            # Accumulate loss and grads in the computation graph so MLX can
+            # fuse all 16 forward+backward passes into one evaluation.
 
-                w_i = float(sample_weights[si]) if sample_weights is not None else 1.0
-                total_loss = total_loss + w_i * loss_i
-                total_loss_uw = total_loss_uw + loss_i
-                weight_sum += w_i
-                n_valid += 1
-
-                if total_grads is None:
-                    if w_i != 1.0:
-                        total_grads = {
-                            "alphas": [g * w_i for g in grads_i["alphas"]],
-                            "a_scales": [g * w_i for g in grads_i["a_scales"]],
-                        }
-                    else:
-                        total_grads = grads_i
-                else:
-                    for i in range(len(params.alphas)):
-                        total_grads["alphas"][i] = (
-                            total_grads["alphas"][i] + w_i * grads_i["alphas"][i]
-                        )
-                        total_grads["a_scales"][i] = (
-                            total_grads["a_scales"][i] + w_i * grads_i["a_scales"][i]
-                        )
+            w_i = float(sample_weights[si]) if sample_weights is not None else 1.0
+            total_loss = total_loss + w_i * loss_i
+            total_loss_uw = total_loss_uw + loss_i
+            weight_sum += w_i
+            n_valid += 1
 
             if total_grads is None:
-                continue  # no valid samples in this accum step, skip
-
-            # Average grads over valid samples (use weight_sum for σ-weighted mode)
-            grad_denom = weight_sum if sample_weights is not None else n_valid
-            for i in range(len(params.alphas)):
-                total_grads["alphas"][i] = total_grads["alphas"][i] / grad_denom
-                total_grads["a_scales"][i] = total_grads["a_scales"][i] / grad_denom
-
-            # Single eval for this mini-batch: loss + all gradients together.
-            all_grad_arrays = total_grads["alphas"] + total_grads["a_scales"]
-            mx.eval(total_loss, *all_grad_arrays)
-
-            loss_denom = weight_sum if sample_weights is not None else n_valid
-            loss_val_i = float(total_loss) / loss_denom
-            loss_uw_val_i = float(total_loss_uw) / n_valid if n_valid > 0 else loss_val_i
-
-            # Skip accum step if loss is NaN/Inf
-            if math.isnan(loss_val_i) or math.isinf(loss_val_i):
-                if step < 10 or step % 100 == 0:
-                    print(
-                        f"  WARNING: NaN/Inf loss at step {step} accum {_accum_i} "
-                        f"(b={b_val:.1f}), skipping accum step",
-                        flush=True,
-                    )
-                continue
-
-            has_nan_grad = any(mx.isnan(g).any().item() for g in all_grad_arrays)
-            if has_nan_grad:
-                if step < 10 or step % 100 == 0:
-                    print(
-                        f"  WARNING: NaN in gradients at step {step} accum {_accum_i} "
-                        f"(b={b_val:.1f}), replacing NaN with 0",
-                        flush=True,
-                    )
-                # Replace NaN elements with 0 rather than skipping the whole update.
-                total_grads["alphas"] = [mx.nan_to_num(g, nan=0.0) for g in total_grads["alphas"]]
-                total_grads["a_scales"] = [mx.nan_to_num(g, nan=0.0) for g in total_grads["a_scales"]]
-
-            # Convert to numpy and accumulate across accum steps
-            alpha_np = [np.array(g) for g in total_grads["alphas"]]
-            a_scale_np = [np.array(g) for g in total_grads["a_scales"]]
-            if accum_alpha_np is None:
-                accum_alpha_np = alpha_np
-                accum_a_scale_np = a_scale_np
+                if w_i != 1.0:
+                    total_grads = {
+                        "alphas": [g * w_i for g in grads_i["alphas"]],
+                        "a_scales": [g * w_i for g in grads_i["a_scales"]],
+                    }
+                else:
+                    total_grads = grads_i
             else:
-                accum_alpha_np = [a + b for a, b in zip(accum_alpha_np, alpha_np)]
-                accum_a_scale_np = [a + b for a, b in zip(accum_a_scale_np, a_scale_np)]
-            accum_loss += loss_val_i * loss_denom
-            accum_loss_uw += loss_uw_val_i * n_valid
-            accum_weight_sum += weight_sum
-            accum_n_used += n_valid
-            valid_accum_steps += 1
+                for i in range(len(params.alphas)):
+                    total_grads["alphas"][i] = (
+                        total_grads["alphas"][i] + w_i * grads_i["alphas"][i]
+                    )
+                    total_grads["a_scales"][i] = (
+                        total_grads["a_scales"][i] + w_i * grads_i["a_scales"][i]
+                    )
 
-        # All accum steps were NaN — skip optimizer update for this step
-        if valid_accum_steps == 0:
+        n_used = n_valid
+        if total_grads is None:
             loss_val = float("nan")
-            loss_uw_val = float("nan")
             loss_history.append(loss_val)
             if step % 50 == 0:
                 pbar.set_postfix(loss="nan", b=f"{b_val:.1f}")
@@ -1092,27 +1098,58 @@ def optimize_block(
             pbar.update(1)
             continue
 
-        # Normalize accumulated gradients by the number of valid accum steps
-        norm_alpha = [mx.array(g / valid_accum_steps) for g in accum_alpha_np]
-        norm_a_scale = [mx.array(g / valid_accum_steps) for g in accum_a_scale_np]
+        # Average grads over valid samples (use weight_sum for σ-weighted mode)
+        grad_denom = weight_sum if sample_weights is not None else n_used
+        for i in range(len(params.alphas)):
+            total_grads["alphas"][i] = total_grads["alphas"][i] / grad_denom
+            total_grads["a_scales"][i] = total_grads["a_scales"][i] / grad_denom
 
-        loss_denom_total = accum_weight_sum if sample_weights is not None else accum_n_used
-        loss_val = accum_loss / loss_denom_total
-        loss_uw_val = accum_loss_uw / accum_n_used
+        # Single eval for the entire batch: loss + all gradients together.
+        # This lets MLX fuse all 16 forward+backward passes into one GPU dispatch
+        # instead of 16 separate sync points.
+        all_grad_arrays = total_grads["alphas"] + total_grads["a_scales"]
+        mx.eval(total_loss, *all_grad_arrays)
+
+        # NaN check on the batch total (if any sample was NaN, total is NaN)
+        loss_denom = weight_sum if sample_weights is not None else n_used
+        loss_val = float(total_loss) / loss_denom
+        if math.isnan(loss_val) or math.isinf(loss_val):
+            if step < 10 or step % 100 == 0:
+                print(
+                    f"  WARNING: NaN/Inf loss at step {step} (b={b_val:.1f}), "
+                    f"skipping optimizer update",
+                    flush=True,
+                )
+            loss_history.append(loss_val)
+            pbar.update(1)
+            continue
+
+        has_nan_grad = any(mx.isnan(g).any().item() for g in all_grad_arrays)
+        if has_nan_grad:
+            if step < 10 or step % 100 == 0:
+                print(
+                    f"  WARNING: NaN in gradients at step {step} (b={b_val:.1f}), "
+                    f"skipping optimizer update",
+                    flush=True,
+                )
+            loss_history.append(loss_val)
+            pbar.update(1)
+            continue
 
         # Clip gradients: a_scale needs tight clipping (small param, sensitive to explosion)
         # alpha uses a looser clip — needs enough gradient to make rounding decisions
         ALPHA_GRAD_CLIP = 0.1
         A_SCALE_GRAD_CLIP = 1.0
         clipped_alpha_grads = [
-            mx.clip(g, -ALPHA_GRAD_CLIP, ALPHA_GRAD_CLIP) for g in norm_alpha
+            mx.clip(g, -ALPHA_GRAD_CLIP, ALPHA_GRAD_CLIP) for g in total_grads["alphas"]
         ]
         clipped_a_grads = [
-            mx.clip(g, -A_SCALE_GRAD_CLIP, A_SCALE_GRAD_CLIP) for g in norm_a_scale
+            mx.clip(g, -A_SCALE_GRAD_CLIP, A_SCALE_GRAD_CLIP) for g in total_grads["a_scales"]
         ]
 
         # Cosine LR schedule for a_scale: anneal effective LR from a_lr → 0
         # Multiply gradients by cos_factor so step size = a_lr * cos_factor (decreasing)
+        cos_factor = 0.5 * (1.0 + math.cos(math.pi * step / iters))
         scaled_a_grads = [g * cos_factor for g in clipped_a_grads]
 
         # Split and apply
@@ -1124,16 +1161,19 @@ def optimize_block(
 
         mx.eval(params.parameters(), w_opt.state, a_opt.state)
 
-        # loss_val was captured before optimizer step (see above)
+        loss_denom = weight_sum if sample_weights is not None else n_used
+        loss_val = float(total_loss) / loss_denom
         loss_history.append(loss_val)
 
         if step % 50 == 0:
             if sample_weights is not None:
+                loss_uw_val = float(total_loss_uw) / n_used
                 pbar.set_postfix(loss_w=f"{loss_val:.4f}", loss_uw=f"{loss_uw_val:.4f}", b=f"{b_val:.1f}")
             else:
                 pbar.set_postfix(loss=f"{loss_val:.4f}", b=f"{b_val:.1f}")
         if step % 200 == 0:
             if sample_weights is not None:
+                loss_uw_val = float(total_loss_uw) / n_used
                 print(f"  {block_name} iter {step}/{iters}  loss(w)={loss_val:.4f}  loss(uw)={loss_uw_val:.4f}  b={b_val:.1f}", flush=True)
             else:
                 print(f"  {block_name} iter {step}/{iters}  loss={loss_val:.4f}  b={b_val:.1f}", flush=True)
@@ -1197,37 +1237,6 @@ def finalize_block(
 
 
 # ---------------------------------------------------------------------------
-# Config writing helper
-# ---------------------------------------------------------------------------
-
-def _write_config(config_path, args, block_names, all_metrics_by_name, exclude_set):
-    """Write config.json for completed blocks. Safe to call after each block."""
-    all_metrics = [
-        all_metrics_by_name[bn] for bn in block_names
-        if bn in all_metrics_by_name
-    ]
-    config = {
-        "format": "adaround_v1",
-        "model_version": "argmaxinc/mlx-stable-diffusion-3-medium",
-        "bits_w": args.bits_w,
-        "bits_a": args.bits_a,
-        "iters": args.iters,
-        "batch_size": args.batch_size,
-        "w_lr": args.w_lr,
-        "a_lr": args.a_lr,
-        "poly_schedule": str(args.poly_schedule) if args.poly_schedule else None,
-        "sigma_weighted": args.sigma_weighted,
-        "sigma_weight_offset": args.sigma_weight_offset,
-        "exclude_layers": sorted(exclude_set) if exclude_set else [],
-        "asymmetric_act": args.asymmetric_act,
-        "n_blocks_quantised": len(all_metrics),
-        "block_metrics": all_metrics,
-    }
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-
-# ---------------------------------------------------------------------------
 # Main CLI
 # ---------------------------------------------------------------------------
 
@@ -1243,10 +1252,6 @@ def main() -> None:
                         help="AdaRound iterations per block (default 20000)")
     parser.add_argument("--batch-size", type=int, default=16,
                         help="Calibration samples per optimisation step (default 16)")
-    parser.add_argument("--grad-accum-steps", type=int, default=1,
-                        help="Accumulate gradients over N mini-batches before each optimizer "
-                             "step. Effective batch = batch_size × grad_accum_steps. "
-                             "Use when batch_size is constrained by memory. (default 1)")
     parser.add_argument("--bits-w", type=int, default=4, choices=[4, 8],
                         help="Weight quantisation bits (default 4)")
     parser.add_argument("--bits-a", type=int, default=8,
@@ -1263,8 +1268,6 @@ def main() -> None:
                         help="Skip blocks whose .npz already exists in the output weights dir")
     parser.add_argument("--refine", action="store_true",
                         help="Warm-start from existing weights (polish previous results with more iters)")
-    parser.add_argument("--force-refine", action="store_true",
-                        help="Override refine config mismatch safety check (use with caution)")
     parser.add_argument("--htg-groups", type=Path, default=None,
                         help="htg_groups.json from src.htg_cluster; enables per-group optimization")
     parser.add_argument("--bb-config", type=Path, default=None,
@@ -1278,6 +1281,9 @@ def main() -> None:
                         help="Weight per-sample loss by 1/(σ+offset), emphasizing clean timesteps")
     parser.add_argument("--sigma-weight-offset", type=float, default=1.0,
                         help="Offset ε in w(σ)=1/(σ+ε). Lower = more aggressive (default: 1.0)")
+    parser.add_argument("--derivative-weighted", action="store_true",
+                        help="Also weight per-sample loss by |dα/dσ|, amplifying blocks where "
+                             "clipping range is most sensitive to σ. Requires --poly-schedule.")
     parser.add_argument("--refine-skip-converged", type=float, default=None, metavar="PCT",
                         help="With --refine, skip blocks whose loss improved less than PCT%% "
                              "over the last 20%% of the prior run (e.g., 0.5 = skip if <0.5%% improvement)")
@@ -1292,6 +1298,8 @@ def main() -> None:
 
     if args.sigma_weighted and args.poly_schedule is None:
         parser.error("--sigma-weighted requires --poly-schedule (need per-sample sigmas)")
+    if args.derivative_weighted and args.poly_schedule is None:
+        parser.error("--derivative-weighted requires --poly-schedule")
     if args.asymmetric_act and args.poly_schedule is None:
         parser.error("--asymmetric-act requires --poly-schedule")
 
@@ -1534,7 +1542,7 @@ def main() -> None:
                 )
 
                 block_data = load_block_data(block_name, group_sample_files)
-                if not block_data or "arg0" not in block_data[0]:
+                if not block_data or "arg0" not in block_data:
                     tqdm.write(f"  SKIP {block_name} (group {group_id}): no data")
                     continue
 
@@ -1553,7 +1561,7 @@ def main() -> None:
                         effective_bits_w = int(round(median(block_bits_list)))
                         effective_bits_w = max(4, min(8, effective_bits_w))
 
-                n_samples = len(block_data)
+                n_samples = block_data["arg0"].shape[0]
                 tqdm.write(f"\n  [{block_name}] group={group_id}  samples={n_samples}  W{effective_bits_w}")
 
                 # Build group-specific sample_sigmas if poly schedule is active
@@ -1578,9 +1586,9 @@ def main() -> None:
                     sample_sigmas=group_sample_sigmas,
                     sigma_weighted=args.sigma_weighted,
                     sigma_weight_offset=args.sigma_weight_offset,
+                    derivative_weighted=args.derivative_weighted,
                     exclude_keys=exclude_set if exclude_set else None,
                     asymmetric_act=args.asymmetric_act,
-                    grad_accum_steps=args.grad_accum_steps,
                 )
                 tqdm.write(f"  {block_name} (group {group_id}) done — "
                            f"final_loss={metrics['final_loss']:.4f}")
@@ -1651,67 +1659,6 @@ def main() -> None:
             prev_block_metrics[m["block_name"]] = m
         if args.resume:
             print(f"  Resuming: {len(prev_metrics_list)} blocks already done")
-
-        # Safety check: warn if refine flags don't match the prior run's config.
-        # Mismatched settings (e.g. adding --poly-schedule to weights trained
-        # without it) cause catastrophic divergence — the rounding decisions are
-        # optimized for a different quantization grid.
-        if args.refine:
-            mismatches = []
-            prev_had_poly = bool(prev_config.get("poly_schedule"))
-            now_has_poly = poly_schedule is not None
-            if now_has_poly and not prev_had_poly:
-                mismatches.append(
-                    "ADDING --poly-schedule: prior weights were trained with static α. "
-                    "Per-σ clipping will invalidate the prior rounding decisions."
-                )
-            elif prev_had_poly and not now_has_poly:
-                mismatches.append(
-                    "REMOVING --poly-schedule: prior weights were trained with per-σ α. "
-                    "Static clipping will invalidate the prior rounding decisions."
-                )
-            prev_sigma_w = prev_config.get("sigma_weighted", False)
-            now_sigma_w = getattr(args, "sigma_weighted", False)
-            if now_sigma_w and not prev_sigma_w:
-                # This is less dangerous (just reweighting), note it but don't block
-                mismatches.append(
-                    "ADDING --sigma-weighted: prior weights were trained with uniform loss weighting. "
-                    "This is usually safe but will shift optimization emphasis."
-                )
-            prev_asym = prev_config.get("asymmetric_act", False)
-            now_asym = getattr(args, "asymmetric_act", False)
-            if now_asym != prev_asym:
-                mismatches.append(
-                    f"CHANGING --asymmetric-act: prior={prev_asym}, now={now_asym}. "
-                    "Activation quantization mode mismatch will corrupt rounding decisions."
-                )
-            if mismatches:
-                print("\n" + "=" * 70)
-                print("WARNING: Refine config mismatch detected!")
-                print("=" * 70)
-                for m in mismatches:
-                    print(f"  • {m}")
-                print()
-                # Block on dangerous mismatches (poly/asymmetric changes)
-                dangerous = any(
-                    "poly-schedule" in m or "asymmetric-act" in m
-                    for m in mismatches
-                    if "usually safe" not in m
-                )
-                if dangerous:
-                    print(
-                        "This will likely cause catastrophic divergence. The prior rounding\n"
-                        "decisions were optimized for a different quantization grid.\n"
-                        "\n"
-                        "Options:\n"
-                        "  1. Train from scratch (without --refine) into a new output dir\n"
-                        "  2. Use --force-refine to override this safety check\n"
-                    )
-                    if not getattr(args, "force_refine", False):
-                        raise SystemExit(1)
-                    print("--force-refine set, proceeding despite mismatch...\n")
-                print("=" * 70 + "\n")
-
     if args.resume:
         all_metrics_by_name = dict(prev_block_metrics)
     elif args.refine:
@@ -1763,11 +1710,11 @@ def main() -> None:
 
         # Load calibration data for this block
         block_data = load_block_data(block_name, all_sample_files)
-        if not block_data or "arg0" not in block_data[0]:
+        if not block_data or "arg0" not in block_data:
             tqdm.write(f"  SKIP {block_name}: no calibration data")
             continue
 
-        n_samples = len(block_data)
+        n_samples = block_data["arg0"].shape[0]
 
         # Load prior weights for warm-start if refining
         block_prior_alphas = None
@@ -1822,9 +1769,9 @@ def main() -> None:
             activation_dtype=pipeline.activation_dtype,
             sigma_weighted=args.sigma_weighted,
             sigma_weight_offset=args.sigma_weight_offset,
+            derivative_weighted=args.derivative_weighted,
             exclude_keys=exclude_set if exclude_set else None,
             asymmetric_act=args.asymmetric_act,
-            grad_accum_steps=args.grad_accum_steps,
         )
         if metrics.get("refined") and metrics["initial_loss"] is not None:
             improvement = metrics["initial_loss"] - metrics["final_loss"]
@@ -1843,18 +1790,37 @@ def main() -> None:
         metrics["quant_paths"] = linear_paths
         all_metrics_by_name[block_name] = metrics
 
-        # Write config after every block so an interrupted run doesn't lose completed metrics
-        _write_config(config_path, args, block_names, all_metrics_by_name, exclude_set)
-
         # Free calibration data
         del block_data
 
     # ------------------------------------------------------------------
-    # Save config (final write via same helper)
+    # Save config
     # ------------------------------------------------------------------
-    _write_config(config_path, args, block_names, all_metrics_by_name, exclude_set)
+    # Emit metrics in block order (preserves prior metrics for untouched blocks)
+    all_metrics = [
+        all_metrics_by_name[bn] for bn in block_names
+        if bn in all_metrics_by_name
+    ]
+    config = {
+        "format": "adaround_v1",
+        "model_version": "argmaxinc/mlx-stable-diffusion-3-medium",
+        "bits_w": args.bits_w,
+        "bits_a": args.bits_a,
+        "iters": args.iters,
+        "batch_size": args.batch_size,
+        "w_lr": args.w_lr,
+        "a_lr": args.a_lr,
+        "sigma_weighted": args.sigma_weighted,
+        "sigma_weight_offset": args.sigma_weight_offset,
+        "derivative_weighted": args.derivative_weighted,
+        "exclude_layers": sorted(exclude_set) if exclude_set else [],
+        "asymmetric_act": args.asymmetric_act,
+        "n_blocks_quantised": len(all_metrics),
+        "block_metrics": all_metrics,
+    }
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
 
-    all_metrics = [all_metrics_by_name[bn] for bn in block_names if bn in all_metrics_by_name]
     print(f"\n=== Done ===")
     print(f"  {len(all_metrics)} blocks quantised")
     if n_skipped_converged > 0:

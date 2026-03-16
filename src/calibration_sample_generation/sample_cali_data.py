@@ -27,6 +27,7 @@ Saved .npz keys:
 
 import argparse
 import gc
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -188,6 +189,14 @@ def main():
         "--local-ckpt", type=str, default=None,
         help="Path to local MMDiT checkpoint",
     )
+    parser.add_argument(
+        "--num-prompts", type=int, default=None,
+        help="Use only the first N prompts from the prompt file (default: all)",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume from checkpoint directory (skips already-completed trajectories)",
+    )
     args = parser.parse_args()
 
     latent_size = tuple(args.latent_size)
@@ -195,6 +204,8 @@ def main():
 
     # --- Load prompts ---
     prompts = load_prompts(args.prompt_file)
+    if args.num_prompts is not None:
+        prompts = prompts[:args.num_prompts]
     print(f"Loaded {len(prompts)} prompts from {args.prompt_file}")
 
     # --- Load pipeline ---
@@ -213,22 +224,30 @@ def main():
     print("Encoding prompts...")
     all_cond, all_pooled = encode_all_prompts(pipeline, prompts, args.cfg_scale)
 
+    # --- Checkpoint directory (one .npz per trajectory) ---
+    ckpt_dir = Path(args.output).with_suffix(".ckpt")
+    ckpt_dir.mkdir(exist_ok=True)
+
     # --- Generate trajectories (batch_size=1 for correct CFG) ---
     n_samples = args.num_fid_samples
     n_prompts = len(prompts)
     print(f"\nGenerating {n_samples} trajectories x {args.num_sampling_steps} steps "
           f"(batch_size=1, {n_prompts} prompt(s) cycled round-robin)")
 
-    # Per-trajectory collectors: xs[step][sample], ts[step][sample]
-    all_xs = []   # will become (steps, n_samples, 1, H, W, C) then squeeze
-    all_ts = []   # will become (steps, n_samples)
     traj_prompt_idx = np.zeros(n_samples, dtype=np.int32)
+    done = {int(p.stem) for p in ckpt_dir.glob("*.npz")} if args.resume else set()
+    if done:
+        print(f"Resuming: {len(done)}/{n_samples} trajectories already done")
 
     t_start = time.time()
+    completed = 0
     for sample_idx in range(n_samples):
-        prompt_idx = sample_idx % n_prompts
-        traj_prompt_idx[sample_idx] = prompt_idx
+        traj_prompt_idx[sample_idx] = sample_idx % n_prompts
+        if sample_idx in done:
+            completed += 1
+            continue
 
+        prompt_idx = sample_idx % n_prompts
         cond_mx = mx.array(all_cond[prompt_idx])
         pooled_mx = mx.array(all_pooled[prompt_idx])
 
@@ -237,26 +256,33 @@ def main():
         mx.eval(x_init)
 
         x_list, t_list = sample_euler_with_calibration(
-            pipeline,
-            x_init,
-            sigmas,
-            cond_mx,
-            pooled_mx,
-            cfg_weight=args.cfg_scale,
+            pipeline, x_init, sigmas, cond_mx, pooled_mx, cfg_weight=args.cfg_scale,
         )
 
-        # Stack steps for this trajectory: (steps, 1, H, W, C)
         xs_traj = np.asarray(mx.stack(x_list, axis=0))
         ts_traj = np.asarray(mx.stack(t_list, axis=0))
-        all_xs.append(xs_traj)
-        all_ts.append(ts_traj)
 
+        np.savez_compressed(
+            ckpt_dir / f"{sample_idx:04d}.npz",
+            xs=xs_traj, ts=ts_traj, prompt_idx=np.array(prompt_idx),
+        )
+
+        completed += 1
         elapsed = time.time() - t_start
-        eta = elapsed / (sample_idx + 1) * (n_samples - sample_idx - 1)
-        print(f"  [{sample_idx+1}/{n_samples}] prompt={prompt_idx} "
+        eta = elapsed / completed * (n_samples - completed) if completed else 0
+        print(f"  [{completed}/{n_samples}] prompt={prompt_idx} "
               f"seed={seed}  elapsed={elapsed:.0f}s  ETA={eta:.0f}s")
 
         gc.collect()
+
+    # --- Assemble from checkpoints ---
+    print("\nAssembling trajectories...")
+    all_xs = []
+    all_ts = []
+    for sample_idx in range(n_samples):
+        ckpt = np.load(ckpt_dir / f"{sample_idx:04d}.npz")
+        all_xs.append(ckpt["xs"])
+        all_ts.append(ckpt["ts"])
 
     # Stack trajectories:
     #   xs: each (steps, 1, H, W, C) -> concat axis=1 -> (steps, n_samples, H, W, C)
@@ -264,23 +290,20 @@ def main():
     xs = np.concatenate(all_xs, axis=1)
     ts = np.stack(all_ts, axis=1)
 
-    # --- Paper: uniformly select 25 steps from 100 ---
+    # --- Paper: uniformly select steps ---
     total_steps = xs.shape[0]
     selected_indices = np.linspace(0, total_steps - 1, args.num_selected_steps, dtype=int)
-    xs = xs[selected_indices]   # (25, n_samples, H, W, C)
-    ts = ts[selected_indices]   # (25, n_samples)
+    xs = xs[selected_indices]
+    ts = ts[selected_indices]
 
     # Flatten (steps, n_samples, ...) -> (n_cal, ...)
     N, S = xs.shape[0], xs.shape[1]
     n_cal = N * S
-    xs = xs.reshape(n_cal, *xs.shape[2:])   # (6400, H, W, C)
-    ts = ts.reshape(n_cal)                   # (6400,)
+    xs = xs.reshape(n_cal, *xs.shape[2:])
+    ts = ts.reshape(n_cal)
 
-    # Expand per-trajectory prompt indices to per-calibration-point
-    # Each trajectory contributes N_selected_steps calibration points
     prompt_indices = np.tile(traj_prompt_idx, N)
 
-    # Shuffle consistently
     rng = np.random.default_rng(args.seed)
     perm = rng.permutation(n_cal)
     xs = xs[perm]
@@ -291,6 +314,10 @@ def main():
         xs, ts, prompt_indices, all_cond, all_pooled,
         prompts, args.cfg_scale, args.output,
     )
+
+    # Clean up checkpoints
+    shutil.rmtree(ckpt_dir)
+    print(f"Removed checkpoint directory {ckpt_dir}")
 
 
 if __name__ == "__main__":

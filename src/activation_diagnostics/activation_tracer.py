@@ -142,55 +142,47 @@ class ActivationTracer:
     def current_context(self) -> Optional[Tuple[str, str]]:
         return self._context_stack[-1] if self._context_stack else None
 
-    def record_post_activation(self, act: mx.array) -> None:
+    def record_activation(self, full_layer_id: str, timestep_key: str, act: mx.array) -> None:
         """
-        Record statistics for a single FFN post-activation tensor.
+        Record statistics for an activation tensor.
 
-        act: MLX array of shape (B, S, 1, D_hidden) or similar.
+        full_layer_id: e.g. "mm_00_img:qkv_in", "mm_00_img:fc2_in"
+        act: MLX array of shape (B, S, 1, D) or similar — stats reduced over all but last dim.
         """
-        ctx = self.current_context
-        if ctx is None:
-            return
-
-        layer_id, timestep_key = ctx
-
         axes = tuple(range(act.ndim - 1))
         n_positions = int(np.prod([act.shape[a] for a in axes]))
 
         act_f32 = act.astype(mx.float32)
-
-        sum_vec = mx.sum(act_f32, axis=axes)
+        sum_vec   = mx.sum(act_f32, axis=axes)
         sq_sum_vec = mx.sum(act_f32 * act_f32, axis=axes)
-        min_vec = mx.min(act_f32, axis=axes)
-        max_vec = mx.max(act_f32, axis=axes)
+        min_vec   = mx.min(act_f32, axis=axes)
+        max_vec   = mx.max(act_f32, axis=axes)
 
-        # Flatten to 1-D for global histogram (across all channels and positions)
         flat_np = np.asarray(act_f32.reshape(-1))
-        hist_counts, _ = np.histogram(
-            flat_np,
-            bins=HISTOGRAM_NUM_BINS,
-            range=HISTOGRAM_RANGE,
-        )
+        hist_counts, _ = np.histogram(flat_np, bins=HISTOGRAM_NUM_BINS, range=HISTOGRAM_RANGE)
 
-        sum_np = np.asarray(sum_vec)
-        sq_sum_np = np.asarray(sq_sum_vec)
-        min_np = np.asarray(min_vec)
-        max_np = np.asarray(max_vec)
+        layer_stats = self.stats.setdefault(full_layer_id, {})
+        per_t = layer_stats.get(timestep_key)
+        if per_t is None:
+            per_t = PerLayerTimeStats()
+            layer_stats[timestep_key] = per_t
 
-        layer_stats = self.stats.setdefault(layer_id, {})
-        per_t_stats = layer_stats.get(timestep_key)
-        if per_t_stats is None:
-            per_t_stats = PerLayerTimeStats()
-            layer_stats[timestep_key] = per_t_stats
-
-        per_t_stats.update(
+        per_t.update(
             n_positions=n_positions,
-            sum_vec=sum_np,
-            sq_sum_vec=sq_sum_np,
-            min_vec=min_np,
-            max_vec=max_np,
+            sum_vec=np.asarray(sum_vec),
+            sq_sum_vec=np.asarray(sq_sum_vec),
+            min_vec=np.asarray(min_vec),
+            max_vec=np.asarray(max_vec),
             hist_counts=hist_counts,
         )
+
+    def record_post_activation(self, act: mx.array) -> None:
+        """Legacy: record post-GELU activation using the context stack."""
+        ctx = self.current_context
+        if ctx is None:
+            return
+        layer_id, timestep_key = ctx
+        self.record_activation(f"{layer_id}:fc2_in", timestep_key, act)
 
     def summarize(self) -> Dict[str, Dict[str, Dict[str, np.ndarray]]]:
         """
@@ -289,6 +281,16 @@ def install_tracing(mmdit: MMDiT) -> ActivationTracer:
     ):
         t_key = _timestep_to_key(timestep)
         intermediates = _ORIG_PRE_SDPA(self_block, tensor, timestep)  # type: ignore[misc]
+
+        # Record input to q/k/v projections (modulated, normed hidden state)
+        tracer_local = _ACTIVE_TRACER
+        layer_id = getattr(self_block, "_trace_id", None)
+        if tracer_local is not None and layer_id is not None:
+            if isinstance(intermediates, dict) and "modulated_pre_attention" in intermediates:
+                tracer_local.record_activation(
+                    f"{layer_id}:qkv_in", t_key, intermediates["modulated_pre_attention"]
+                )
+
         if isinstance(intermediates, dict):
             intermediates["_timestep_key"] = t_key
         return intermediates
@@ -309,6 +311,9 @@ def install_tracing(mmdit: MMDiT) -> ActivationTracer:
         timestep_key = kwargs.pop("_timestep_key", None)
 
         if tracer_local is not None and layer_id is not None and timestep_key is not None:
+            # Record input to o_proj (raw SDPA output before projection)
+            tracer_local.record_activation(f"{layer_id}:o_in", timestep_key, sdpa_output)
+
             tracer_local.push_context(layer_id, timestep_key)
             try:
                 out = _ORIG_POST_SDPA(  # type: ignore[misc]
@@ -339,11 +344,20 @@ def install_tracing(mmdit: MMDiT) -> ActivationTracer:
         )
 
     def ffn_call_patched(self_ffn: FFN, x: mx.array) -> mx.array:
+        tracer_local = _ACTIVE_TRACER
+        ctx = tracer_local.current_context if tracer_local is not None else None
+
+        if tracer_local is not None and ctx is not None:
+            layer_id, t_key = ctx
+            # Record input to fc1
+            tracer_local.record_activation(f"{layer_id}:fc1_in", t_key, x)
+
         hidden = self_ffn.act_fn(self_ffn.fc1(x))
 
-        tracer_local = _ACTIVE_TRACER
-        if tracer_local is not None and tracer_local.current_context is not None:
-            tracer_local.record_post_activation(hidden)
+        if tracer_local is not None and ctx is not None:
+            layer_id, t_key = ctx
+            # Record input to fc2 (post-GELU activation)
+            tracer_local.record_activation(f"{layer_id}:fc2_in", t_key, hidden)
 
         return self_ffn.fc2(hidden)
 
@@ -379,6 +393,7 @@ def remove_tracing() -> None:
 
 __all__ = [
     "ActivationTracer",
+    "PerLayerTimeStats",
     "HISTOGRAM_NUM_BINS",
     "HISTOGRAM_RANGE",
     "install_tracing",

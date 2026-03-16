@@ -1,7 +1,7 @@
 """
 Validate polynomial clipping schedule generalizability across independent COCO image groups.
 
-Runs full SD3 denoising on 2 independent groups of COCO prompts, builds polynomial
+Runs full SD3 denoising on 3 independent groups of COCO prompts, builds polynomial
 schedules for each group in-memory, and compares them against each other.
 
 Generalisation claim: curves are a property of SD3 rectified-flow physics, not the
@@ -11,7 +11,7 @@ Usage:
     conda run -n diffusionkit python -m src.validate_poly_generalization \\
         --coco-prompts coco_prompts.csv \\
         --group-size 30 \\
-        --num-groups 2 \\
+        --num-groups 3 \\
         --output-dir generalization_results \\
         --num-steps 25
 """
@@ -481,36 +481,13 @@ def main():
     parser.add_argument("--cfg-weight", type=float, default=7.5)
     parser.add_argument("--latent-size", type=int, default=64,
                         help="Spatial size of latent (e.g. 32 → 256px, 64 → 512px)")
-    parser.add_argument("--refit-from-npz", type=Path, nargs="*", default=[],
-                        metavar="NPZ",
-                        help="Refit schedules from saved trajectory NPZ files instead of "
-                             "re-running denoising. Replaces --load-group-schedules.")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Refit from NPZ if requested ----
-    if args.refit_from_npz:
-        named_schedules = []
-        for i, npz_path in enumerate(args.refit_from_npz):
-            data = np.load(npz_path)
-            sigmas = data["sigmas"]
-            trajs = {k: (sigmas, data[k]) for k in data.files if k != "sigmas"}
-            sched = build_schedule(trajs, sigmas)
-            label = f"Group {chr(65 + i)}"
-            named_schedules.append((label, sched))
-            out_path = args.output_dir / f"group_{i}_schedule.json"
-            with open(out_path, "w") as f:
-                json.dump(sched, f, indent=2)
-            print(f"Refit {label} from {npz_path} → {out_path} ({len(sched['layers'])} layers).")
-        all_sigmas = np.load(args.refit_from_npz[0])["sigmas"]
-        args.num_groups = 0
-        args.load_group_schedules = []
-
     # ---- Load any pre-existing group schedules ----
     # named_schedules: list of (label, schedule_dict) in order
-    if not args.refit_from_npz:
-        named_schedules = []
+    named_schedules = []
     for i, path in enumerate(args.load_group_schedules):
         with open(path) as f:
             sched = json.load(f)
@@ -559,8 +536,7 @@ def main():
         print("Pipeline loaded.")
 
     # ---- Collect new group trajectories ----
-    if not args.refit_from_npz:
-        all_sigmas = None
+    all_sigmas = None
     for g_idx, prompts in enumerate(new_groups):
         label = chr(65 + n_loaded + g_idx)
         file_idx = n_loaded + g_idx
