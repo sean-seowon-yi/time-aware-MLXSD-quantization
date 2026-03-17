@@ -260,11 +260,9 @@ def install_tracing(mmdit: MMDiT) -> ActivationTracer:
             img_block._trace_id = img_id  # type: ignore[attr-defined]
             tracer.layer_ids[id(img_block)] = img_id
 
-            # Only tag text blocks that actually have an FFN
-            if not getattr(txt_block, "skip_post_sdpa", False):
-                txt_id = f"mm_{idx:02d}_txt"
-                txt_block._trace_id = txt_id  # type: ignore[attr-defined]
-                tracer.layer_ids[id(txt_block)] = txt_id
+            txt_id = f"mm_{idx:02d}_txt"
+            txt_block._trace_id = txt_id  # type: ignore[attr-defined]
+            tracer.layer_ids[id(txt_block)] = txt_id
 
     if hasattr(mmdit, "unified_transformer_blocks"):
         for idx, block in enumerate(mmdit.unified_transformer_blocks):

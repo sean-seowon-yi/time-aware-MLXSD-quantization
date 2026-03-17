@@ -322,3 +322,43 @@ What is not yet done:
 2. **Calibration of α for the recentered distribution.** Currently `generate_poly_schedule` fits p99.9 of raw activation magnitudes (distance from zero). For asymmetric quantization, the scale polynomial should describe spread around the center, not distance from zero. The recentered data is available in the calibration files but the fitting pipeline needs a pass that subtracts `center(σ)` before computing percentiles.
 
 3. **Verification that the 4 extreme layers are actually recoverable at W4.** The shift magnitudes (60–254) suggest asymmetric INT8 would help dramatically. W4 recovery is less certain — it depends on whether the spread after recentering is small enough for 4-bit resolution. This requires a calibration run with `--include-shifts` followed by an AdaRound optimization pass using the asymmetric fake-quant path on those layers.
+
+---
+
+## 8. Future Work: Composing with CSB+SSC
+
+PTQ4DiT's Channel-wise Salience Balancing (CSB) and Spearman's ρ-guided Salience Calibration (SSC) address a complementary error source: channel-wise outlier imbalance between activations and weights. CSB applies diagonal scaling matrices B^X and B^W to redistribute extreme channel magnitudes before quantization, then absorbs them into the weights via re-parameterization. SSC reweights which timesteps the balancing matrices are calibrated on.
+
+These techniques and polynomial clipping are orthogonal — they target different failure modes:
+
+| Technique | What it fixes |
+|-----------|--------------|
+| CSB+SSC | Channel-wise outlier imbalance between activations and weights |
+| Poly schedule | Per-σ clipping error (wrong α at most timesteps) |
+| AdaRound | Weight rounding error |
+| σ-weighted loss | Rounding decisions biased toward perceptually important timesteps |
+
+A natural composition would stack all four in sequence:
+
+1. **CSB+SSC** — compute B^X and B^W from calibration data, absorb into weights via re-parameterization
+2. **Poly schedule calibration** — collect activation statistics from the *post-CSB* transformed activations (critical: the poly schedule must describe what the quantizer actually sees at inference, which is X·B^X, not the raw X)
+3. **AdaRound** — optimize per-weight rounding decisions using the poly schedule for correct per-σ clipping during the reconstruction loss
+4. **σ-weighted loss** — apply derivative-based or perceptual weighting so rounding decisions prioritize the most important timesteps
+
+The ordering of steps 1 and 2 is not interchangeable. Because CSB transforms the activation distributions, fitting the poly schedule to raw (pre-CSB) activations would produce polynomials describing the wrong distributions. The poly calibration must run after CSB is applied and absorbed.
+
+To our knowledge, no prior work combines learned channel balancing, continuous σ-dependent clipping, AdaRound weight rounding, and σ-aware loss weighting in a single pipeline. Each component addresses a distinct quantization error source; they compose without overlap and without interference.
+
+### Full pipeline
+
+The complete implementation would require two separate activation collection passes:
+
+1. **FP16 calibration run** — generate images with the FP16 model, collect raw activation statistics (channel salience per layer per timestep)
+2. **Compute CSB+SSC matrices** — derive B^X and B^W from those statistics, absorb into weights to produce a re-parameterized FP16 model
+3. **Post-CSB activation collection** — run the re-parameterized model through calibration images again, collect activation statistics from the transformed activations (this is the extra pass not present in the current pipeline)
+4. **Fit poly schedule** — fit polynomials to the post-CSB trajectories
+5. **AdaRound optimization** — train rounding decisions using the poly schedule for per-σ clipping and σ-weighted loss
+6. **Export quantized model** — commit hard rounding decisions, save W4A8 weights
+7. **Evaluate** — benchmark against RTN baseline and AdaRound-without-CSB
+
+The main new piece of infrastructure is implementing CSB+SSC itself, which is not currently in the codebase. Everything else (activation collection, poly fitting, AdaRound) maps onto existing tooling.

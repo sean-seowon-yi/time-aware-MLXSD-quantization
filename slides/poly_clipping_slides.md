@@ -5,7 +5,7 @@
 
 ## Slide 1: Title
 
-**Polynomial Clipping for Time-Aware Quantization of Stable Diffusion 3**
+**Polynomial Clipping for Time-Aware Quantization of Stable Diffusion 3 Medium-MLX on Apple Silicon**
 
 Improving AdaRound for Dual-Stream Diffusion Transformers
 
@@ -32,23 +32,108 @@ Improving AdaRound for Dual-Stream Diffusion Transformers
 
 ---
 
-## Slide 3: Rectified Flow (SD3's Formulation)
+## Slide 3: What Is Quantization?
 
-**Simpler than DDPM — but same quantization problem**
+**Replacing 16-bit floats with low-bit integers to make models smaller and faster**
 
-**SD3 uses Rectified Flow:**
-- Linear interpolation between data and noise: `x_t = (1-t) · x_0 + t · ε`
-- Noise level σ = t, ranging from 1.0 (pure noise) → 0.0 (clean image)
-- Euler ODE solver instead of DDPM's stochastic sampler
+**Why quantize?**
+- SD3 Medium is **4.17 GB** in FP16 — too large for most consumer devices
+- 4-bit weights cut that to ~1 GB
+- Fewer bytes to move = faster inference, lower memory bandwidth
 
-**Why this matters:**
-- Smooth, linear input trajectory → smooth activation trajectories
-- Low-degree polynomials are sufficient to model activation drift
-- Simpler physics than cosine DDPM schedules → cooperates with compact polynomial fits
+**How it works — the core idea:**
+
+Think of it like converting a measurement to a coarser unit. If your thermometer reads −12.7°C and you store it as −13°C to save space, that's a tiny rounding error you can live with. Quantization does the same for neural network values — instead of rounding to whole degrees, you round to one of 256 integer "slots."
+
+To do that, you need to know the range of values the layer produces. That range is defined by **α** (alpha) — the largest absolute value you expect to see. If a layer's activations typically fall between −5 and +5, you set α = 5. If they span −100 to +100, α = 100.
+
+**Where α comes from:** You run calibration images through the model and observe what values each layer actually produces. The 99.9th percentile of the absolute values you see — large enough to cover almost everything, but not inflated by rare extreme outliers — becomes α for that layer. This is called *calibration*.
+
+```
+scale = α / 127                              (divides the range [-α, +α] into 254 slots)
+x_q = clip(round(x / scale), -127, 127)     (map each value to its nearest slot)
+x̂   = x_q × scale                           (convert back to approximate float)
+```
+
+**Concrete example:** Say α = 5, so scale = 5/127 ≈ 0.039. A value of 3.2 maps to slot round(3.2/0.039) = slot 82. Reconstructed: 82 × 0.039 ≈ 3.20 — nearly exact. A value of 7.0 is outside [−5, +5] and gets hard-clamped to slot 127 → 4.96. That's a clipping error of 2.04 — the entire excess is lost.
+
+Every value in `[-α, +α]` maps to one of 256 integers. Values outside get **clipped** — hard-clamped to ±127. Values inside get **rounded** to the nearest grid point.
+
+**Two sources of quantization error:**
+1. **Clipping error** — values beyond ±α get clamped; error equals how far outside they were
+2. **Rounding error** — values inside ±α get rounded; error ≤ α/127
+
+**The clipping range α is the critical decision:**
+- α too small → activations spill outside and get hard-clipped → large errors
+- α too large → 127 grid points spread coarsely → wasted precision
+- α just right → tight grid over the actual distribution → minimal error both ways
+
+**For a static model (classifier, LLM):** calibrate α once on representative data, done.
+
+**For a diffusion model:** the same network runs 20–50 times, at different noise levels each time. The activations at σ=1.0 (pure noise) are completely different from σ=0.09 (nearly clean image). A single α is wrong at almost every step.
 
 ---
 
-## Slide 4: SD3 Architecture — MM-DiT
+## Slide 4: Quantization — The Basics
+
+**Replace 16-bit floats with low-bit integers**
+
+**Why quantize?**
+- Model size: 4× smaller (FP16 → INT4)
+- Memory bandwidth: fewer bytes to move → faster inference
+- SD3 Medium: **4.17 GB** in FP16 → ~1.0 GB in W4
+
+**How it works:**
+```
+scale = α / qmax                    (α = the largest value you expect — the edge of the range)
+x_q = clip(round(x / scale), -qmax, qmax) × scale
+```
+
+**The clipping range α is everything:**
+- Too small: activations outside `[-α, +α]` are hard-clipped → large errors
+- Too large: integer grid is coarsely spaced → wasted precision
+
+**For a static model (LLM, classifier):** calibrate α once, done.
+
+**For a diffusion model:** the activations at σ=1.0 are completely different from σ=0.09. A single α is wrong at almost every step.
+
+---
+
+## Slide 5: Rectified Flow (SD3's Formulation)
+
+**A cleaner, more direct path from noise to image**
+
+Earlier diffusion models (DDPM) added and removed noise according to a complex cosine-shaped schedule — the amount of noise added at each step followed a non-linear curve, and the removal process used a stochastic sampler that introduced randomness at every step. It worked, but the math was complicated and the denoising path was winding.
+
+**Rectified Flow** (used in SD3) replaces all of that with a straight line.
+
+**The core idea — a weighted average of image and noise:**
+
+Imagine you have a clean photo (call it x₀) and a blob of pure random noise (call it ε). Rectified flow defines every intermediate "noisy image" as simply a blend of the two:
+
+```
+x_t = (1 - t) · x₀  +  t · ε
+```
+
+- At t = 0: x_t = x₀ — pure clean image
+- At t = 0.5: x_t = 0.5·x₀ + 0.5·ε — half image, half noise
+- At t = 1.0: x_t = ε — pure noise
+
+The noise level σ = t, so σ runs from 1.0 (pure noise) down to ~0.09 (nearly clean image) during a generation. Each denoising step moves the blend a little further toward the clean image — it's just subtracting a bit of noise each time, following a straight-line trajectory in pixel space.
+
+**Compared to DDPM's cosine schedule:**
+
+DDPM's noise schedule is non-linear — it adds noise rapidly at first, then slows down. This means the "distance" the model has to travel at each step varies a lot. Rectified flow's linear schedule means the model takes equal-sized steps from pure noise to clean image, making the trajectory predictable and smooth.
+
+**Why this cooperates with polynomial clipping:**
+
+Because the input to the network follows a perfectly straight line through noise levels, the network's internal activations also change smoothly and predictably as σ decreases. There are no sudden jumps or inflection points driven by the noise schedule itself — any curvature in the activation trajectories comes from the model's own learned behaviour, not from schedule artifacts. This is why low-degree polynomials (degree 2–3) are enough to fit those trajectories accurately. Under DDPM's cosine schedule, the trajectories would be more complex and harder to model compactly.
+
+**One practical consequence:** the polynomial schedule works at any number of denoising steps — 20, 28, or 50 — without recalibration, because it's a continuous function of σ, not a lookup table tied to specific timestep indices.
+
+---
+
+## Slide 6: SD3 Architecture — MM-DiT
 
 **Multi-Modal Diffusion Transformer: Two Streams, Joint Attention**
 
@@ -73,7 +158,7 @@ Text Tokens   ──┘                          └── Text Output
 
 ---
 
-## Slide 5: SD3 — The Dual-Stream Problem
+## Slide 7: SD3 — The Dual-Stream Problem
 
 **Image and text streams have systematically different activation scales**
 
@@ -100,32 +185,7 @@ A shift of 254 units means 93% of INT8 buckets are wasted on empty space.
 
 ---
 
-## Slide 6: Quantization — The Basics
-
-**Replace 16-bit floats with low-bit integers**
-
-**Why quantize?**
-- Model size: 4× smaller (FP16 → INT4)
-- Memory bandwidth: fewer bytes to move → faster inference
-- SD3 Medium: **4.17 GB** in FP16 → ~1.0 GB in W4
-
-**How it works:**
-```
-scale = α / qmax                    (α = clipping half-width)
-x_q = clip(round(x / scale), -qmax, qmax) × scale
-```
-
-**The clipping range α is everything:**
-- Too small: activations outside `[-α, +α]` are hard-clipped → large errors
-- Too large: integer grid is coarsely spaced → wasted precision
-
-**For a static model (LLM, classifier):** calibrate α once, done.
-
-**For a diffusion model:** the activations at σ=1.0 are completely different from σ=0.09. A single α is wrong at almost every step.
-
----
-
-## Slide 7: Round-to-Nearest — The Baseline Problem
+## Slide 8: Round-to-Nearest — The Baseline Problem
 
 **The simplest approach: just round each weight to the nearest integer**
 
@@ -154,7 +214,7 @@ The output error `ΔW · x` is not random noise — it's correlated with the inp
 
 ---
 
-## Slide 8: AdaRound — Learned Rounding
+## Slide 9: AdaRound — Learned Rounding
 
 **Key Insight: Rounding decisions should minimize *block output* error, not *weight* error**
 
@@ -187,7 +247,7 @@ min_α  ||block_fp16(x) - block_quant(α, x)||²  +  λ · Σ(1 - |2h(α_w) - 1|
 
 ---
 
-## Slide 9: AdaRound's Limitations for Diffusion Models
+## Slide 10: AdaRound's Limitations for Diffusion Models
 
 **AdaRound was designed for static models. Diffusion models break its core assumption.**
 
@@ -209,7 +269,7 @@ All calibration samples contribute equally to the reconstruction loss. But a rou
 
 ---
 
-## Slide 10: What We Discovered — 5 Failure Modes
+## Slide 11: What We Discovered — 5 Failure Modes
 
 **We collected activation statistics across 30 images × 30 noise levels, all 285 layers**
 
@@ -237,7 +297,7 @@ Image attention projections **rise** as denoising progresses. Text attention pro
 
 ---
 
-## Slide 11: Key Observation — Activation Trajectories Are Smooth
+## Slide 12: Key Observation — Activation Trajectories Are Smooth
 
 **Plot any layer's activation scale vs. σ — it's not noise. It's a smooth curve.**
 
@@ -271,7 +331,7 @@ Rectified flow defines `x_t = (1-t)x_0 + t·ε`. The network sees a smooth inter
 
 ---
 
-## Slide 12: Our Proposal — Polynomial Clipping Schedule
+## Slide 13: Our Proposal — Polynomial Clipping Schedule
 
 **Fit a polynomial α(σ) to each layer's activation trajectory. Evaluate it at inference time.**
 
@@ -304,7 +364,7 @@ Rectified flow defines `x_t = (1-t)x_0 + t·ε`. The network sees a smooth inter
 
 ---
 
-## Slide 13: σ-Aware AdaRound
+## Slide 14: σ-Aware AdaRound
 
 **What changes with polynomial clipping:**
 
@@ -343,7 +403,7 @@ Rectified flow defines `x_t = (1-t)x_0 + t·ε`. The network sees a smooth inter
 
 ---
 
-## Slide 14: σ-Weighted Loss
+## Slide 15: σ-Weighted Loss
 
 **Not all noise levels are equally important**
 
@@ -389,7 +449,7 @@ The derivative `dα/dσ = c₁ + 2c₂σ` is exact and free — no finite-differ
 
 ---
 
-## Slide 15: Why This Is Novel
+## Slide 16: Why This Is Novel
 
 **Three levels of novelty**
 
@@ -409,7 +469,7 @@ A single optimization pass where every calibration sample has its own correct α
 
 ---
 
-## Slide 16: Storage and Runtime Overhead
+## Slide 17: Storage and Runtime Overhead
 
 **The polynomial schedule is essentially free**
 
@@ -440,7 +500,7 @@ x_q = fake_quant(x, scale)                # quantize activations
 
 ---
 
-## Slide 17: Mixed-Precision — Surgically Keeping 4 Layers in FP16
+## Slide 18: Mixed-Precision — Surgically Keeping 4 Layers in FP16
 
 **Not every layer should be quantized. Knowing which ones to skip is part of the method.**
 
@@ -520,7 +580,7 @@ Yes — mixed-precision is a recognized pattern, though our trigger is more prin
 
 ---
 
-## Slide 18: Per-Channel Activation Quantization — When It Matters
+## Slide 19: Per-Channel Activation Quantization — When It Matters
 
 **Current design: one activation scale per layer (per-tensor)**
 
@@ -620,7 +680,7 @@ The asymmetric quant work in Slide 17 addresses Problem 1 for layers we *do* qua
 
 ---
 
-## Slide 19: Results — Schedule Generalization
+## Slide 20: Results — Schedule Generalization
 
 **Do the polynomial coefficients generalize across different calibration sets?**
 
@@ -637,7 +697,7 @@ The 4 extreme-shift layers (mm14, mm20, mm21, mm22 txt mlp_fc2) are the exceptio
 
 ---
 
-## Slide 20: What's Still To Do
+## Slide 21: What's Still To Do
 
 **Current status and next steps**
 
@@ -659,7 +719,7 @@ How much does polynomial clipping improve FID and PSNR vs. standard AdaRound and
 
 ---
 
-## Slide 21: Summary
+## Slide 22: Summary
 
 **What we built:**
 

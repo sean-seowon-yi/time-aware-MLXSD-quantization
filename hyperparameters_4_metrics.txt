@@ -1,5 +1,9 @@
-64 ms-coco prompts
+100 ms-coco prompts (coco_100_calibration_prompts.csv)
 image size 512x512
 CFG 4
 steps 30
 seed 42
+
+Adaround Cache
+-built using 100 images with 15 timesteps over the 30 denoising steps
+
