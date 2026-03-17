@@ -386,6 +386,8 @@ def run_act_quant_inference(
     seed: int,
     proxies: List[_ActQuantLayer],
     step_keys_sorted: List[int],
+    height: int = 512,
+    width: int = 512,
 ):
     """
     Custom Euler inference loop that threads step_key into activation proxies
@@ -404,7 +406,7 @@ def run_act_quant_inference(
     conditioning = conditioning.astype(pipeline.activation_dtype)
     pooled = pooled.astype(pipeline.activation_dtype)
 
-    x_T = pipeline.get_empty_latent(64, 64)
+    x_T = pipeline.get_empty_latent(height // 8, width // 8)
     noise = pipeline.get_noise(seed, x_T)
     sigmas = pipeline.get_sigmas(pipeline.sampler, num_steps)
 
@@ -825,12 +827,16 @@ def main() -> None:
                         help="Negative prompt (default: empty)")
     parser.add_argument("--output-image", type=Path, default=Path("quant_test.png"),
                         help="Where to save the generated image (default: quant_test.png)")
-    parser.add_argument("--num-steps", type=int, default=28,
-                        help="Denoising steps (default 28)")
-    parser.add_argument("--cfg-scale", type=float, default=7.0,
-                        help="CFG guidance scale (default 7.0)")
+    parser.add_argument("--num-steps", type=int, default=30,
+                        help="Denoising steps (default 30)")
+    parser.add_argument("--cfg-scale", type=float, default=4.0,
+                        help="CFG guidance scale (default 4.0)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default 42)")
+    parser.add_argument("--height", type=int, default=512,
+                        help="Image height in pixels (default 512)")
+    parser.add_argument("--width", type=int, default=512,
+                        help="Image width in pixels (default 512)")
     parser.add_argument("--compare", action="store_true",
                         help="Also generate a baseline FP16 image for comparison")
     parser.add_argument("--blocks", type=str, default=None,
@@ -911,6 +917,7 @@ def main() -> None:
             num_steps=args.num_steps,
             seed=args.seed,
             negative_text=args.negative_prompt,
+            latent_size=(args.height // 8, args.width // 8),
         )
         image = images[0] if isinstance(images, (list, tuple)) else images
         image.save(baseline_path)
@@ -1001,6 +1008,8 @@ def main() -> None:
             seed=args.seed,
             proxies=proxies,
             step_keys_sorted=step_keys_sorted,
+            height=args.height,
+            width=args.width,
         )
         image.save(args.output_image)
     else:
@@ -1011,6 +1020,7 @@ def main() -> None:
             num_steps=args.num_steps,
             seed=args.seed,
             negative_text=args.negative_prompt,
+            latent_size=(args.height // 8, args.width // 8),
         )
         image = images[0] if isinstance(images, (list, tuple)) else images
         image.save(args.output_image)
