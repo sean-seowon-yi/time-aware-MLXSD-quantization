@@ -2137,7 +2137,8 @@ def main() -> None:
                 f"({pct:+.1f}%){' (converged)' if abs(pct) < 0.5 else ''}"
             )
         else:
-            print(f"  {block_name} done — final_loss={metrics['final_loss']:.4f}")
+            loss_str = f"{metrics['final_loss']:.4f}" if metrics['final_loss'] is not None else "n/a (iters=0)"
+            print(f"  {block_name} done — final_loss={loss_str}")
 
         linear_paths = _save_block_weights(
             weights_dir, block_name, block, is_mm, params, args.bits_w,

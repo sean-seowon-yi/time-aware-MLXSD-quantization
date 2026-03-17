@@ -534,7 +534,30 @@ def load_adaround_weights(
                 if "__" not in key:
                     continue
                 safe_path, field = key.rsplit("__", 1)
-                linear_path = safe_path.replace("_", ".")
+                # Decode safe_path back to dot-separated linear_path.
+                # Naïve replace("_", ".") is wrong because attribute names like
+                # "image_transformer_block" and "q_proj" contain underscores.
+                # Paths always follow: {stream_block}.{sublayer}.{layer}
+                # where stream_block ∈ {image_transformer_block,
+                #                       text_transformer_block,
+                #                       transformer_block}
+                #       sublayer ∈ {attn, mlp}  (no underscores)
+                #       layer ∈ {q_proj, k_proj, v_proj, o_proj, fc1, fc2}
+                _known_prefixes = (
+                    "image_transformer_block",
+                    "text_transformer_block",
+                    "transformer_block",
+                )
+                linear_path = None
+                for _pfx in _known_prefixes:
+                    if safe_path.startswith(_pfx + "_"):
+                        _rest = safe_path[len(_pfx) + 1:]   # e.g. "attn_q_proj"
+                        _parts = _rest.split("_", 1)         # ["attn", "q_proj"]
+                        linear_path = f"{_pfx}.{_parts[0]}.{_parts[1]}"
+                        break
+                if linear_path is None:
+                    # Fallback for any other format (e.g. older exports)
+                    linear_path = safe_path.replace("_", ".")
                 if linear_path not in tmp:
                     tmp[linear_path] = {"bits_w": bits_w, "bits_a": bits_a}
                 if field == "weight_int":
