@@ -2147,6 +2147,32 @@ def main() -> None:
         metrics["quant_paths"] = linear_paths
         all_metrics_by_name[block_name] = metrics
 
+        # Write config.json after every block so an interrupt doesn't lose metrics
+        _checkpoint_metrics = [
+            all_metrics_by_name[bn] for bn in block_names
+            if bn in all_metrics_by_name
+        ]
+        _checkpoint_config = {
+            "format": "adaround_v1",
+            "model_version": "argmaxinc/mlx-stable-diffusion-3-medium",
+            "bits_w": args.bits_w,
+            "bits_a": args.bits_a,
+            "iters": args.iters,
+            "batch_size": args.batch_size,
+            "grad_accum": args.grad_accum,
+            "w_lr": args.w_lr,
+            "a_lr": args.a_lr,
+            "sigma_weighted": args.sigma_weighted,
+            "sigma_weight_offset": args.sigma_weight_offset,
+            "derivative_weighted": args.derivative_weighted,
+            "exclude_layers": sorted(exclude_set) if exclude_set else [],
+            "asymmetric_act": args.asymmetric_act,
+            "n_blocks_quantised": len(_checkpoint_metrics),
+            "block_metrics": _checkpoint_metrics,
+        }
+        with open(config_path, "w") as _f:
+            json.dump(_checkpoint_config, _f, indent=2)
+
         # Free calibration data
         del block_data
 
