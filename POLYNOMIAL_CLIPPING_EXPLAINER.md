@@ -124,12 +124,12 @@ In short: the polynomial doesn't change what AdaRound optimizes (weight rounding
 
 **σ-weighted loss.** On top of correct per-σ clipping, we weight the AdaRound loss per sample so that not all noise levels contribute equally to the rounding decisions. This only works *because* each sample already has its σ-correct α — without per-σ clipping, any weighting scheme would just emphasize samples whose α is wrong, accomplishing little.
 
-We currently use `w(σ) = 1/(σ + offset)` (perceptual weighting), but the polynomial opens up a family of weighting strategies. Here are the options, roughly ordered by how much additional benefit they might provide:
+The polynomial opens up a family of weighting strategies. Here are the options, roughly ordered by how much additional benefit they might provide:
 
 | Strategy | Formula | What it emphasizes | Polynomial-derived? | Expected benefit |
 |----------|---------|-------------------|-------------------|-----------------|
-| **Uniform** (baseline) | `w = 1` | All σ equally | No | Baseline — no σ preference |
-| **Perceptual** (current) | `w = 1/(σ + offset)` | Low-σ (fine detail) | No | Moderate — prioritizes where errors are visible |
+| **Uniform** (current) | `w = 1` | All σ equally | No | Baseline — no σ preference |
+| **Perceptual** | `w = 1/(σ + offset)` | Low-σ (fine detail) | No | Moderate — prioritizes where errors are visible |
 | **Trajectory sensitivity** | `w = \|dα/dσ\|` | Where α changes fastest | Yes — derivative of polynomial | Potentially high — targets fragile regions |
 | **SNR-based** | `w = α²/σ²` | High signal-to-noise ratio | Partially — uses α(σ) | Theoretically grounded but harder to tune |
 | **Reconstruction-error** | `w = loss_prev(σ)` | Hardest samples | No — adaptive | High, but adds complexity (two-pass) |
@@ -143,7 +143,7 @@ The two polynomial-derived strategies are worth highlighting:
 
 Both strategies fall directly out of the polynomial representation — a lookup table would require finite-difference approximations for the derivative, which adds noise. The polynomial gives an exact, smooth derivative for free.
 
-**Status:** These weighting strategies are proposed, not yet implemented or benchmarked. We currently use the simple perceptual weighting `1/(σ + offset)`. The derivative-based strategies are a natural next step enabled by the polynomial, but their benefit over perceptual weighting is unproven. To our knowledge, no prior work uses activation trajectory derivatives to weight quantization optimization — this would be novel if it works.
+**Status:** All weighting strategies are implemented (`--sigma-weighted`, `--derivative-weighted`) but none have been benchmarked yet — the current `quantized_weights_poly` run used uniform weighting (`w = 1`). Perceptual and derivative-based weighting are ready to test but their benefit over uniform is unproven. To our knowledge, no prior work uses activation trajectory derivatives to weight quantization optimization — this would be novel if it works.
 
 ### The Result: Degree Distribution
 
@@ -185,6 +185,10 @@ Everyone either ignores the σ-dependence, averages across it, or discretizes it
 
 Could you get the same per-σ clipping quality with a dense lookup table and interpolation? Yes — the polynomial is one implementation of continuous clipping, not the only one. But the polynomial has a useful property: it acts as a **structural prior**. A lookup table memorizes 25 data points. A degree-2 polynomial with R² = 0.94 tells you the trajectory is a smooth parabola — it filters out calibration noise and makes the layer's behavior legible. You can read the coefficients and immediately see whether a layer's scale rises, falls, or curves.
 
+**Can you do σ-weighted AdaRound with a lookup table instead of a polynomial?** Yes. The prerequisite for σ-weighted AdaRound is simply that the clipping is correct at each σ — a LUT with interpolation satisfies that just as well as a polynomial. For the basic perceptual weighting `1/(σ + offset)`, a LUT works fine. The one place a LUT falls short is the derivative-based weighting strategies (`|dα/dσ|` and combined perceptual × sensitivity), which require a smooth analytical derivative. The polynomial provides this for free (`c₁ + 2c₂σ`); with a LUT you'd need finite differences, which add noise. But since those strategies are currently proposed rather than implemented, a LUT + interpolation + perceptual weighting would achieve σ-aware AdaRound. The polynomial's practical advantages over a LUT — compact storage (402 coefficients vs. 7,125 values), calibration-noise filtering, interpretable coefficients, and exact derivatives — are real but not prerequisites for the core technique.
+
+**So what is the polynomial's actual differentiator over a LUT?** The derivative-based weighting is the clearest one — it's the only capability a LUT genuinely can't replicate cleanly. But it's unproven: whether `|dα/dσ|` weighting improves quantization quality over simple perceptual weighting is an open question, and no prior work has tried it. The polynomial's *demonstrated* advantage over a LUT is mostly engineering convenience: fewer numbers to store, smoother fits that filter calibration noise. The real value of the whole approach — polynomial or LUT — is simply getting the clipping right per timestep so AdaRound optimizes weight rounding without fighting a confounding clipping error. The polynomial is a clean way to achieve that, not a breakthrough on its own.
+
 ### σ-aware AdaRound: a new way to optimize quantized weights
 
 Separate from the clipping schedule itself, the trajectory model enables something nobody has done with AdaRound: **varying the clipping range per calibration sample based on its noise level during weight optimization.**
@@ -198,6 +202,20 @@ On top of this, we apply σ-dependent loss weighting (see Section 4 for the full
 Any weighting strategy — whether perceptual, derivative-based, or combined — has a prerequisite: **the activation clipping must already be correct at each σ.** Here's why. The AdaRound loss for a given sample is the reconstruction error between the FP16 output and the quantized output. If the clipping range α is wrong for that sample's σ, the reconstruction error is dominated by clipping error — the loss is huge regardless of how the weights are rounded. If you then *weight* that sample heavily (because it's at a perceptually important σ), you're telling the optimizer to focus on a sample whose error it can't fix. The optimizer contorts the rounding decisions trying to compensate for a clipping problem, making other samples worse in the process.
 
 With per-σ clipping, the clipping error is removed. The reconstruction error each sample contributes is purely due to rounding — which is what AdaRound controls. Now weighting actually does what you intend: it tells the optimizer which σ regions to prioritize when making rounding trade-offs. Per-σ clipping is the foundation that makes any σ-weighted strategy viable.
+
+### Literature survey: has anyone weighted the AdaRound loss by timestep?
+
+A search of the diffusion quantization literature (as of early 2026) confirms that **no paper explicitly weights the AdaRound block-reconstruction MSE loss by noise level or timestep.** The closest work:
+
+| Paper | What they do | How it differs |
+|-------|-------------|----------------|
+| **Gradient-Aligned Calibration** (arXiv 2602.01289) | AdaRound + learns per-sample weights to align gradients across timestep groups | Gradient-matching objective, not a direct λ(σ) on the MSE loss |
+| **DMQ** (arXiv 2507.12933) | Focal-loss-inspired λ(t) weighting during a channel-scaling step (LES) | BRECQ/AdaRound weight rounding itself remains unweighted |
+| **AdaTSQ** (arXiv 2602.09883) | Fisher-weighted Hessian accumulation per timestep | Same spirit, but GPTQ/Hessian framework, not AdaRound block reconstruction |
+| **TFMQ-DM** (arXiv 2311.16503) | AdaRound + BRECQ with timestep-aware activation parameter sets | No λ(t) in the weight rounding loss |
+| **FP4DiT** (arXiv 2503.15465) | Scale-aware AdaRound adapted for floating-point formats | No timestep weighting |
+
+The pattern is consistent: papers that use AdaRound don't weight the reconstruction loss by σ; papers that weight by σ use GPTQ or channel-scaling steps, not AdaRound. The specific combination — AdaRound reconstruction loss weighted by `1/(σ + offset)` or `|dα/dσ|` — does not appear in the literature. This is both a novelty claim and a reminder that the approach is unvalidated: it hasn't been done, which means we don't know yet whether it helps.
 
 ### What's specific to MM-DiT
 
