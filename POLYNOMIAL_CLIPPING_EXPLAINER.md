@@ -268,6 +268,31 @@ Standard AdaRound optimizes against one activation distribution. If that distrib
 
 The σ-weighted loss goes further: since quantization errors at low σ (near-clean images) are more perceptually damaging than errors at high σ (mostly noise), we weight the loss by `1/(σ + 1)` or with other weighting schemes so the optimizer prioritizes getting the fine-detail timesteps right. The result is rounding decisions that are jointly optimized for correct clipping *and* perceptual quality — not just minimal reconstruction error at an arbitrary calibration point.
 
+### Choosing the clipping percentile: p99.9 vs p99.99 vs p100
+
+When fitting the polynomial (or building the LUT), you need to decide what statistic to use for `α` at each `(layer, σ)` data point. The three main options:
+
+| Percentile | What it clips | Effect on α |
+|------------|---------------|-------------|
+| **p99.9** | Top 0.1% of activation magnitudes | Tighter α — better grid resolution for 99.9% of values |
+| **p99.99** | Top 0.01% | Slightly wider — clips only extreme outliers |
+| **p100** (absmax) | Nothing — true maximum | Widest α — zero clipping, coarser grid |
+
+The intuition behind p99.9 is sound for static quantization: clip a small tail of outliers to recover precision for the bulk of the distribution. For inference-only activation quantization, this tradeoff is straightforward.
+
+**The problem with p99.9 during AdaRound training.** AdaRound optimizes weight rounding decisions to minimize reconstruction error while fake-quantizing activations with clipping range α. If p99.9 clips too aggressively, the activation distribution the optimizer sees during training is different from the distribution seen at inference. The rounding decisions become tuned for clipped activations — and can be actively wrong when the model runs with wider clipping or full FP16 activations.
+
+In practice, we found that AdaRound weights trained with p99.9 activation clipping produced **worse image quality than round-to-nearest (RTN) weights** when tested with FP16 activations — completely degraded images (solid brown/fur texture, no scene structure). RTN, which has no activation coupling, at least produces partial scene structure. The AdaRound optimizer had so thoroughly tuned the rounding decisions for the clipped activation distribution that the weights were useless under any other conditions.
+
+**p100 is the correct choice for AdaRound training.** By using the true maximum as α, clipping error is zero by construction — every activation value fits within the range. The reconstruction loss the optimizer sees is purely due to weight rounding, which is exactly what AdaRound should be optimizing. There is no confounding clipping error, no coupling between training and inference conditions.
+
+The cost of p100 is a slightly coarser quantization grid (wider α means larger step size), but this is a clean tradeoff: you trade a small amount of per-sample precision for rounding decisions that are correct under all inference conditions.
+
+**For inference-only activation quantization** (not paired with AdaRound training), p99.9 or p99.99 may give better image quality than p100 because the precision benefit outweighs the clipping cost. The key distinction is whether activation quantization is coupled to weight optimization:
+
+- **AdaRound training**: use p100 — eliminates clipping error from the optimization signal
+- **Inference-only A8**: p99.9 or p99.99 may give better precision, worth tuning
+
 ### Overhead
 The schedule is 402 coefficients for 285 layers. At each denoising step, evaluating a degree-2 polynomial is 2 multiplies and 2 adds per layer — negligible next to the matrix multiplications in the transformer.
 

@@ -155,6 +155,14 @@ def load_poly_schedule(path) -> Optional[Dict]:
         return json.load(f)
 
 
+def load_lut_schedule(path) -> Optional[Dict]:
+    """Load LUT (lookup table) clipping schedule JSON. Returns None if path is None."""
+    if path is None:
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
 # ---------------------------------------------------------------------------
 # Activation quantization proxy
 # ---------------------------------------------------------------------------
@@ -179,21 +187,37 @@ class _ActQuantLayer:
         per_timestep: Dict,
         outlier_cfg: Dict,
         poly_cfg: Optional[Dict] = None,
+        lut_cfg: Optional[Dict] = None,
     ):
         self.layer = layer
         self.layer_name = layer_name
         self.per_timestep = per_timestep   # step_key (str) → {bits, scale, shift?}
         self.outlier_cfg = outlier_cfg     # {multiplier_vector, ...} or {}
         self.poly_cfg = poly_cfg           # {degree, coeffs, r2, cv} or None
+        self.lut_cfg = lut_cfg             # {alphas: [...], sigmas: [...]} or None
         self.poly_sigma_range = None       # set by apply_act_quant_hooks
+        self.poly_margin: float = 1.0      # set by main(); multiplies alpha bounds
         self.current_step_key: Optional[int] = None
         self.current_sigma: Optional[float] = None
 
     def _get_scale_and_bits(self):
-        """Resolve activation scale — poly schedule takes priority over static config."""
+        """Resolve activation scale — LUT > poly > static config priority."""
+        # LUT clipping: nearest-sigma lookup, no curve fitting
+        if self.lut_cfg is not None and self.current_sigma is not None:
+            sigmas = self.lut_cfg["sigmas"]
+            alphas = self.lut_cfg["alphas"]
+            # Find nearest sigma
+            idx = int(np.argmin([abs(s - self.current_sigma) for s in sigmas]))
+            alpha = alphas[idx] * self.poly_margin  # reuse margin for tuning
+            if alpha < 1e-8:
+                return None, None
+            scale = alpha / 127  # A8: 2^(8-1) - 1 = 127
+            return scale, 8
+
         # Polynomial clipping: compute α(σ) and derive scale
         if self.poly_cfg is not None and self.current_sigma is not None:
             alpha = eval_poly_alpha(self.poly_cfg["coeffs"], self.current_sigma, self.poly_sigma_range)
+            alpha *= self.poly_margin
             if alpha < 1e-8:
                 return None, None
             bits = 8  # A8
@@ -235,6 +259,7 @@ class _ActQuantLayer:
         if poly_shift is not None:
             # Asymmetric activation quantization
             alpha = eval_poly_alpha(self.poly_cfg["coeffs"], self.current_sigma, self.poly_sigma_range)
+            alpha *= self.poly_margin
             qmin = -(2 ** (bits - 1))
             qmax = 2 ** (bits - 1) - 1
             min_val = poly_shift - alpha
@@ -289,11 +314,12 @@ def apply_act_quant_hooks(
     per_timestep: Dict,
     outlier_config: Dict,
     poly_schedule: Optional[Dict] = None,
+    lut_schedule: Optional[Dict] = None,
     exclude_layers: Optional[set] = None,
 ) -> Tuple[List, List]:
     """
     Walk the MMDiT block hierarchy and wrap each nn.Linear whose name appears
-    in per_timestep (or poly_schedule) with an _ActQuantLayer proxy.
+    in per_timestep (or poly_schedule or lut_schedule) with an _ActQuantLayer proxy.
 
     Layer naming convention (matches collect_layer_activations.py):
       mm{i}.img.{attn|mlp}.{q,k,v,o}_proj / fc1 / fc2
@@ -308,41 +334,46 @@ def apply_act_quant_hooks(
         Pass to remove_act_quant_hooks() to restore originals.
     """
     poly_layers = poly_schedule.get("layers", {}) if poly_schedule else {}
+    lut_layers = lut_schedule.get("layers", {}) if lut_schedule else {}
+    lut_sigmas = lut_schedule.get("sigmas", []) if lut_schedule else []
 
-    # Build set of all layer names that appear in at least one timestep or poly schedule
+    # Build set of all layer names that appear in at least one timestep or poly/lut schedule
     quant_layer_names: set = set()
     for step_layers in per_timestep.values():
         quant_layer_names.update(step_layers.keys())
     # Also include poly-only layers (layers in poly schedule but not in static config)
     quant_layer_names.update(poly_layers.keys())
+    # Also include LUT-only layers
+    quant_layer_names.update(lut_layers.keys())
 
     proxies: List[_ActQuantLayer] = []
     patches: List[Tuple] = []
 
-    def _poly_name_for(full_name: str) -> Optional[str]:
-        """Map dot-separated layer name to underscore-separated poly schedule key."""
-        # Poly schedule uses underscore keys like "mm0_img_attn_q_proj"
-        # apply_act_quant_hooks uses dot keys like "mm0.img.attn.q_proj"
-        underscore_name = full_name.replace(".", "_")
-        if underscore_name in poly_layers:
-            return underscore_name
-        return None
+    def _underscore_key(full_name: str) -> str:
+        """Map dot-separated layer name to underscore-separated schedule key."""
+        return full_name.replace(".", "_")
 
     def _patch_sub(sub, attr: str, full_name: str):
         layer = getattr(sub, attr, None)
-        poly_key = _poly_name_for(full_name)
+        us_key = _underscore_key(full_name)
+        has_poly = us_key in poly_layers
+        has_lut = us_key in lut_layers
         if layer is None:
             return
-        if full_name not in quant_layer_names and poly_key is None:
+        if full_name not in quant_layer_names and not has_poly and not has_lut:
             return
         # Skip excluded layers (Module B: they stay FP16 end-to-end)
-        if exclude_layers and poly_key and poly_key in exclude_layers:
+        if exclude_layers and us_key in exclude_layers:
             return
         per_ts = {sk: per_timestep[sk][full_name]
                   for sk in per_timestep if full_name in per_timestep[sk]}
         outlier_cfg = outlier_config.get(full_name, {})
-        poly_cfg = poly_layers.get(poly_key) if poly_key else None
-        proxy = _ActQuantLayer(layer, full_name, per_ts, outlier_cfg, poly_cfg)
+        poly_cfg = poly_layers.get(us_key) if has_poly else None
+        # Build LUT config for this layer: {alphas, sigmas}
+        lut_cfg = None
+        if has_lut:
+            lut_cfg = {"alphas": lut_layers[us_key]["alphas"], "sigmas": lut_sigmas}
+        proxy = _ActQuantLayer(layer, full_name, per_ts, outlier_cfg, poly_cfg, lut_cfg)
         proxy.poly_sigma_range = poly_schedule.get("sigma_range") if poly_schedule else None
         setattr(sub, attr, proxy)
         patches.append((sub, attr, layer))
@@ -421,7 +452,8 @@ def run_act_quant_inference(
 
     extra_args = {"conditioning": conditioning, "cfg_weight": cfg_scale}
 
-    for i in range(len(sigmas) - 1):
+    from tqdm import tqdm
+    for i in tqdm(range(len(sigmas) - 1), desc="Sampling"):
         # Find nearest collected step_key for this step index
         nearest_key = min(step_keys_sorted, key=lambda k: abs(k - i)) if step_keys_sorted else None
         sigma_val = float(np.array(sigmas[i]))
@@ -811,6 +843,68 @@ def weight_diff_stats(
 
 
 # ---------------------------------------------------------------------------
+# RTN (round-to-nearest) W8 fake quantization
+# ---------------------------------------------------------------------------
+
+def fake_quant_weights_rtn_w8(pipeline) -> int:
+    """
+    Apply round-to-nearest int8 fake quantization to all MMDiT linear weights.
+
+    For each linear layer:
+      1. Compute per-output-channel scale: s = max(|w|, dim=1) / 127
+      2. Quantize: w_int = round(w / s), clip to [-127, 127]
+      3. Dequantize: w_fake = w_int * s  (stays FP16, captures quantization error)
+
+    This is a diagnostic tool — no memory savings, but isolates weight
+    quantization error from activation quantization error.
+
+    Returns the number of layers quantized.
+    """
+    mmdit = pipeline.mmdit
+    n_quantized = 0
+    pending: list = []
+
+    def _quant_linear(layer):
+        nonlocal n_quantized
+        w = np.array(layer.weight)  # (out, in), float16
+        w32 = w.astype(np.float32)
+        # Per-output-channel symmetric scale
+        amax = np.maximum(np.max(np.abs(w32), axis=1, keepdims=True), 1e-8)
+        scale = amax / 127.0
+        w_int = np.clip(np.round(w32 / scale), -127, 127)
+        w_fake = (w_int * scale).astype(np.float16)
+        new_weight = mx.array(w_fake)
+        layer.weight = new_weight
+        pending.append(new_weight)
+        n_quantized += 1
+
+    def _walk_block(tb):
+        for lin_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            layer = getattr(tb.attn, lin_name, None)
+            if layer is not None and isinstance(layer, nn.Linear):
+                _quant_linear(layer)
+        if hasattr(tb, "mlp"):
+            for lin_name in ("fc1", "fc2"):
+                layer = getattr(tb.mlp, lin_name, None)
+                if layer is not None and isinstance(layer, nn.Linear):
+                    _quant_linear(layer)
+
+    if hasattr(mmdit, "multimodal_transformer_blocks"):
+        for block in mmdit.multimodal_transformer_blocks:
+            _walk_block(block.image_transformer_block)
+            _walk_block(block.text_transformer_block)
+
+    if hasattr(mmdit, "unified_transformer_blocks"):
+        for block in mmdit.unified_transformer_blocks:
+            _walk_block(block.transformer_block)
+
+    if pending:
+        mx.eval(*pending)
+
+    return n_quantized
+
+
+# ---------------------------------------------------------------------------
 # Main CLI
 # ---------------------------------------------------------------------------
 
@@ -818,7 +912,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Load AdaRound quantised weights and run a test generation"
     )
-    parser.add_argument("--adaround-output", type=Path, required=True,
+    parser.add_argument("--adaround-output", type=Path, default=None,
                         help="Output dir from adaround_optimize.py (contains config.json)")
     parser.add_argument("--prompt", type=str,
                         default="a photo of a tabby cat sitting on a wooden table",
@@ -853,24 +947,58 @@ def main() -> None:
     parser.add_argument("--poly-schedule", type=Path, default=None,
                         help="polynomial_clipping_schedule.json from generate_poly_schedule.py; "
                              "enables continuous polynomial A8 clipping (V4)")
+    parser.add_argument("--no-act-quant-qk", action="store_true",
+                        help="Exclude q_proj and k_proj from activation quantization "
+                             "(keeps attention QK inputs in FP16 to avoid attention saturation)")
+    parser.add_argument("--no-act-quant-attn", action="store_true",
+                        help="Exclude all attention projections (q/k/v/o) from A8, "
+                             "keep only fc1/fc2")
+    parser.add_argument("--lut-schedule", type=Path, default=None,
+                        help="LUT clipping schedule JSON from generate_lut_schedule.py; "
+                             "uses direct per-timestep absmax lookup (no polynomial fitting)")
+    parser.add_argument("--global-a8", action="store_true",
+                        help="Use max absmax across all timesteps per layer as a single "
+                             "fixed alpha (simplest baseline). Requires --lut-schedule.")
+    parser.add_argument("--poly-margin", type=float, default=1.0,
+                        help="Multiply poly/LUT clipping bounds by this factor "
+                             "(>1.0 = wider/safer bounds, default 1.0)")
+    parser.add_argument("--rtn-w8", action="store_true",
+                        help="Use RTN (round-to-nearest) W8 quantization on FP16 weights "
+                             "instead of AdaRound W4. No --adaround-output needed.")
+    parser.add_argument("--no-weight-quant", action="store_true",
+                        help="Skip all weight quantization (keep FP16 weights). "
+                             "Use with --poly-schedule for A8-only testing.")
     args = parser.parse_args()
 
-    # ------------------------------------------------------------------
-    # Load quantised weight map
-    # ------------------------------------------------------------------
-    print("=== Loading AdaRound Weights ===")
-    config, quant_weights = load_adaround_weights(args.adaround_output)
+    if not args.rtn_w8 and not args.no_weight_quant and args.adaround_output is None:
+        parser.error("--adaround-output is required unless --rtn-w8 or --no-weight-quant is used")
+    if args.global_a8 and args.lut_schedule is None:
+        parser.error("--global-a8 requires --lut-schedule")
 
-    if args.blocks:
-        selected = set(args.blocks.split(","))
-        quant_weights = {k: v for k, v in quant_weights.items() if k in selected}
+    # ------------------------------------------------------------------
+    # Load quantised weight map (skip if --rtn-w8)
+    # ------------------------------------------------------------------
+    config = {}
+    quant_weights = {}
 
-    n_blocks = len(quant_weights)
-    n_layers = sum(len(v) for v in quant_weights.values())
-    print(f"  Blocks:       {n_blocks}")
-    print(f"  Linear layers: {n_layers}")
-    print(f"  W{config.get('bits_w', 4)}A{config.get('bits_a', 8)} "
-          f"({config.get('iters', '?')} iters)")
+    if not args.rtn_w8 and not args.no_weight_quant:
+        print("=== Loading AdaRound Weights ===")
+        config, quant_weights = load_adaround_weights(args.adaround_output)
+
+        if args.blocks:
+            selected = set(args.blocks.split(","))
+            quant_weights = {k: v for k, v in quant_weights.items() if k in selected}
+
+        n_blocks = len(quant_weights)
+        n_layers = sum(len(v) for v in quant_weights.values())
+        print(f"  Blocks:       {n_blocks}")
+        print(f"  Linear layers: {n_layers}")
+        print(f"  W{config.get('bits_w', 4)}A{config.get('bits_a', 8)} "
+              f"({config.get('iters', '?')} iters)")
+    elif args.rtn_w8:
+        print("=== RTN W8 mode (no AdaRound weights) ===")
+    else:
+        print("=== A8-only mode (FP16 weights, no weight quantization) ===")
 
     # ------------------------------------------------------------------
     # Load pipeline
@@ -892,7 +1020,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Optional: weight diff stats (before injection)
     # ------------------------------------------------------------------
-    if args.diff_stats:
+    if args.diff_stats and not args.rtn_w8:
         print("\n=== Weight Diff Stats (FP16 baseline vs AdaRound) ===")
         stats = weight_diff_stats(pipeline, quant_weights)
         if stats:
@@ -924,11 +1052,17 @@ def main() -> None:
         print(f"  Done in {time.time() - t0:.1f}s  →  {baseline_path}")
 
     # ------------------------------------------------------------------
-    # Inject quantised weights (V1: FP16 dequantize  |  V3: MLX int4)
+    # Inject quantised weights
     # ------------------------------------------------------------------
-    print("\n=== Injecting AdaRound Weights ===")
     t0 = time.time()
-    if args.mlx_int4:
+    if args.no_weight_quant:
+        print("\n=== Skipping weight quantization (FP16 weights) ===")
+    elif args.rtn_w8:
+        print("\n=== Applying RTN W8 Fake Quantization ===")
+        n_injected = fake_quant_weights_rtn_w8(pipeline)
+        print(f"  {n_injected} layers fake-quantized to W8 in {time.time() - t0:.1f}s")
+    elif args.mlx_int4:
+        print("\n=== Injecting AdaRound Weights (MLX int4) ===")
         n_injected, mem_stats = inject_weights_mlx_int4(
             pipeline, quant_weights, group_size=args.group_size
         )
@@ -937,6 +1071,7 @@ def main() -> None:
               f"  →  int4={mem_stats['int4_mb']:.1f} MB"
               f"  ({mem_stats['ratio']:.2f}× reduction)")
     else:
+        print("\n=== Injecting AdaRound Weights ===")
         n_injected = inject_weights(pipeline, quant_weights)
         print(f"  {n_injected} layers injected in {time.time() - t0:.1f}s")
 
@@ -954,7 +1089,25 @@ def main() -> None:
         print(f"\n=== Polynomial Clipping Schedule: {args.poly_schedule} ===")
         print(f"  {n_poly} layers with polynomial clipping (version: {poly_schedule.get('version')})")
 
-    if args.quant_config is not None or poly_schedule is not None:
+    # Load LUT schedule if provided
+    lut_schedule = load_lut_schedule(args.lut_schedule)
+    if lut_schedule is not None:
+        n_lut = len(lut_schedule.get("layers", {}))
+        print(f"\n=== LUT Clipping Schedule: {args.lut_schedule} ===")
+        print(f"  {n_lut} layers with per-timestep LUT (version: {lut_schedule.get('version')})")
+
+        # --global-a8: collapse per-timestep alphas to max across all timesteps
+        if args.global_a8:
+            for layer_key, layer_data in lut_schedule["layers"].items():
+                max_alpha = max(layer_data["alphas"])
+                layer_data["alphas"] = [max_alpha] * len(layer_data["alphas"])
+            print(f"  Global A8: using max absmax across all timesteps per layer")
+
+    if poly_schedule is not None and lut_schedule is not None:
+        print("  WARNING: Both --poly-schedule and --lut-schedule provided; LUT takes priority")
+
+    has_act_schedule = args.quant_config is not None or poly_schedule is not None or lut_schedule is not None
+    if has_act_schedule:
         per_timestep = {}
         outlier_config = {}
         if args.quant_config is not None:
@@ -969,10 +1122,38 @@ def main() -> None:
         # Get exclude_layers from the AdaRound config (Module B)
         cfg_exclude = set(config.get("exclude_layers", []))
 
+        # Build the set of all schedule layers for exclude filtering
+        all_schedule_layers = {}
+        if poly_schedule:
+            all_schedule_layers.update(poly_schedule.get("layers", {}))
+        if lut_schedule:
+            all_schedule_layers.update(lut_schedule.get("layers", {}))
+
+        # Optionally exclude q_proj and k_proj from activation quantization
+        # to prevent attention saturation from W4A8 combined quantization
+        if getattr(args, "no_act_quant_qk", False):
+            import re as _re
+            qk_keys = {k for k in all_schedule_layers if _re.search(r"_[qk]_proj$", k)}
+            cfg_exclude = cfg_exclude | qk_keys
+            print(f"  Excluding {len(qk_keys)} q/k_proj layers from activation quantization")
+
+        if getattr(args, "no_act_quant_attn", False):
+            import re as _re
+            attn_keys = {k for k in all_schedule_layers if _re.search(r"_[qkvo]_proj$", k)}
+            cfg_exclude = cfg_exclude | attn_keys
+            print(f"  Excluding {len(attn_keys)} attention layers from activation quantization")
+
         proxies, act_quant_patches = apply_act_quant_hooks(
             pipeline.mmdit, per_timestep, outlier_config, poly_schedule,
+            lut_schedule=lut_schedule,
             exclude_layers=cfg_exclude if cfg_exclude else None,
         )
+
+        # Apply margin to all proxies
+        if args.poly_margin != 1.0:
+            for proxy in proxies:
+                proxy.poly_margin = args.poly_margin
+            print(f"  Clipping margin: {args.poly_margin}× (wider clipping bounds)")
 
         # Count bits distribution
         n_a8 = n_a4 = n_other = 0
