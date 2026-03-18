@@ -1,5 +1,6 @@
 {
   "version": "lut_v1",
+  "percentile": "p100_absmax",
   "sigma_range": [
     0.10430908203125,
     1.0
