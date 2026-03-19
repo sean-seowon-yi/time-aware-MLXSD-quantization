@@ -577,12 +577,13 @@ def compute_model_size(pipeline) -> Dict:
 # Prompt loading
 # ---------------------------------------------------------------------------
 
-def load_prompts(csv_path: Path, max_count: int) -> List[str]:
+def load_prompts(prompt_path: Path, max_count: int) -> List[str]:
     """
-    Load up to max_count prompts from a CSV with a single 'prompt' column.
-    Falls back to three synthetic prompts if the file does not exist.
+    Load up to max_count prompts from a CSV ('prompt' column) or a plain-text
+    file (.txt, one prompt per line).  Falls back to three synthetic prompts if
+    the file does not exist.
     """
-    if not csv_path.exists():
+    if not prompt_path.exists():
         fallback = [
             "a photo of a cat",
             "abstract art with vibrant colors",
@@ -591,7 +592,18 @@ def load_prompts(csv_path: Path, max_count: int) -> List[str]:
         return fallback[:max_count]
 
     prompts: List[str] = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
+
+    if prompt_path.suffix.lower() == ".txt":
+        with open(prompt_path, encoding="utf-8") as f:
+            for line in f:
+                if len(prompts) >= max_count:
+                    break
+                p = line.strip()
+                if p:
+                    prompts.append(p)
+        return prompts
+
+    with open(prompt_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             if len(prompts) >= max_count:
@@ -753,7 +765,9 @@ def _load_pipeline(
     adaround_act_config: Optional[Path],
     mlx_int4: bool = False,
     group_size: int = 64,
-    poly_schedule_path: Optional[Path] = None,
+    poly_schedule: Optional[Dict] = None,
+    lut_schedule: Optional[Dict] = None,
+    poly_margin: float = 1.0,
 ):
     """
     Load DiffusionPipeline and apply quantization config.
@@ -806,27 +820,32 @@ def _load_pipeline(
         else:
             inject_weights(pipeline, quant_weights)
 
-    # Load polynomial schedule if provided
-    poly_schedule = None
-    if poly_schedule_path is not None:
-        with open(poly_schedule_path) as f:
-            poly_schedule = json.load(f)
-
     # Activation quantization hooks
+    # Supports three modes (in priority order):
+    #   1. --adaround-act-config  : static per-timestep config JSON
+    #   2. --poly-schedule        : sigma-polynomial clipping schedule
+    #   3. --lut-schedule         : per-timestep lookup table schedule
+    # Modes 2 and 3 can be combined (poly takes priority per-layer).
     act_config_path = adaround_act_config
-    if act_config_path is not None or poly_schedule is not None:
+    per_timestep: Dict = {}
+    outlier_config: Dict = {}
+    if act_config_path is not None:
+        with open(act_config_path) as f:
+            quant_cfg = json.load(f)
+        per_timestep = quant_cfg.get("per_timestep", {})
+        outlier_config = quant_cfg.get("outlier_config", {})
+
+    if act_config_path is not None or poly_schedule is not None or lut_schedule is not None:
         from src.load_adaround_model import apply_act_quant_hooks
-        per_timestep = {}
-        outlier_config = {}
-        if act_config_path is not None:
-            with open(act_config_path) as f:
-                quant_cfg = json.load(f)
-            per_timestep = quant_cfg.get("per_timestep", {})
-            outlier_config = quant_cfg.get("outlier_config", {})
-        step_keys_sorted = sorted(int(k) for k in per_timestep.keys()) if per_timestep else []
+        step_keys_sorted = sorted(int(k) for k in per_timestep.keys())
         proxies, patches = apply_act_quant_hooks(
-            pipeline.mmdit, per_timestep, outlier_config, poly_schedule=poly_schedule
+            pipeline.mmdit, per_timestep, outlier_config,
+            poly_schedule=poly_schedule,
+            lut_schedule=lut_schedule,
         )
+        if poly_margin != 1.0:
+            for proxy in proxies:
+                proxy.poly_margin = poly_margin
         quant_ctx["proxies"] = proxies
         quant_ctx["act_quant_patches"] = patches
         quant_ctx["step_keys_sorted"] = step_keys_sorted
@@ -912,7 +931,9 @@ def generate_images(
     adaround_act_config: Optional[Path] = None,
     mlx_int4: bool = False,
     group_size: int = 64,
-    poly_schedule_path: Optional[Path] = None,
+    poly_schedule: Optional[Dict] = None,
+    lut_schedule: Optional[Dict] = None,
+    poly_margin: float = 1.0,
 ) -> Tuple[List[float], Dict]:
     """
     Generate images for all prompts and return timing + memory stats.
@@ -966,7 +987,8 @@ def generate_images(
         t0 = time.time()
         pipeline, quant_ctx = _load_pipeline(
             config, adaround_output, adaround_act_config, mlx_int4, group_size,
-            poly_schedule_path=poly_schedule_path,
+            poly_schedule=poly_schedule, lut_schedule=lut_schedule,
+            poly_margin=poly_margin,
         )
         image = _generate_single_image(
             pipeline, quant_ctx, prompt, seed, num_steps, cfg_scale
@@ -1080,19 +1102,23 @@ def main() -> None:
     # Config
     parser.add_argument(
         "--config", type=str, default="fp16",
-        choices=["fp16", "naive_int8", "adaround_w4", "adaround_w4a8", "adaround_w4a8_poly", "taqdit_w4a8", "mlx_int4"],
+        choices=["fp16", "naive_int8", "adaround_w4", "adaround_w4a8", "taqdit_w4a8", "mlx_int4"],
         help="Quantization config to benchmark",
     )
     parser.add_argument("--adaround-output", type=Path, default=None,
                         help="AdaRound weights dir (from adaround_optimize.py)")
     parser.add_argument("--adaround-act-config", type=Path, default=None,
                         help="Activation quant config JSON (from analyze_activations.py)")
+    parser.add_argument("--poly-schedule", type=Path, default=None,
+                        help="Polynomial clipping schedule JSON (from generate_poly_schedule.py)")
+    parser.add_argument("--lut-schedule", type=Path, default=None,
+                        help="LUT clipping schedule JSON (from generate_lut_schedule.py)")
+    parser.add_argument("--poly-margin", type=float, default=1.0,
+                        help="Multiplier applied to poly/LUT clipping bounds (default: 1.0)")
     parser.add_argument("--taqdit-output", type=Path, default=None,
                         help="TaQ-DiT weights dir (reserved for future use)")
     parser.add_argument("--taqdit-act-config", type=Path, default=None,
                         help="TaQ-DiT act config JSON (reserved for future use)")
-    parser.add_argument("--poly-schedule", type=Path, default=None,
-                        help="Polynomial clipping schedule JSON (from generate_poly_schedule.py)")
 
     # Generation
     parser.add_argument("--prompt-csv", type=Path, default=None,
@@ -1132,12 +1158,25 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.config == "adaround_w4a8_poly" and args.poly_schedule is None:
-        parser.error("--poly-schedule is required for adaround_w4a8_poly config")
-
     prompt_csv = args.prompt_csv or (_REPO / "all_prompts.csv")
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load poly/LUT schedules once (shared across all images)
+    poly_schedule: Optional[Dict] = None
+    lut_schedule: Optional[Dict] = None
+    if args.poly_schedule is not None:
+        with open(args.poly_schedule) as f:
+            poly_schedule = json.load(f)
+        print(f"  Poly schedule: {args.poly_schedule} "
+              f"(percentile={poly_schedule.get('percentile', 'unknown')})")
+    if args.lut_schedule is not None:
+        with open(args.lut_schedule) as f:
+            lut_schedule = json.load(f)
+        print(f"  LUT schedule:  {args.lut_schedule} "
+              f"(percentile={lut_schedule.get('percentile', 'unknown')})")
+    if args.poly_margin != 1.0:
+        print(f"  Poly margin:   {args.poly_margin}×")
 
     generated_dir = args.generated_dir or (output_dir / "images")
 
@@ -1169,7 +1208,9 @@ def main() -> None:
             adaround_act_config=args.adaround_act_config,
             mlx_int4=args.mlx_int4,
             group_size=args.group_size,
-            poly_schedule_path=args.poly_schedule,
+            poly_schedule=poly_schedule,
+            lut_schedule=lut_schedule,
+            poly_margin=args.poly_margin,
         )
 
         # Compute model size once after generation (pipeline discarded per-image;
@@ -1179,7 +1220,8 @@ def main() -> None:
             pipeline_sz, _ = _load_pipeline(
                 args.config, args.adaround_output, args.adaround_act_config,
                 args.mlx_int4, args.group_size,
-                poly_schedule_path=args.poly_schedule,
+                poly_schedule=poly_schedule, lut_schedule=lut_schedule,
+                poly_margin=args.poly_margin,
             )
             model_stats = compute_model_size(pipeline_sz)
             del pipeline_sz
@@ -1257,6 +1299,12 @@ def main() -> None:
         "num_steps": args.num_steps,
         "cfg_scale": args.cfg_scale,
         "seed": args.seed,
+        "adaround_output": str(args.adaround_output) if args.adaround_output else None,
+        "poly_schedule": str(args.poly_schedule) if args.poly_schedule else None,
+        "poly_schedule_percentile": poly_schedule.get("percentile") if poly_schedule else None,
+        "lut_schedule": str(args.lut_schedule) if args.lut_schedule else None,
+        "lut_schedule_percentile": lut_schedule.get("percentile") if lut_schedule else None,
+        "poly_margin": args.poly_margin if args.poly_margin != 1.0 else None,
         "latency": lat_stats,
         "memory": memory_stats,
         "model": model_stats,
