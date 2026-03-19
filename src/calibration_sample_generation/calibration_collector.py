@@ -23,7 +23,7 @@ def sample_euler_with_calibration(
     sigmas,
     conditioning,
     pooled_conditioning,
-    cfg_weight: float = 1.5,
+    cfg_weight: float = 4.0,
 ):
     """
     Euler (deterministic ODE) sampler with per-step (x, t) collection.

@@ -1,19 +1,15 @@
 """
-Phase 1: Generate calibration data for time-aware quantization of SD3 (MMDiT).
+Phase 1 EDA: Generate calibration data for Q-Diffusion fusion study on SD3 MMDiT.
 
-Aligned with TaQ-DiT (arXiv:2411.14172):
-  - 100 sampling steps per trajectory
-  - 256 trajectories total
-  - Uniformly select 25 timesteps from the 100
-  - Shuffle the calibration pool
+EDA configuration (differs from original TaQ-DiT paper):
+  - 100 prompts from sample_prompts.txt (default)
+  - 30 Euler steps per trajectory, ALL collected (dense temporal coverage)
+  - 3,000 total calibration points (100 trajectories × 30 timesteps)
 
-Improvements over the paper's single-class-label setup for SD3:
-  - Supports 1-N diverse text prompts (loaded from a file)
-  - Prompts are cycled round-robin across trajectories so the calibration
-    set covers varied conditioning, producing more representative activation
-    distributions for quantization.
-  - Conditioning is stored *once per unique prompt* (not duplicated per
-    calibration point) to keep the .npz small (~200 MB instead of ~8 GB).
+Prompt loading priority:
+  1. --prompt-file  — explicit text file (one prompt per line)
+  2. --coco-json    — local captions_val2017.json with seeded sampling
+  3. default        — eda_output/coco_64_prompts.txt (DEFAULT_PROMPT_FILE)
 
 Saved .npz keys:
   xs              (n_cal, H, W, C)                  noisy latent inputs
@@ -27,6 +23,8 @@ Saved .npz keys:
 
 import argparse
 import gc
+import hashlib
+import re
 import sys
 import time
 from pathlib import Path
@@ -59,6 +57,10 @@ from calibration_config import (
     DEFAULT_LATENT_SIZE,
     DEFAULT_CFG_WEIGHT,
     DEFAULT_PROMPT_FILE,
+    COCO_SEED,
+    COCO_WORD_COUNT_MIN,
+    COCO_WORD_COUNT_MAX,
+    EDA_OUTPUT_DIR,
 )
 from calibration_collector import sample_euler_with_calibration
 
@@ -70,6 +72,116 @@ def load_prompts(path: str) -> list[str]:
     if not prompts:
         raise ValueError(f"No prompts found in {path}")
     return prompts
+
+
+_COCO_ANNOTATIONS_URL = (
+    "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+)
+_COCO_CACHE_DIR = Path(__file__).resolve().parents[2] / ".coco_cache"
+_COCO_JSON_NAME = "captions_val2017.json"
+
+
+def _download_coco_captions() -> list[str]:
+    """
+    Download captions_val2017.json from the official COCO server if not cached,
+    then return all caption strings.
+
+    The zip (~241 MB) is extracted to .coco_cache/ at the repo root and reused
+    on subsequent runs.
+    """
+    import json
+    import urllib.request
+    import zipfile
+
+    _COCO_CACHE_DIR.mkdir(exist_ok=True)
+    json_path = _COCO_CACHE_DIR / _COCO_JSON_NAME
+
+    if not json_path.exists():
+        zip_path = _COCO_CACHE_DIR / "annotations_trainval2017.zip"
+        if not zip_path.exists():
+            print(f"Downloading COCO annotations (~241 MB) from {_COCO_ANNOTATIONS_URL}")
+            print("(This only happens once; cached to .coco_cache/)")
+
+            def _progress(count, block_size, total):
+                done = count * block_size
+                if total > 0:
+                    pct = min(done / total * 100, 100)
+                    print(f"\r  {pct:.1f}%  ({done // 1024 // 1024} MB / {total // 1024 // 1024} MB)",
+                          end="", flush=True)
+
+            urllib.request.urlretrieve(_COCO_ANNOTATIONS_URL, zip_path, reporthook=_progress)
+            print()  # newline after progress
+
+        print(f"Extracting {_COCO_JSON_NAME}...")
+        with zipfile.ZipFile(zip_path) as zf:
+            # File is at annotations/captions_val2017.json inside the zip
+            inner = f"annotations/{_COCO_JSON_NAME}"
+            with zf.open(inner) as src, open(json_path, "wb") as dst:
+                dst.write(src.read())
+        zip_path.unlink()  # remove zip to save space
+        print(f"Cached to {json_path}")
+
+    print(f"Loading COCO captions from {json_path}")
+    with open(json_path) as f:
+        data = json.load(f)
+    return [ann["caption"].strip() for ann in data["annotations"]]
+
+
+def load_coco_prompts(
+    num_samples: int = NUM_CALIBRATION_SAMPLES,
+    seed: int = COCO_SEED,
+    word_min: int = COCO_WORD_COUNT_MIN,
+    word_max: int = COCO_WORD_COUNT_MAX,
+    coco_json: str = None,
+) -> list[str]:
+    """
+    Sample captions from MS-COCO 2017 val set.
+
+    Loading order:
+      1. Local JSON (--coco-json path to captions_val2017.json via pycocotools or json)
+      2. HuggingFace datasets (HuggingFaceM4/COCO, validation split)
+
+    Filters to [word_min, word_max] word count, deduplicates by lowercase hash,
+    then draws num_samples uniformly at random with the given seed.
+    """
+    captions = []
+
+    if coco_json is not None:
+        # Load from local captions_val2017.json
+        import json
+        print(f"Loading COCO captions from {coco_json}")
+        with open(coco_json) as f:
+            data = json.load(f)
+        captions = [ann["caption"].strip() for ann in data["annotations"]]
+    else:
+        captions = _download_coco_captions()
+
+    # Filter by word count
+    def word_count(text):
+        return len(re.findall(r"\S+", text))
+
+    captions = [c for c in captions if word_min <= word_count(c) <= word_max]
+
+    # Deduplicate by lowercase hash
+    seen = set()
+    unique = []
+    for c in captions:
+        key = hashlib.md5(c.lower().strip().encode()).hexdigest()
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+
+    if len(unique) < num_samples:
+        raise ValueError(
+            f"Only {len(unique)} unique COCO captions passed filters "
+            f"(need {num_samples}). Relax word_min/word_max or use a larger split."
+        )
+
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(len(unique), size=num_samples, replace=False)
+    selected = [unique[i] for i in sorted(indices)]
+    print(f"Sampled {len(selected)} COCO captions (seed={seed}, word range=[{word_min},{word_max}])")
+    return selected
 
 
 def encode_all_prompts(pipeline, prompts, cfg_weight):
@@ -138,8 +250,9 @@ def save_calibration_data(
 
 
 def main():
+    default_output = str(Path(EDA_OUTPUT_DIR) / "coco_cali_data.npz")
     parser = argparse.ArgumentParser(
-        description="Phase 1: Generate calibration data for TaQ-DiT on SD3/MMDiT"
+        description="Phase 1 EDA: Generate COCO calibration data for SD3/MMDiT"
     )
     parser.add_argument(
         "--model-version", type=str, default=MODEL_VERSION,
@@ -151,11 +264,11 @@ def main():
     )
     parser.add_argument(
         "--num-sampling-steps", type=int, default=NUM_SAMPLING_STEPS,
-        help="Denoising steps per trajectory",
+        help="Euler steps per trajectory (all are collected; no subsampling)",
     )
     parser.add_argument(
         "--num-selected-steps", type=int, default=NUM_SELECTED_TIMESTEPS,
-        help="Uniformly selected timesteps for calibration set",
+        help="Timesteps to keep (set equal to --num-sampling-steps for full coverage)",
     )
     parser.add_argument(
         "--latent-size", type=int, nargs=2, default=list(DEFAULT_LATENT_SIZE),
@@ -163,19 +276,30 @@ def main():
     )
     parser.add_argument(
         "--cfg-scale", type=float, default=DEFAULT_CFG_WEIGHT,
-        help="Classifier-free guidance scale (paper: 1.5)",
+        help="Classifier-free guidance scale",
     )
+
+    # Prompt source: COCO JSON (preferred) or plain text file fallback
+    prompt_group = parser.add_mutually_exclusive_group()
+    prompt_group.add_argument(
+        "--coco-json", type=str, default=None,
+        help="Path to captions_val2017.json. If omitted, loads from HuggingFace.",
+    )
+    prompt_group.add_argument(
+        "--prompt-file", type=str, default=None,
+        help="Plain text file with prompts (one per line). Bypasses COCO sampling.",
+    )
+
     parser.add_argument(
-        "--prompt-file", type=str, default=DEFAULT_PROMPT_FILE,
-        help="Text file with prompts (one per line). Prompts are cycled "
-             "round-robin across trajectories.",
+        "--coco-seed", type=int, default=COCO_SEED,
+        help="Seed for reproducible COCO caption sampling",
     )
     parser.add_argument(
         "--seed", type=int, default=0,
-        help="Global random seed",
+        help="Global random seed for latent noise",
     )
     parser.add_argument(
-        "--output", "-o", type=str, default="DiT_cali_data.npz",
+        "--output", "-o", type=str, default=default_output,
         help="Output path for calibration .npz",
     )
     parser.add_argument(
@@ -193,9 +317,22 @@ def main():
     latent_size = tuple(args.latent_size)
     assert latent_size[0] % 2 == 0 and latent_size[1] % 2 == 0, "Latent H,W must be even"
 
+    # Ensure output directory exists
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+
     # --- Load prompts ---
-    prompts = load_prompts(args.prompt_file)
-    print(f"Loaded {len(prompts)} prompts from {args.prompt_file}")
+    if args.prompt_file is not None:
+        prompts = load_prompts(args.prompt_file)
+        print(f"Loaded {len(prompts)} prompts from {args.prompt_file}")
+    elif args.coco_json is not None:
+        prompts = load_coco_prompts(
+            num_samples=args.num_fid_samples,
+            seed=args.coco_seed,
+            coco_json=args.coco_json,
+        )
+    else:
+        prompts = load_prompts(DEFAULT_PROMPT_FILE)
+        print(f"Loaded {len(prompts)} prompts from {DEFAULT_PROMPT_FILE}")
 
     # --- Load pipeline ---
     print("Loading SD3 Medium pipeline...")
@@ -264,7 +401,8 @@ def main():
     xs = np.concatenate(all_xs, axis=1)
     ts = np.stack(all_ts, axis=1)
 
-    # --- Paper: uniformly select 25 steps from 100 ---
+    # Select timesteps: with num_sampling_steps==num_selected_steps (both 30),
+    # linspace(0, 29, 30) is the identity — all steps are kept.
     total_steps = xs.shape[0]
     selected_indices = np.linspace(0, total_steps - 1, args.num_selected_steps, dtype=int)
     xs = xs[selected_indices]   # (25, n_samples, H, W, C)
@@ -273,8 +411,8 @@ def main():
     # Flatten (steps, n_samples, ...) -> (n_cal, ...)
     N, S = xs.shape[0], xs.shape[1]
     n_cal = N * S
-    xs = xs.reshape(n_cal, *xs.shape[2:])   # (6400, H, W, C)
-    ts = ts.reshape(n_cal)                   # (6400,)
+    xs = xs.reshape(n_cal, *xs.shape[2:])   # (1700, H, W, C)
+    ts = ts.reshape(n_cal)                   # (1700,)
 
     # Expand per-trajectory prompt indices to per-calibration-point
     # Each trajectory contributes N_selected_steps calibration points
