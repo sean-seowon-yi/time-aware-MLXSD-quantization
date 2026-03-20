@@ -1,0 +1,18 @@
+{
+  "mode": "fp16",
+  "seed": 42,
+  "num_steps": 30,
+  "cfg_weight": 4.0,
+  "latent_size": [
+    64,
+    64
+  ],
+  "num_prompts": 1,
+  "prompts": [
+    "a cat sitting on a red couch"
+  ],
+  "timings_s": [
+    63.78156113624573
+  ],
+  "total_time_s": 63.85
+}

@@ -91,7 +91,7 @@ def collect_adaln_stats(mmdit) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Main collection loop (Euler sampler, no CFG)
+# Main collection loop (Euler sampler, optional CFG)
 # ---------------------------------------------------------------------------
 
 def run_diagnostic_collection(
@@ -101,32 +101,50 @@ def run_diagnostic_collection(
     collector: ChannelStatsCollector,
     num_steps: int | None = None,
     latent_size: tuple[int, int] | None = None,
+    cfg_weight: float | None = None,
 ) -> None:
     """Run the Euler denoising loop for every (prompt, seed) pair, firing
     hooks on every denoising step so the collector accumulates statistics.
+
+    When ``cfg_weight > 0``, classifier-free guidance is applied: the MMDiT
+    receives batch=2 inputs (conditioned + unconditioned) per step, and the
+    outputs are combined via the standard CFG formula before the Euler update.
     """
     num_steps = num_steps or DIAG_CONFIG["num_steps"]
     latent_size = latent_size or tuple(DIAG_CONFIG["latent_size"])
+    cfg_weight = cfg_weight if cfg_weight is not None else DIAG_CONFIG["cfg_weight"]
+    use_cfg = cfg_weight > 0
 
     total_runs = len(prompts) * len(seeds)
     run_idx = 0
 
+    # Cache the original adaLN weights from the in-memory model to avoid
+    # reloading the full checkpoint from disk after every prompt
+    # (DiffusionKit's load_mmdit reads the entire safetensors file each call).
+    from mlx.utils import tree_flatten
+    _adaln_cache = [
+        (k, v) for k, v in tree_flatten(pipeline.mmdit.parameters())
+        if "adaLN" in k
+    ]
+
     for prompt_id, prompt in enumerate(prompts):
         conditioning, pooled_conditioning = pipeline.encode_text(
-            prompt, cfg_weight=0.0,
+            prompt, cfg_weight=cfg_weight,
         )
-        # DiffusionKit's _tokenize always appends an empty-negative-text row,
-        # yielding batch=2 even with cfg_weight=0.  Slice to batch=1 so we
-        # collect only conditioned-path statistics.
-        conditioning = conditioning[:1]
-        pooled_conditioning = pooled_conditioning[:1]
+        if not use_cfg:
+            conditioning = conditioning[:1]
+            pooled_conditioning = pooled_conditioning[:1]
+        conditioning = conditioning.astype(pipeline.activation_dtype)
+        pooled_conditioning = pooled_conditioning.astype(pipeline.activation_dtype)
         mx.eval(conditioning, pooled_conditioning)
+        batch_size = conditioning.shape[0]  # 2 with CFG, 1 without
 
         for seed in seeds:
             run_idx += 1
             t0 = time.time()
             logger.info(
-                "Run %d/%d  prompt=%d  seed=%d", run_idx, total_runs, prompt_id, seed
+                "Run %d/%d  prompt=%d  seed=%d  cfg=%.1f",
+                run_idx, total_runs, prompt_id, seed, cfg_weight,
             )
 
             mx.random.seed(seed)
@@ -157,28 +175,36 @@ def run_diagnostic_collection(
                     seed=seed,
                 )
 
+                if use_cfg:
+                    x_in = mx.concatenate([x] * 2, axis=0)
+                else:
+                    x_in = x
+
                 token_text = mx.expand_dims(conditioning, 2)
-                ts = mx.broadcast_to(timesteps[i], [1])
+                ts = mx.broadcast_to(timesteps[i], [batch_size])
 
                 mmdit_output = mmdit(
-                    latent_image_embeddings=x,
+                    latent_image_embeddings=x_in,
                     token_level_text_embeddings=token_text,
                     timestep=ts,
                 )
 
-                denoised = pipeline.sampler.calculate_denoised(
-                    sigmas[i], mmdit_output, x,
-                )
+                if use_cfg:
+                    eps_pred = pipeline.sampler.calculate_denoised(
+                        sigmas[i], mmdit_output, x_in,
+                    )
+                    eps_cond, eps_uncond = eps_pred.split(2)
+                    denoised = eps_uncond + cfg_weight * (eps_cond - eps_uncond)
+                else:
+                    denoised = pipeline.sampler.calculate_denoised(
+                        sigmas[i], mmdit_output, x,
+                    )
+
                 d = (x - denoised) / sigmas[i]
                 x = x + d * (sigmas[i + 1] - sigmas[i])
                 mx.eval(x)
 
-            # cache_modulation_params offloads adaLN weights to save memory.
-            # Restore them from disk before clearing the cache so the next
-            # call to cache_modulation_params can recompute modulation params.
-            pipeline.mmdit.load_weights(
-                pipeline.load_mmdit(only_modulation_dict=True), strict=False,
-            )
+            pipeline.mmdit.load_weights(_adaln_cache, strict=False)
             pipeline.mmdit.clear_modulation_params_cache()
 
             elapsed = time.time() - t0

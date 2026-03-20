@@ -102,7 +102,7 @@ $$
 b_j = \text{clamp}\left(b_j, \; b_{\min}, \; b_{\max}\right)
 $$
 
-Defaults: $b_{\min} = 10^{-5}$, $b_{\max} = 10^{5}$. Additionally, if $s(W_j) < \epsilon$ (dead weight channel), set $b_j = 1$ (no balancing).
+Defaults: $b_{\min} = 10^{-2}$, $b_{\max} = 10^{2}$. These bounds ensure $b^{-1}$ stays within float16 range (~65,504) even after online scaling. Additionally, if $s(W_j) < \epsilon$ (dead weight channel), set $b_j = 1$ (no balancing).
 
 ---
 
@@ -114,7 +114,7 @@ Phase 2 calibration reuses Phase 1 diagnostic data. No new data collection is re
 
 For each target layer $l$:
 
-1. **Activation trajectory**: Load `diagnostics/activation_stats/{l}.npz` → `act_channel_max` of shape `[T, d_in]` where `T = num_steps` (28 by default). Each entry is the per-channel max activation magnitude at that sigma step, aggregated across all calibration prompts and seeds.
+1. **Activation trajectory**: Load `diagnostics/activation_stats/{l}.npz` → `act_channel_max` of shape `[T, d_in]` where `T = num_steps` (30 by default). Each entry is the per-channel max activation magnitude at that sigma step, aggregated across all calibration prompts and seeds.
 2. **Weight salience**: Load `diagnostics/weight_stats.npz` → `w_channel_max` of shape `[d_in]`. The per-channel max weight magnitude.
 3. **Sigma schedule**: Load `diagnostics/config.json` → `sigma_values` for the sigma-to-step mapping (needed only for reference; SSC operates on the ordered step index).
 

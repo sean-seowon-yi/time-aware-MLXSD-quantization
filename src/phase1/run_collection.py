@@ -32,11 +32,11 @@ def main():
     )
     parser.add_argument(
         "--num-prompts", type=int, default=None,
-        help="Limit number of prompts (default: all 20)",
+        help="Limit number of prompts (default: all 100)",
     )
     parser.add_argument(
         "--num-seeds", type=int, default=None,
-        help="Limit number of seeds (default: 8)",
+        help="Limit number of seeds (default: 1)",
     )
     args = parser.parse_args()
 
@@ -93,26 +93,34 @@ def main():
     hooks = install_hooks(registry, collector)
 
     # --- Run collection ---
+    cfg_weight = DIAG_CONFIG["cfg_weight"]
     t0 = time.time()
     run_diagnostic_collection(
         pipeline, prompts, seeds, collector,
         num_steps=DIAG_CONFIG["num_steps"],
         latent_size=tuple(DIAG_CONFIG["latent_size"]),
+        cfg_weight=cfg_weight,
     )
     elapsed = time.time() - t0
     logger.info("Collection finished in %.1f s", elapsed)
 
     # --- Collect adaLN stats ---
-    # adaLN weights were offloaded during the last denoising run; restore them
-    # so we can re-cache modulation params for analysis.
-    pipeline.mmdit.load_weights(
-        pipeline.load_mmdit(only_modulation_dict=True), strict=False,
-    )
+    # adaLN weights are already restored after run_diagnostic_collection;
+    # capture from memory instead of reloading full checkpoint from disk.
+    from mlx.utils import tree_flatten
+    adaln_cache = [
+        (k, v) for k, v in tree_flatten(pipeline.mmdit.parameters())
+        if "adaLN" in k
+    ]
+    pipeline.mmdit.load_weights(adaln_cache, strict=False)
     conditioning, pooled_conditioning = pipeline.encode_text(
-        DIAGNOSTIC_PROMPTS[0], cfg_weight=0.0,
+        prompts[0], cfg_weight=cfg_weight,
     )
-    conditioning = conditioning[:1]
-    pooled_conditioning = pooled_conditioning[:1]
+    if cfg_weight <= 0:
+        conditioning = conditioning[:1]
+        pooled_conditioning = pooled_conditioning[:1]
+    conditioning = conditioning.astype(pipeline.activation_dtype)
+    pooled_conditioning = pooled_conditioning.astype(pipeline.activation_dtype)
     mx.eval(conditioning, pooled_conditioning)
     sigmas = pipeline.get_sigmas(pipeline.sampler, DIAG_CONFIG["num_steps"])
     timesteps = pipeline.sampler.timestep(sigmas).astype(pipeline.activation_dtype)
