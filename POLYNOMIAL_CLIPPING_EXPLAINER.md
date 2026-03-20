@@ -137,7 +137,15 @@ The polynomial opens up a family of weighting strategies. Here are the options, 
 
 The two polynomial-derived strategies are worth highlighting:
 
-**Trajectory sensitivity (`|dα/dσ|`).** For a degree-2 polynomial `α(σ) = c₀ + c₁σ + c₂σ²`, the derivative is just `c₁ + 2c₂σ` — trivial to compute. This weight is large where the clipping range is changing rapidly with σ, meaning a small error in the polynomial fit or a small shift in the activation distribution causes a large change in α. These are the timesteps where getting the rounding decisions right matters most, because the quantization grid is most sensitive to perturbation. For the 227 static layers (degree 0), dα/dσ = 0 everywhere, so this naturally assigns uniform weight to layers that don't need special attention.
+**Trajectory sensitivity (`|dα/dσ|`).** The derivative-weighted loss is:
+
+$$L = \sum_i \left| \frac{d\alpha}{d\sigma} \bigg|_{\sigma_i} \right| \cdot \| \hat{W} x_i - W x_i \|^2$$
+
+The weight is computed per-layer — each linear projection has its own polynomial, so each layer's optimizer sees a different weighting of the calibration samples. For a degree-2 polynomial `α(σ) = a₀ + a₁σ + a₂σ²`, the derivative is `a₁ + 2a₂σ`, evaluated analytically via `np.polyder(coeffs)`. The weight is large where the clipping range is changing rapidly with σ — these are the timesteps where the quantization grid is most sensitive to perturbation, and where getting rounding decisions right matters most.
+
+**Zero-weight risk.** A natural concern: if a layer has a degree-0 fit (constant α), the derivative is zero everywhere, so all calibration samples get weight 0 and the AdaRound optimizer sees no gradient signal. Those layers would effectively revert to RTN. This isn't inherently wrong — a flat trajectory means the grid is stable across all timesteps, so any rounding decision is equally valid — but it means AdaRound provides no benefit for those layers even if reconstruction error is large.
+
+**Why this is safe with the p100 schedule.** The p100 schedule has no degree-0 layers. All 285 layers have degree ≥ 2 (quadratic or higher), so every layer has a non-zero derivative and contributes to the loss. The p99.9 schedule produced many flat fits because clipped maxima were more stable; the true-maximum trajectories in p100 have enough natural variation that the fitter always finds meaningful curvature.
 
 **Combined perceptual × sensitivity.** Multiply the trajectory derivative by the perceptual weight: `w(σ) = |dα/dσ| / (σ + offset)`. This focuses the optimizer on timesteps that are *both* perceptually important (low σ, fine detail) *and* where the clipping range is fragile (high derivative). A timestep at σ = 0.1 where α is changing fast gets maximum weight; a timestep at σ = 0.9 where α is flat gets minimal weight. This is the strategy most likely to outperform simple perceptual weighting, because it concentrates optimization effort exactly where quantization is both hardest and most consequential.
 
@@ -147,7 +155,9 @@ Both strategies fall directly out of the polynomial representation — a lookup 
 
 ### The Result: Degree Distribution
 
-Of 285 layers in SD3's MM-DiT:
+The degree distribution differs between p99.9 and p100 schedules, because clipped maxima are smoother and easier to fit with low-degree polynomials.
+
+**p99.9 schedule** (polynomial_clipping_schedule_512_p999.json):
 
 | Degree | Count | Fraction |
 |--------|-------|----------|
@@ -155,14 +165,17 @@ Of 285 layers in SD3's MM-DiT:
 | 2 (quadratic) | 57 | 20.0% |
 | 3 (cubic) | 1 | 0.4% |
 
-**80% of layers don't need a polynomial at all** — their activations are stable enough that a single constant works. Only 58 layers (20%) have meaningful temporal drift requiring degree-2 or higher fits. This is both a storage advantage and a validation: most of the network behaves well, and our method surgically targets the layers that don't.
+**80% of layers have flat trajectories under p99.9** — clipping at the 99.9th percentile removes outliers that drive variation, so most layers look stationary. Only 58 layers (20%) have meaningful drift.
 
-### Fit Quality
+**p100 schedule** (polynomial_clipping_schedule_512_p100.json):
 
-For the 57 quadratic fits:
-- **Median R² = 0.944** — the polynomial captures 94.4% of the variance
-- **Mean R² = 0.925**
-- **Minimum R² = 0.711** (worst-case still captures the dominant trend)
+| Degree | Count | Fraction |
+|--------|-------|----------|
+| 2 (quadratic) | 184 | 64.6% |
+| 3 (cubic) | 42 | 14.7% |
+| 4 (quartic) | 59 | 20.7% |
+
+**All 285 layers have degree ≥ 2 under p100.** True-maximum trajectories are noisier (no outlier clipping), so the fitter always finds curvature worth fitting. This has two implications: (1) the p100 schedule is more expressive, and (2) derivative weighting is safe — no layer gets a zero derivative and falls back to RTN.
 
 ---
 
