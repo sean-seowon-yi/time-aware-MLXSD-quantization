@@ -45,30 +45,30 @@
 
 ### 2.1 Salience (PTQ4DiT Eq. 4)
 
-For a linear layer with input activation \(X \in \mathbb{R}^{B \times N \times d_{in}}\) and weight \(W \in \mathbb{R}^{d_{out} \times d_{in}}\):
+For a linear layer with input activation $X \in \mathbb{R}^{B \times N \times d_{in}}$ and weight $W \in \mathbb{R}^{d_{out} \times d_{in}}$:
 
-\[
+$$
 s(X_j^{(\sigma)}) = \max_{b,n} |X_{b,n,j}^{(\sigma)}|, \quad s(W_j) = \max_{i} |W_{i,j}|
-\]
+$$
 
 - Activation salience is **time-dependent**: it varies across the sigma (denoising) trajectory.
 - Weight salience is **time-independent**: weights are fixed.
 
 ### 2.2 SSC: Time-Aware Calibration Weighting (PTQ4DiT Eq. 11)
 
-At each sigma step \(\sigma_t\), compute the Spearman rank correlation \(\rho_t\) between the activation salience vector \(s(X^{(\sigma_t)})\) and the weight salience vector \(s(W)\). Then:
+At each sigma step $\sigma_t$, compute the Spearman rank correlation $\rho_t$ between the activation salience vector $s(X^{(\sigma_t)})$ and the weight salience vector $s(W)$. Then:
 
-\[
+$$
 \eta_t = \frac{\exp(-\rho_t)}{\sum_{\tau} \exp(-\rho_\tau)}
-\]
+$$
 
-Timesteps with **lower** \(\rho\) (stronger complementarity) receive **higher** weight. This is a softmax over \(-\rho\).
+Timesteps with **lower** $\rho$ (stronger complementarity) receive **higher** weight. This is a softmax over $-\rho$.
 
-The SSC-weighted representative activation salience for channel \(j\):
+The SSC-weighted representative activation salience for channel $j$:
 
-\[
+$$
 \bar{s}(X_j) = \sum_t \eta_t \cdot s(X_j^{(\sigma_t)})
-\]
+$$
 
 This replaces the naive time-average with a complementarity-aware average, giving more influence to timesteps where CSB can be most effective.
 
@@ -76,33 +76,33 @@ This replaces the naive time-average with a complementarity-aware average, givin
 
 For each target linear layer, compute a per-channel balancing factor:
 
-\[
+$$
 b_j = \left(\frac{\bar{s}(X_j)}{s(W_j)}\right)^{\alpha}, \quad \alpha \in (0, 1)
-\]
+$$
 
-Default \(\alpha = 0.5\) (geometric mean, from SmoothQuant). The balancing matrix is \(B = \text{diag}(b_1, \dots, b_{d_{in}})\).
+Default $\alpha = 0.5$ (geometric mean, from SmoothQuant). The balancing matrix is $B = \text{diag}(b_1, \dots, b_{d_{in}})$.
 
 The balanced linear operation:
 
-\[
+$$
 Y = X W^T = \underbrace{(X \cdot B^{-1})}_{\text{balanced activation}} \cdot \underbrace{(W \cdot B)^T}_{\text{balanced weight}}
-\]
+$$
 
 In element-wise terms:
-- Balanced activation: \(\tilde{X}_j = X_j / b_j\) — reduces dynamic range of high-salience activation channels.
-- Balanced weight: \(\tilde{W}_{i,j} = W_{i,j} \cdot b_j\) — increases weight magnitude for those channels (which had low weight salience due to complementarity).
+- Balanced activation: $\tilde{X}_j = X_j / b_j$ — reduces dynamic range of high-salience activation channels.
+- Balanced weight: $\tilde{W}_{i,j} = W_{i,j} \cdot b_j$ — increases weight magnitude for those channels (which had low weight salience due to complementarity).
 
-After balancing, both \(\tilde{X}\) and \(\tilde{W}\) have more uniform per-channel dynamic ranges, making uniform quantization significantly more effective.
+After balancing, both $\tilde{X}$ and $\tilde{W}$ have more uniform per-channel dynamic ranges, making uniform quantization significantly more effective.
 
 ### 2.4 Numerical Stability
 
 Clamp balancing factors to avoid extreme values:
 
-\[
+$$
 b_j = \text{clamp}\left(b_j, \; b_{\min}, \; b_{\max}\right)
-\]
+$$
 
-Defaults: \(b_{\min} = 10^{-5}\), \(b_{\max} = 10^{5}\). Additionally, if \(s(W_j) < \epsilon\) (dead weight channel), set \(b_j = 1\) (no balancing).
+Defaults: $b_{\min} = 10^{-5}$, $b_{\max} = 10^{5}$. Additionally, if $s(W_j) < \epsilon$ (dead weight channel), set $b_j = 1$ (no balancing).
 
 ---
 
@@ -112,7 +112,7 @@ Phase 2 calibration reuses Phase 1 diagnostic data. No new data collection is re
 
 ### 3.1 Load Phase 1 Data
 
-For each target layer \(l\):
+For each target layer $l$:
 
 1. **Activation trajectory**: Load `diagnostics/activation_stats/{l}.npz` → `act_channel_max` of shape `[T, d_in]` where `T = num_steps` (28 by default). Each entry is the per-channel max activation magnitude at that sigma step, aggregated across all calibration prompts and seeds.
 2. **Weight salience**: Load `diagnostics/weight_stats.npz` → `w_channel_max` of shape `[d_in]`. The per-channel max weight magnitude.
@@ -120,7 +120,7 @@ For each target layer \(l\):
 
 ### 3.2 Compute SSC Weights
 
-For each layer \(l\):
+For each layer $l$:
 
 ```python
 rho_trajectory = compute_spearman_trajectory(act_trajectory, wt_salience)
@@ -138,7 +138,7 @@ Both functions are already implemented in `src/phase1/analyze.py` and can be dir
 weighted_act_salience = ssc_weights @ act_trajectory  # [T] @ [T, d_in] → [d_in]
 ```
 
-This produces \(\bar{s}(X_j)\) for every channel.
+This produces $\bar{s}(X_j)$ for every channel.
 
 ### 3.4 Compute Balancing Vector
 
@@ -153,7 +153,7 @@ Where `eps = 1e-12`, `alpha = 0.5`, `b_min = 1e-5`, `b_max = 1e5`.
 
 ## 4. CSB for Shared-Input Layers (QKV Projections)
 
-Q, K, and V projections within the same TransformerBlock share the same input tensor (`modulated_pre_attention`), which is the output of `affine_transform(x, shift=β₁, scale=γ₁, norm_module=norm1)`. Since the adaLN absorption modifies the shared input, only **one** balancing vector \(b_{\text{qkv}}\) can be applied to it. However, each projection has its own weight matrix with potentially different weight salience profiles.
+Q, K, and V projections within the same TransformerBlock share the same input tensor (`modulated_pre_attention`), which is the output of `affine_transform(x, shift=β₁, scale=γ₁, norm_module=norm1)`. Since the adaLN absorption modifies the shared input, only **one** balancing vector $b_{\text{qkv}}$ can be applied to it. However, each projection has its own weight matrix with potentially different weight salience profiles.
 
 Two methods are available for computing the shared balancing vector.
 
@@ -161,17 +161,17 @@ Two methods are available for computing the shared balancing vector.
 
 Merge the weight salience across Q, K, V by taking the per-channel maximum:
 
-\[
+$$
 s_{\text{merged}}(W_j) = \max\left(s(W_{q,j}),\; s(W_{k,j}),\; s(W_{v,j})\right)
-\]
+$$
 
 Then compute the shared balancing vector:
 
-\[
+$$
 b_{\text{qkv},j} = \left(\frac{\bar{s}(X_j)}{s_{\text{merged}}(W_j)}\right)^{\alpha}
-\]
+$$
 
-**Rationale.** For each channel \(j\), the projection with the highest weight salience gets the optimal balance. The other two projections receive a slightly conservative balance (their weight channels are scaled up slightly less than their individual optima). This avoids any under-balancing that could cause weight quantization outliers.
+**Rationale.** For each channel $j$, the projection with the highest weight salience gets the optimal balance. The other two projections receive a slightly conservative balance (their weight channels are scaled up slightly less than their individual optima). This avoids any under-balancing that could cause weight quantization outliers.
 
 **When to prefer.** When Q, K, V weight salience profiles differ significantly at specific channels, or when one projection (e.g., q_proj) has much higher weight salience than the others.
 
@@ -179,23 +179,23 @@ b_{\text{qkv},j} = \left(\frac{\bar{s}(X_j)}{s_{\text{merged}}(W_j)}\right)^{\al
 
 Compute each projection's ideal balancing factor, then take the geometric mean:
 
-\[
+$$
 b_{p,j} = \left(\frac{\bar{s}(X_j)}{s(W_{p,j})}\right)^{\alpha} \quad \text{for } p \in \{q, k, v\}
-\]
+$$
 
-\[
+$$
 b_{\text{qkv},j} = \left(b_{q,j} \cdot b_{k,j} \cdot b_{v,j}\right)^{1/3}
-\]
+$$
 
 Equivalently:
 
-\[
+$$
 s_{\text{geomean}}(W_j) = \left(s(W_{q,j}) \cdot s(W_{k,j}) \cdot s(W_{v,j})\right)^{1/3}
-\]
+$$
 
-\[
+$$
 b_{\text{qkv},j} = \left(\frac{\bar{s}(X_j)}{s_{\text{geomean}}(W_j)}\right)^{\alpha}
-\]
+$$
 
 **Rationale.** Distributes the approximation error equally across all three projections rather than optimizing for the most extreme one. If the weight salience profiles are fairly similar across Q, K, V, this yields a tighter overall balance.
 
@@ -205,9 +205,9 @@ b_{\text{qkv},j} = \left(\frac{\bar{s}(X_j)}{s_{\text{geomean}}(W_j)}\right)^{\a
 
 Regardless of which method is used for the shared input balancing vector, each projection's weight is balanced independently:
 
-\[
+$$
 \tilde{W}_p = W_p \cdot \text{diag}(b_{\text{qkv}}) \quad \text{for } p \in \{q, k, v\}
-\]
+$$
 
 In code (MLX, where `W` has shape `[d_out, d_in]`):
 ```python
@@ -215,9 +215,9 @@ W_p_balanced = W_p * b_qkv[None, :]  # broadcast across rows (d_out)
 ```
 
 The balanced operation preserves the original output:
-\[
+$$
 \tilde{X} \cdot \tilde{W}_p^T = (X / b_{\text{qkv}}) \cdot (W_p \cdot b_{\text{qkv}})^T = X \cdot W_p^T
-\]
+$$
 
 The biases of q_proj and v_proj are **unchanged** — bias operates on the output dimension, which is not affected by input-channel balancing.
 
@@ -225,17 +225,17 @@ The biases of q_proj and v_proj are **unchanged** — bias operates on the outpu
 
 ## 5. Re-parameterization (Absorption into adaLN)
 
-The key efficiency of PTQ4DiT is that the \(B^{-1}\) scaling on activations can often be **absorbed** into preceding operations, eliminating runtime overhead. In SD3 Medium, the absorption targets are the `adaLN_modulation` MLP weights.
+The key efficiency of PTQ4DiT is that the $B^{-1}$ scaling on activations can often be **absorbed** into preceding operations, eliminating runtime overhead. In SD3 Medium, the absorption targets are the `adaLN_modulation` MLP weights.
 
 ### 5.1 SD3's adaLN Formulation
 
 DiffusionKit's `affine_transform` applies:
 
-\[
+$$
 Z = \text{LN}(X) \cdot (1 + \gamma) + \beta
-\]
+$$
 
-where \(\gamma\) (scale) and \(\beta\) (shift) are produced by the adaLN MLP. The `(1 + γ)` formulation differs from some DiT implementations that use `γ · LN(X) + β` without the additive 1. This requires a bias correction during absorption (derived below).
+where $\gamma$ (scale) and $\beta$ (shift) are produced by the adaLN MLP. The `(1 + γ)` formulation differs from some DiT implementations that use `γ · LN(X) + β` without the additive 1. This requires a bias correction during absorption (derived below).
 
 ### 5.2 adaLN MLP Structure
 
@@ -256,56 +256,56 @@ The output (9216 = 6 × 1536) is split into 6 chunks along the last dimension:
 | `[6144:7680]` | γ₂ | Pre-FFN scale | fc1 |
 | `[7680:9216]` | α₂ | Post-FFN gate | Applied after fc2 |
 
-Let \(W_{\text{mod}} \in \mathbb{R}^{9216 \times 1536}\) and \(b_{\text{mod}} \in \mathbb{R}^{9216}\) denote the adaLN Linear's weight and bias. Given timestep embedding \(e\) (after SiLU), each parameter chunk is:
+Let $W_{\text{mod}} \in \mathbb{R}^{9216 \times 1536}$ and $b_{\text{mod}} \in \mathbb{R}^{9216}$ denote the adaLN Linear's weight and bias. Given timestep embedding $e$ (after SiLU), each parameter chunk is:
 
-\[
+$$
 \beta_1 = e \cdot W_{\text{mod}}[0\!:\!1536]^T + b_{\text{mod}}[0\!:\!1536]
-\]
+$$
 
 (and similarly for the other chunks).
 
 ### 5.3 Absorption Derivation for q/k/v_proj
 
-We want the adaLN output to produce the balanced activation \(\tilde{Z} = Z / b_{\text{qkv}}\):
+We want the adaLN output to produce the balanced activation $\tilde{Z} = Z / b_{\text{qkv}}$:
 
-\[
+$$
 \tilde{Z}_j = \frac{Z_j}{b_j} = \frac{\text{LN}(X)_j \cdot (1 + \gamma_{1,j}) + \beta_{1,j}}{b_j}
-\]
+$$
 
-This must equal \(\text{LN}(X)_j \cdot (1 + \tilde{\gamma}_{1,j}) + \tilde{\beta}_{1,j}\) for the modified parameters \(\tilde{\gamma}_1, \tilde{\beta}_1\):
+This must equal $\text{LN}(X)_j \cdot (1 + \tilde{\gamma}_{1,j}) + \tilde{\beta}_{1,j}$ for the modified parameters $\tilde{\gamma}_1, \tilde{\beta}_1$:
 
-\[
+$$
 (1 + \tilde{\gamma}_{1,j}) = \frac{1 + \gamma_{1,j}}{b_j}, \qquad \tilde{\beta}_{1,j} = \frac{\beta_{1,j}}{b_j}
-\]
+$$
 
-Solving for \(\tilde{\gamma}_{1,j}\):
+Solving for $\tilde{\gamma}_{1,j}$:
 
-\[
+$$
 \tilde{\gamma}_{1,j} = \frac{1 + \gamma_{1,j}}{b_j} - 1
-\]
+$$
 
-Since \(\gamma_{1,j} = e \cdot W_{\text{mod}}[j']^T + b_{\text{mod}}[j']\) where \(j' = j + 1536\):
+Since $\gamma_{1,j} = e \cdot W_{\text{mod}}[j']^T + b_{\text{mod}}[j']$ where $j' = j + 1536$:
 
-\[
+$$
 \tilde{\gamma}_{1,j} = \frac{1 + e \cdot W_{\text{mod}}[j']^T + b_{\text{mod}}[j']}{b_j} - 1
 = e \cdot \frac{W_{\text{mod}}[j']^T}{b_j} + \frac{1 + b_{\text{mod}}[j']}{b_j} - 1
-\]
+$$
 
 This gives the modified adaLN weight and bias:
 
 **Shift (β₁) — rows `[0:1536]`:**
 
-\[
+$$
 \tilde{W}_{\text{mod}}[j, :] = \frac{W_{\text{mod}}[j, :]}{b_j}, \qquad \tilde{b}_{\text{mod}}[j] = \frac{b_{\text{mod}}[j]}{b_j}
-\]
+$$
 
 **Scale (γ₁) — rows `[1536:3072]`:**
 
-\[
+$$
 \tilde{W}_{\text{mod}}[j', :] = \frac{W_{\text{mod}}[j', :]}{b_j}, \qquad \tilde{b}_{\text{mod}}[j'] = \frac{1 + b_{\text{mod}}[j']}{b_j} - 1
-\]
+$$
 
-where \(j' = j + 1536\) and \(b_j\) is the \(j\)-th element of \(b_{\text{qkv}}\).
+where $j' = j + 1536$ and $b_j$ is the $j$-th element of $b_{\text{qkv}}$.
 
 **Gate (α₁) — rows `[3072:4608]`:** Unchanged. The gate is applied **after** o_proj, not before it:
 ```python
@@ -314,21 +314,21 @@ residual = residual + attention_out * post_attn_scale
 
 ### 5.4 Absorption for fc1
 
-Identical procedure using \(b_{\text{fc1}}\) (the balancing vector for fc1) on the MLP portion of the adaLN output:
+Identical procedure using $b_{\text{fc1}}$ (the balancing vector for fc1) on the MLP portion of the adaLN output:
 
 **Shift (β₂) — rows `[4608:6144]`:**
 
-\[
+$$
 \tilde{W}_{\text{mod}}[j'', :] = \frac{W_{\text{mod}}[j'', :]}{b_{\text{fc1},j}}, \qquad \tilde{b}_{\text{mod}}[j''] = \frac{b_{\text{mod}}[j'']}{b_{\text{fc1},j}}
-\]
+$$
 
 **Scale (γ₂) — rows `[6144:7680]`:**
 
-\[
+$$
 \tilde{W}_{\text{mod}}[j''', :] = \frac{W_{\text{mod}}[j''', :]}{b_{\text{fc1},j}}, \qquad \tilde{b}_{\text{mod}}[j'''] = \frac{1 + b_{\text{mod}}[j''']}{b_{\text{fc1},j}} - 1
-\]
+$$
 
-where \(j'' = j + 4608\), \(j''' = j + 6144\).
+where $j'' = j + 4608$, $j''' = j + 6144$.
 
 **Gate (α₂) — rows `[7680:9216]`:** Unchanged.
 
@@ -344,11 +344,11 @@ Output is split into 2 chunks:
 - `[0:1536]` → shift (β)
 - `[1536:3072]` → scale (γ)
 
-Absorption of \(b_{\text{final}}\) follows the same derivation:
+Absorption of $b_{\text{final}}$ follows the same derivation:
 
-- **Shift rows `[0:1536]`:** weight divided by \(b_j\), bias divided by \(b_j\).
-- **Scale rows `[1536:3072]`:** weight divided by \(b_j\), bias → \((1 + b_{\text{old}}) / b_j - 1\).
-- **Weight:** `final_layer.linear.weight` balanced as \(W_{\text{new}} = W \cdot \text{diag}(b_{\text{final}})\).
+- **Shift rows `[0:1536]`:** weight divided by $b_j$, bias divided by $b_j$.
+- **Scale rows `[1536:3072]`:** weight divided by $b_j$, bias → $(1 + b_{\text{old}}) / b_j - 1$.
+- **Weight:** `final_layer.linear.weight` balanced as $W_{\text{new}} = W \cdot \text{diag}(b_{\text{final}})$.
 
 ### 5.6 Combined adaLN Modification (Implementation)
 
@@ -398,12 +398,12 @@ def absorb_into_adaln(
 
 ## 6. Online Balancing for Post-Nonlinearity Layers
 
-Two layer families cannot absorb \(B^{-1}\) into a preceding operation:
+Two layer families cannot absorb $B^{-1}$ into a preceding operation:
 
 - **o_proj**: input is the per-modality SDPA output slice. The preceding operation (joint SDPA) is not modified.
-- **fc2**: input is `GELU(fc1(x))`. GELU is nonlinear, so \(B^{-1}\) cannot pass through it.
+- **fc2**: input is `GELU(fc1(x))`. GELU is nonlinear, so $B^{-1}$ cannot pass through it.
 
-For these layers, \(B^{-1}\) is applied **online** as an element-wise multiply at inference time. This happens per-modality (image o_proj uses \(b_{\text{o\_proj,img}}^{-1}\), text fc2 uses \(b_{\text{fc2,txt}}^{-1}\), etc.).
+For these layers, $B^{-1}$ is applied **online** as an element-wise multiply at inference time. This happens per-modality (image o_proj uses $b_{\text{o\_proj,img}}^{-1}$, text fc2 uses $b_{\text{fc2,txt}}^{-1}$, etc.).
 
 ### 6.1 Data Flow with Online Balancing
 
@@ -465,15 +465,15 @@ After CSB balancing, quantize the balanced weight matrix to 4-bit using MLX's bu
 
 **Per-group affine quantization (MLX default):**
 
-For a weight matrix \(\tilde{W} \in \mathbb{R}^{d_{out} \times d_{in}}\), partition the \(d_{in}\) dimension into groups of size \(G\) (default 64). For each group \(g\), let \(\alpha_g = \max(\tilde{W}_g)\) and \(\beta_g = \min(\tilde{W}_g)\):
+For a weight matrix $\tilde{W} \in \mathbb{R}^{d_{out} \times d_{in}}$, partition the $d_{in}$ dimension into groups of size $G$ (default 64). For each group $g$, let $\alpha_g = \max(\tilde{W}_g)$ and $\beta_g = \min(\tilde{W}_g)$:
 
-\[
+$$
 \text{scale}_g = \frac{\alpha_g - \beta_g}{2^{b} - 1} = \frac{\alpha_g - \beta_g}{15} \quad \text{(for 4-bit)}
-\]
+$$
 
-\[
+$$
 \tilde{W}_{q,g} = \text{round}\left(\frac{\tilde{W}_g - \beta_g}{\text{scale}_g}\right), \quad \text{clamped to } [0, 15]
-\]
+$$
 
 MLX provides this via:
 
@@ -493,9 +493,9 @@ which internally calls `mx.quantize` and stores the quantized representation. At
 
 Dynamic per-tensor symmetric 8-bit fake quantization applied at runtime:
 
-\[
+$$
 \text{scale} = \frac{\max(|X|)}{127}, \quad X_q = \text{clamp}\left(\text{round}\left(\frac{X}{\text{scale}}\right),\; -128,\; 127\right), \quad \hat{X} = X_q \cdot \text{scale}
-\]
+$$
 
 ```python
 def fake_quantize_a8(x: mx.array) -> mx.array:
@@ -561,7 +561,7 @@ The layer registry from Phase 1 (`src/phase1/registry.py`) already tags each lay
 
 ### 8.2 Per-Block CSB Computation
 
-For each block \(i \in [0, 23]\) and each modality side:
+For each block $i \in [0, 23]$ and each modality side:
 
 1. **Shared activation trajectory**: q/k/v_proj share the same input, so their activation trajectories are identical. Load the activation trajectory from any one of them (e.g., q_proj).
 
@@ -579,7 +579,7 @@ For each block \(i \in [0, 23]\) and each modality side:
 
 For each block, the modification order matters because the adaLN MLP is modified in-place:
 
-1. Compute \(b_{\text{qkv}}\) and \(b_{\text{fc1}}\).
+1. Compute $b_{\text{qkv}}$ and $b_{\text{fc1}}$.
 2. Absorb both into `adaLN_modulation.layers[1]` (the combined function in Section 5.6 handles both simultaneously).
 3. Balance q/k/v_proj weights: `W_p *= b_qkv[None, :]` for each projection.
 4. Balance fc1 weight: `W_fc1 *= b_fc1[None, :]`.
@@ -926,7 +926,7 @@ Non-quantized components (adaLN, embedders, norms, SDPA, text encoders, VAE) rem
 
 Before full evaluation, verify correctness at each stage:
 
-1. **After CSB absorption:** Run FP16 inference on the balanced (but unquantized) model. The output should be **numerically very close** to the original FP16 model (CSB is mathematically exact — the balancing cancels out). Small differences (max absolute error on the order of \(10^{-3}\) for FP16) are expected due to floating-point rounding during weight modification. Larger discrepancies indicate a bug in absorption or weight modification.
+1. **After CSB absorption:** Run FP16 inference on the balanced (but unquantized) model. The output should be **numerically very close** to the original FP16 model (CSB is mathematically exact — the balancing cancels out). Small differences (max absolute error on the order of $10^{-3}$ for FP16) are expected due to floating-point rounding during weight modification. Larger discrepancies indicate a bug in absorption or weight modification.
 2. **After W4 quantization (no A8):** Run inference with 4-bit weights but FP16 activations. Compare output to FP16 baseline.
 3. **After W4A8:** Run full quantized inference. Compare to FP16 baseline.
 
