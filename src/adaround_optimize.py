@@ -981,6 +981,10 @@ def _compute_derivative_weights(
 
     # If all layers are static, return uniform weights
     if mean_deriv.max() == 0.0:
+        # All layers are degree-0 (static polynomial) — derivative is zero everywhere.
+        # Return uniform weights so that when combined with sigma weighting, the result
+        # degrades gracefully to pure perceptual weighting (1/(σ+offset)), which is the
+        # right fallback when there is no timestep-sensitivity signal.
         return np.ones_like(sample_sigmas, dtype=np.float64)
 
     return mean_deriv / mean_deriv.mean()  # Normalize so mean weight = 1.0
