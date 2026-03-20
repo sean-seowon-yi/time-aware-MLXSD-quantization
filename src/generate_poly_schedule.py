@@ -1,7 +1,7 @@
 """
 Generate polynomial clipping schedule for timestep-aware A8 fake quantization.
 
-Fits tiered polynomials to per-layer p999 activation trajectories across σ steps,
+Fits tiered polynomials to per-layer p100 (absmax) activation trajectories across σ steps,
 outputting a compact JSON schedule that replaces static per-timestep scale lookups
 with continuous polynomial evaluation.
 
@@ -23,7 +23,97 @@ from pathlib import Path
 
 import numpy as np
 
-from src.explore_curve_fits import load_percentile_trajectories, poly_r2
+
+# ---------------------------------------------------------------------------
+# Helpers (inlined from deleted explore_curve_fits.py)
+# ---------------------------------------------------------------------------
+
+def poly_r2(x, y, deg):
+    """Fit polynomial of given degree, return (r2, coeffs)."""
+    coeffs = np.polyfit(x, y, deg)
+    y_pred = np.polyval(coeffs, x)
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    return r2, coeffs
+
+
+def _load_step(ts_dir: Path, step: str):
+    p = ts_dir / f"step_{step}.npz"
+    return np.load(p, allow_pickle=True) if p.exists() else None
+
+
+def _absmax_from_step(data, layer_raw: str) -> float:
+    mx = data.get(f"{layer_raw}__avg_max")
+    mn = data.get(f"{layer_raw}__avg_min")
+    if mx is None or mn is None:
+        return np.nan
+    return float(np.maximum(np.abs(mx), np.abs(mn)).mean())
+
+
+def load_percentile_trajectories(activations_dir: Path):
+    """Return dict of percentile -> {layer_raw -> (sigmas, values)}.
+
+    Loads p100_absmax, p999, p99 from each step's index JSON,
+    building per-layer trajectories at each percentile level.
+    Also returns a 'mean_absmax' trajectory (from avg_min/avg_max arrays).
+    """
+    meta_path = activations_dir / "layer_statistics.json"
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    ts_dir = activations_dir / "timestep_stats"
+    step_keys = sorted(meta["step_keys"], key=int)
+    sigma_map = {k: float(v) for k, v in meta["sigma_map"].items()}
+    sigmas = np.array([sigma_map[s] for s in step_keys])
+
+    step_indices = {}
+    step_npz = {}
+    for s in step_keys:
+        idx_path = ts_dir / f"step_{s}_index.json"
+        with open(idx_path) as f:
+            step_indices[s] = json.load(f)
+        step_npz[s] = _load_step(ts_dir, s)  # may be None if no .npz
+
+    all_layers_dot = sorted(step_indices[step_keys[0]].keys())
+
+    percentile_trajs = {}
+
+    for pname, field in [("p100_absmax", "tensor_absmax"),
+                          ("p999", "hist_p999"),
+                          ("p99", "hist_p99")]:
+        trajs = {}
+        for layer_dot in all_layers_dot:
+            vals = []
+            for s in step_keys:
+                info = step_indices[s].get(layer_dot, {})
+                v = info.get(field)
+                if v is not None:
+                    vals.append(abs(float(v)))
+                else:
+                    vals.append(np.nan)
+            vals = np.array(vals)
+            mask = ~np.isnan(vals)
+            if mask.sum() > 3:
+                layer_raw = layer_dot.replace(".", "_")
+                trajs[layer_raw] = (sigmas[mask], vals[mask])
+        percentile_trajs[pname] = trajs
+
+    # mean_absmax from per-channel npz arrays (optional, may not exist)
+    trajs = {}
+    for layer_dot in all_layers_dot:
+        layer_raw = layer_dot.replace(".", "_")
+        vals = np.array([
+            _absmax_from_step(step_npz[s], layer_raw)
+            if step_npz[s] is not None else np.nan
+            for s in step_keys
+        ])
+        mask = ~np.isnan(vals)
+        if mask.sum() > 3:
+            trajs[layer_raw] = (sigmas[mask], vals[mask])
+    percentile_trajs["mean_absmax"] = trajs
+
+    return percentile_trajs, sigmas
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +256,7 @@ def load_shift_trajectories(activations_dir: Path):
 # Main
 # ---------------------------------------------------------------------------
 
-def generate_schedule(activations_dir: Path, percentile: str = "p999",
+def generate_schedule(activations_dir: Path, percentile: str = "p100_absmax",
                       include_shifts: bool = False):
     """Generate polynomial clipping schedule from activation trajectories.
 
@@ -272,7 +362,7 @@ def main():
                         default=Path("calibration_data_100/activations"))
     parser.add_argument("--output", type=Path,
                         default=Path("polynomial_clipping_schedule.json"))
-    parser.add_argument("--percentile", default="p999",
+    parser.add_argument("--percentile", default="p100_absmax",
                         choices=["p99", "p999", "mean_absmax", "p100_absmax"])
     parser.add_argument("--include-shifts", action="store_true",
                         help="Fit shift (center) trajectories for asymmetric activation quant")

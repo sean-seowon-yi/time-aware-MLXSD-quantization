@@ -87,9 +87,9 @@ def remove_linear_hooks(pipeline, hooks):
 # ---------------------------------------------------------------------------
 
 def collect_step_stats(hooks):
-    """Batch-eval pending arrays, compute p99.9 per layer, clear hooks.
+    """Batch-eval pending arrays, compute p100 absmax per layer, clear hooks.
 
-    Returns dict: layer_key -> float p999 value.
+    Returns dict: layer_key -> float absmax value.
     """
     pending = [h._last_output for h, _, _ in hooks.values()
                if h._last_output is not None and isinstance(h._last_output, mx.array)]
@@ -100,7 +100,7 @@ def collect_step_stats(hooks):
     for key, (hook, _, _) in hooks.items():
         if hook._last_output is not None:
             arr = np.abs(np.array(hook._last_output))
-            stats[key] = float(np.percentile(arr.ravel(), 99.9))
+            stats[key] = float(arr.max())
         hook.clear()
     return stats
 
@@ -162,16 +162,16 @@ def _reset_modulation_cache(pipeline):
 
 
 def collect_group(pipeline, prompts, num_steps, latent_size=64):
-    """Run all prompts in the group; aggregate per-step p999 stats.
+    """Run all prompts in the group; aggregate per-step absmax stats.
 
-    Returns (trajs dict: layer_key -> (sigmas_array, p999_means_array), all_sigmas).
+    Returns (trajs dict: layer_key -> (sigmas_array, absmax_means_array), all_sigmas).
     """
     from diffusionkit.mlx import CFGDenoiser
 
     hooks = install_linear_hooks(pipeline)
     denoiser = CFGDenoiser(pipeline)
 
-    # acc[step_idx][layer_key] = list of per-prompt p999 values
+    # acc[step_idx][layer_key] = list of per-prompt absmax values
     acc = defaultdict(lambda: defaultdict(list))
     all_sigmas = None
 
@@ -229,7 +229,7 @@ def build_schedule(trajs, sigmas):
         }
     return {
         "version": "poly_v1",
-        "percentile": "p999",
+        "percentile": "p100_absmax",
         "sigma_range": [float(sigmas.min()), float(sigmas.max())],
         "layers": layers,
     }
@@ -372,7 +372,7 @@ def plot_curve_overlays(named_schedules, sigmas, output_path):
                     label=label, linewidth=1.5)
         ax.set_title(f"{st}\n{layer}", fontsize=7)
         ax.set_xlabel("σ", fontsize=8)
-        ax.set_ylabel("p99.9 activation", fontsize=8)
+        ax.set_ylabel("absmax activation", fontsize=8)
         ax.legend(fontsize=6)
         ax.grid(True, linestyle="--", alpha=0.4)
 
@@ -427,7 +427,7 @@ def plot_high_nrmse_layers(summary, named_schedules, sigmas, output_path, top_n=
                     label=label, linewidth=1.5)
         ax.set_title(f"{layer}\nmax nRMSE={worst[layer]*100:.1f}%", fontsize=7)
         ax.set_xlabel("σ", fontsize=8)
-        ax.set_ylabel("p99.9", fontsize=8)
+        ax.set_ylabel("absmax", fontsize=8)
         ax.legend(fontsize=6)
         ax.grid(True, linestyle="--", alpha=0.4)
 

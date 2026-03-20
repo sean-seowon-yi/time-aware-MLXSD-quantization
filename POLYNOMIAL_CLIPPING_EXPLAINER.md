@@ -97,7 +97,7 @@ Instead of storing a clipping range `α` for every layer at every timestep, we f
 
 ### The Technical Details
 
-**Data collection.** We collect the p99.9 percentile of activation magnitudes for each of the 285 layers at each of the 25 `σ` steps, averaged across 30 calibration images. This gives us 285 trajectories, each with 25 data points.
+**Data collection.** We collect the p100 (absmax) of activation magnitudes for each of the 285 layers at each of the 25 `σ` steps, averaged across 30 calibration images. This gives us 285 trajectories, each with 25 data points.
 
 **Tiered degree selection.** Not every layer needs a polynomial — many are nearly constant. We use a tiered fitting strategy:
 
@@ -268,30 +268,17 @@ Standard AdaRound optimizes against one activation distribution. If that distrib
 
 The σ-weighted loss goes further: since quantization errors at low σ (near-clean images) are more perceptually damaging than errors at high σ (mostly noise), we weight the loss by `1/(σ + 1)` or with other weighting schemes so the optimizer prioritizes getting the fine-detail timesteps right. The result is rounding decisions that are jointly optimized for correct clipping *and* perceptual quality — not just minimal reconstruction error at an arbitrary calibration point.
 
-### Choosing the clipping percentile: p99.9 vs p99.99 vs p100
+### Why p100 (absmax) for the clipping percentile
 
-When fitting the polynomial (or building the LUT), you need to decide what statistic to use for `α` at each `(layer, σ)` data point. The three main options:
+When fitting the polynomial, the statistic used for `α` at each `(layer, σ)` data point is the **p100 absmax** — the true maximum activation magnitude. This means zero clipping: every activation value fits within the quantization range `[-α, +α]`.
 
-| Percentile | What it clips | Effect on α |
-|------------|---------------|-------------|
-| **p99.9** | Top 0.1% of activation magnitudes | Tighter α — better grid resolution for 99.9% of values |
-| **p99.99** | Top 0.01% | Slightly wider — clips only extreme outliers |
-| **p100** (absmax) | Nothing — true maximum | Widest α — zero clipping, coarser grid |
+The cost is a slightly coarser quantization grid (wider α → larger step size), but the benefit is critical for weight optimization:
 
-The intuition behind p99.9 is sound for static quantization: clip a small tail of outliers to recover precision for the bulk of the distribution. For inference-only activation quantization, this tradeoff is straightforward.
+**The problem with sub-p100 percentiles during weight optimization.** When p99.9 was used, weight rounding decisions were optimized against clipped activation distributions. The rounding decisions became tuned for a distribution the model never sees at inference with wider clipping or FP16 activations. In practice, weights trained with p99.9 clipping produced **worse image quality than round-to-nearest (RTN)** — completely degraded images. The optimizer had contorted rounding decisions to compensate for clipping error it couldn't fix.
 
-**The problem with p99.9 during AdaRound training.** AdaRound optimizes weight rounding decisions to minimize reconstruction error while fake-quantizing activations with clipping range α. If p99.9 clips too aggressively, the activation distribution the optimizer sees during training is different from the distribution seen at inference. The rounding decisions become tuned for clipped activations — and can be actively wrong when the model runs with wider clipping or full FP16 activations.
+**p100 eliminates this failure mode.** With the true maximum as α, the reconstruction loss during GPTQ Hessian collection or any weight optimization reflects only weight quantization error — no confounding clipping artifacts. The rounding decisions are correct under all inference conditions.
 
-In practice, we found that AdaRound weights trained with p99.9 activation clipping produced **worse image quality than round-to-nearest (RTN) weights** when tested with FP16 activations — completely degraded images (solid brown/fur texture, no scene structure). RTN, which has no activation coupling, at least produces partial scene structure. The AdaRound optimizer had so thoroughly tuned the rounding decisions for the clipped activation distribution that the weights were useless under any other conditions.
-
-**p100 is the correct choice for AdaRound training.** By using the true maximum as α, clipping error is zero by construction — every activation value fits within the range. The reconstruction loss the optimizer sees is purely due to weight rounding, which is exactly what AdaRound should be optimizing. There is no confounding clipping error, no coupling between training and inference conditions.
-
-The cost of p100 is a slightly coarser quantization grid (wider α means larger step size), but this is a clean tradeoff: you trade a small amount of per-sample precision for rounding decisions that are correct under all inference conditions.
-
-**For inference-only activation quantization** (not paired with AdaRound training), p99.9 or p99.99 may give better image quality than p100 because the precision benefit outweighs the clipping cost. The key distinction is whether activation quantization is coupled to weight optimization:
-
-- **AdaRound training**: use p100 — eliminates clipping error from the optimization signal
-- **Inference-only A8**: p99.9 or p99.99 may give better precision, worth tuning
+**Note:** For future inference-only A8 quantization (no weight optimization coupling), p99.9 may recover precision by tightening α. This is a separate concern from the schedule used during weight quantization.
 
 ### Overhead
 The schedule is 402 coefficients for 285 layers. At each denoising step, evaluating a degree-2 polynomial is 2 multiplies and 2 adds per layer — negligible next to the matrix multiplications in the transformer.
@@ -344,7 +331,7 @@ These are exactly the 4 layers that currently require W8 or FP16 fallback becaus
 center(σ) = (tensor_max + tensor_min) / 2    → shift polynomial
 α(σ)      = (tensor_max - tensor_min) / 2    → scale polynomial
 ```
-or equivalently, fit α to the p99.9 of the recentered distribution `|x - center|`.
+or equivalently, fit α to the absmax of the recentered distribution `|x - center|`.
 
 **What would need to be implemented**
 
@@ -362,7 +349,7 @@ What is not yet done:
 
 1. **Inference-time shift application.** The quantized model weights are stored and loaded without any asymmetric zero-point correction. To deploy asymmetric quantization, the INT8 kernel must apply the per-layer zero-point at every forward pass. If the runtime only supports symmetric INT8, the shift can instead be folded into a bias correction on the preceding layer's output — but this requires non-trivial model surgery.
 
-2. **Calibration of α for the recentered distribution.** Currently `generate_poly_schedule` fits p99.9 of raw activation magnitudes (distance from zero). For asymmetric quantization, the scale polynomial should describe spread around the center, not distance from zero. The recentered data is available in the calibration files but the fitting pipeline needs a pass that subtracts `center(σ)` before computing percentiles.
+2. **Calibration of α for the recentered distribution.** Currently `generate_poly_schedule` fits absmax of raw activation magnitudes (distance from zero). For asymmetric quantization, the scale polynomial should describe spread around the center, not distance from zero. The recentered data is available in the calibration files but the fitting pipeline needs a pass that subtracts `center(σ)` before computing absmax.
 
 3. **Verification that the 4 extreme layers are actually recoverable at W4.** The shift magnitudes (60–254) suggest asymmetric INT8 would help dramatically. W4 recovery is less certain — it depends on whether the spread after recentering is small enough for 4-bit resolution. This requires a calibration run with `--include-shifts` followed by an AdaRound optimization pass using the asymmetric fake-quant path on those layers.
 

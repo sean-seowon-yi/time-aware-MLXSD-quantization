@@ -20,7 +20,7 @@ MODEL_VERSION = "argmaxinc/mlx-stable-diffusion-3-medium"
 DEFAULT_LATENT_SIZE = (32, 32)
 
 # CFG scale for calibration (paper: 1.50)
-DEFAULT_CFG_WEIGHT = 1.5
+DEFAULT_CFG_WEIGHT = 4
 
 # Default prompt file (shipped alongside this module)
 DEFAULT_PROMPT_FILE = str(Path(__file__).resolve().parent / "sample_prompts.txt")
