@@ -981,7 +981,7 @@ def generate_images(
                 print(f"  [resume] skipping {img_idx:04d}.png")
             continue
 
-        seed = seed_base
+        seed = seed_base + img_idx
         reset_metal_peak_memory()
 
         t0 = time.time()
