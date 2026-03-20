@@ -2022,6 +2022,10 @@ def main() -> None:
     else:
         all_metrics_by_name = {}
 
+    # Total iters = prior iters + current iters (refine accumulates)
+    prior_iters = prev_config.get("iters", 0) if (args.resume or args.refine) and config_path.exists() else 0
+    total_iters = (prior_iters + args.iters) if args.refine else args.iters
+
     n_total = len(block_names)
     n_skipped_converged = 0
     for block_idx, block_name in enumerate(block_names, 1):
@@ -2157,7 +2161,7 @@ def main() -> None:
             "model_version": "argmaxinc/mlx-stable-diffusion-3-medium",
             "bits_w": args.bits_w,
             "bits_a": args.bits_a,
-            "iters": args.iters,
+            "iters": total_iters,
             "batch_size": args.batch_size,
             "grad_accum": args.grad_accum,
             "w_lr": args.w_lr,
@@ -2193,7 +2197,7 @@ def main() -> None:
         "model_version": "argmaxinc/mlx-stable-diffusion-3-medium",
         "bits_w": args.bits_w,
         "bits_a": args.bits_a,
-        "iters": args.iters,
+        "iters": total_iters,
         "batch_size": args.batch_size,
         "grad_accum": args.grad_accum,
         "w_lr": args.w_lr,
