@@ -8,13 +8,13 @@
 
 | Family | Shape (out, in) | Count | Notes |
 |---|---|---|---|
-| q_proj | (1536, 1536) | 48 | 24 blocks × img + txt. Has bias. |
-| k_proj | (1536, 1536) | 48 | No bias. |
-| v_proj | (1536, 1536) | 48 | Has bias. |
-| o_proj | (1536, 1536) | 47 | Block 23 txt is Identity (skipped). |
-| fc1 | (6144, 1536) | 47 | Block 23 txt has no FFN. |
-| fc2 | (1536, 6144) | 47 | Block 23 txt has no FFN. |
-| final_layer.linear | (64, 1536) | 1 | Patch unprojection. |
+| `q_proj` | (1536, 1536) | 48 | 24 blocks × img + txt. Has bias. |
+| `k_proj` | (1536, 1536) | 48 | No bias. |
+| `v_proj` | (1536, 1536) | 48 | Has bias. |
+| `o_proj` | (1536, 1536) | 47 | Block 23 txt is Identity (skipped). |
+| `fc1` | (6144, 1536) | 47 | Block 23 txt has no FFN. |
+| `fc2` | (1536, 6144) | 47 | Block 23 txt has no FFN. |
+| `final_layer.linear` | (64, 1536) | 1 | Patch unprojection. |
 | **Total** | | **286** | |
 
 **Excluded from quantization (kept FP16):**
@@ -173,7 +173,7 @@ $$
 
 **Rationale.** For each channel $j$, the projection with the highest weight salience gets the optimal balance. The other two projections receive a slightly conservative balance (their weight channels are scaled up slightly less than their individual optima). This avoids any under-balancing that could cause weight quantization outliers.
 
-**When to prefer.** When Q, K, V weight salience profiles differ significantly at specific channels, or when one projection (e.g., q_proj) has much higher weight salience than the others.
+**When to prefer.** When Q, K, V weight salience profiles differ significantly at specific channels, or when one projection (e.g., `q_proj`) has much higher weight salience than the others.
 
 ### 4.2 Method 2 — Balanced (Geometric Mean Weight Salience)
 
@@ -219,7 +219,7 @@ $$
 \tilde{X} \cdot \tilde{W}_p^T = (X / b_{\text{qkv}}) \cdot (W_p \cdot b_{\text{qkv}})^T = X \cdot W_p^T
 $$
 
-The biases of q_proj and v_proj are **unchanged** — bias operates on the output dimension, which is not affected by input-channel balancing.
+The biases of `q_proj` and `v_proj` are **unchanged** — bias operates on the output dimension, which is not affected by input-channel balancing.
 
 ---
 
@@ -249,9 +249,9 @@ The output (9216 = 6 × 1536) is split into 6 chunks along the last dimension:
 
 | Index range | Symbol | Role | Downstream layer |
 |---|---|---|---|
-| `[0:1536]` | β₁ | Pre-attention shift | q/k/v_proj |
-| `[1536:3072]` | γ₁ | Pre-attention scale | q/k/v_proj |
-| `[3072:4608]` | α₁ | Post-attention gate | Applied after o_proj |
+| `[0:1536]` | β₁ | Pre-attention shift | `q/k/v_proj` |
+| `[1536:3072]` | γ₁ | Pre-attention scale | `q/k/v_proj` |
+| `[3072:4608]` | α₁ | Post-attention gate | Applied after `o_proj` |
 | `[4608:6144]` | β₂ | Pre-FFN shift | fc1 |
 | `[6144:7680]` | γ₂ | Pre-FFN scale | fc1 |
 | `[7680:9216]` | α₂ | Post-FFN gate | Applied after fc2 |
@@ -264,7 +264,7 @@ $$
 
 (and similarly for the other chunks).
 
-### 5.3 Absorption Derivation for q/k/v_proj
+### 5.3 Absorption Derivation for q/k/v\_proj
 
 We want the adaLN output to produce the balanced activation $\tilde{Z} = Z / b_{\text{qkv}}$:
 
@@ -332,7 +332,7 @@ where $j'' = j + 4608$, $j''' = j + 6144$.
 
 **Gate (α₂) — rows `[7680:9216]`:** Unchanged.
 
-### 5.5 Absorption for final_layer.linear
+### 5.5 Absorption for final\_layer.linear
 
 The FinalLayer's adaLN is:
 
@@ -400,14 +400,14 @@ def absorb_into_adaln(
 
 Two layer families cannot absorb $B^{-1}$ into a preceding operation:
 
-- **o_proj**: input is the per-modality SDPA output slice. The preceding operation (joint SDPA) is not modified.
-- **fc2**: input is `GELU(fc1(x))`. GELU is nonlinear, so $B^{-1}$ cannot pass through it.
+- **`o_proj`**: input is the per-modality SDPA output slice. The preceding operation (joint SDPA) is not modified.
+- **`fc2`**: input is `GELU(fc1(x))`. GELU is nonlinear, so $B^{-1}$ cannot pass through it.
 
-For these layers, $B^{-1}$ is applied **online** as an element-wise multiply at inference time. This happens per-modality (image o_proj uses $b_{\text{o\_proj,img}}^{-1}$, text fc2 uses $b_{\text{fc2,txt}}^{-1}$, etc.).
+For these layers, $B^{-1}$ is applied **online** as an element-wise multiply at inference time. This happens per-modality (image `o_proj` uses $b_{\text{o\_proj,img}}^{-1}$, text `fc2` uses $b_{\text{fc2,txt}}^{-1}$, etc.).
 
 ### 6.1 Data Flow with Online Balancing
 
-**For o_proj** (referencing the architecture in `useful_doc/model.txt`):
+**For `o_proj`** (referencing the architecture in `useful_doc/model.txt`):
 
 ```
 Joint SDPA output → split into img/txt slices
@@ -447,12 +447,12 @@ The online multiply is an element-wise operation:
 
 | Layer | Online multiply cost | Matmul cost | Ratio |
 |---|---|---|---|
-| o_proj | O(B·N·1536) | O(B·N·1536²) | 1/1536 ≈ 0.07% |
-| fc2 | O(B·N·6144) | O(B·N·6144·1536) | 1/1536 ≈ 0.07% |
+| `o_proj` | O(B·N·1536) | O(B·N·1536²) | 1/1536 ≈ 0.07% |
+| `fc2` | O(B·N·6144) | O(B·N·6144·1536) | 1/1536 ≈ 0.07% |
 
 Memory: one `float32` vector per layer (stored as float32 to avoid float16 overflow on `1/b` values near 100).
-- o_proj: 1536 × 4 bytes = 6 KB per layer, × 47 layers = 282 KB
-- fc2: 6144 × 4 bytes = 24 KB per layer, × 47 layers = 1.1 MB
+- `o_proj`: 1536 × 4 bytes = 6 KB per layer, × 47 layers = 282 KB
+- `fc2`: 6144 × 4 bytes = 24 KB per layer, × 47 layers = 1.1 MB
 - **Total: ~1.4 MB** — negligible.
 
 ---
@@ -544,9 +544,9 @@ class W4A8Linear(nn.Module):
 
 **Precision note:** `b_inv` is stored as `mx.float32` because values near `1/b_min = 100` are within float16 range (~65504) but float32 provides a safety margin. The `(x * self.b_inv)` multiplication temporarily promotes to float32, and `.astype(orig_dtype)` casts the result back to fp16 to avoid dtype drift through the network.
 
-For **post-adaLN layers** (q/k/v_proj, fc1, final_layer.linear): `b_inv` is not set (the attribute does not exist) because the balancing is already absorbed into the adaLN parameters.
+For **post-adaLN layers** (`q/k/v_proj`, `fc1`, `final_layer.linear`): `b_inv` is not set (the attribute does not exist) because the balancing is already absorbed into the adaLN parameters.
 
-For **post-nonlinearity layers** (o_proj, fc2): `b_inv = mx.array(1.0 / b_vector, dtype=mx.float32)` stored as a model parameter.
+For **post-nonlinearity layers** (`o_proj`, `fc2`): `b_inv = mx.array(1.0 / b_vector, dtype=mx.float32)` stored as a model parameter.
 
 ---
 
@@ -568,17 +568,17 @@ The layer registry from Phase 1 (`src/phase1/registry.py`) already tags each lay
 
 For each block $i \in [0, 23]$ and each modality side:
 
-1. **Shared activation trajectory**: q/k/v_proj share the same input, so their activation trajectories are identical. Load the activation trajectory from any one of them (e.g., q_proj).
+1. **Shared activation trajectory**: `q/k/v_proj` share the same input, so their activation trajectories are identical. Load the activation trajectory from any one of them (e.g., `q_proj`).
 
-2. **SSC weights**: Although the activation trajectory is shared across q/k/v, the Spearman ρ trajectory **differs** for each projection because ρ is computed between the activation salience vector and the weight salience vector, and each projection has a different weight matrix. Two options: (a) use q_proj's ρ trajectory as the representative (simplest), or (b) compute ρ for each projection separately and average the resulting SSC weights to better account for the different weight salience profiles.
+2. **SSC weights**: Although the activation trajectory is shared across q/k/v, the Spearman ρ trajectory **differs** for each projection because ρ is computed between the activation salience vector and the weight salience vector, and each projection has a different weight matrix. Two options: (a) use `q_proj`'s ρ trajectory as the representative (simplest), or (b) compute ρ for each projection separately and average the resulting SSC weights to better account for the different weight salience profiles.
 
 3. **QKV balancing vector**: Apply Method 1 (Max) or Method 2 (Geometric Mean) from Section 4.
 
 4. **fc1 balancing vector**: Compute independently using fc1's own activation trajectory and weight salience.
 
-5. **o_proj balancing vector**: Compute independently using o_proj's activation trajectory (SDPA output slice) and weight salience.
+5. **`o_proj` balancing vector**: Compute independently using `o_proj`'s activation trajectory (SDPA output slice) and weight salience.
 
-6. **fc2 balancing vector**: Compute independently using fc2's activation trajectory (post-GELU) and weight salience.
+6. **`fc2` balancing vector**: Compute independently using `fc2`'s activation trajectory (post-GELU) and weight salience.
 
 ### 8.3 Absorption and Weight Modification Order
 
@@ -586,10 +586,10 @@ For each block, the modification order matters because the adaLN MLP is modified
 
 1. Compute $b_{\text{qkv}}$ and $b_{\text{fc1}}$.
 2. Absorb both into `adaLN_modulation.layers[1]` (the combined function in Section 5.6 handles both simultaneously).
-3. Balance q/k/v_proj weights: `W_p *= b_qkv[None, :]` for each projection.
-4. Balance fc1 weight: `W_fc1 *= b_fc1[None, :]`.
-5. Balance o_proj weight: `W_o *= b_o[None, :]`.
-6. Balance fc2 weight: `W_fc2 *= b_fc2[None, :]`.
+3. Balance `q/k/v_proj` weights: `W_p *= b_qkv[None, :]` for each projection.
+4. Balance `fc1` weight: `W_fc1 *= b_fc1[None, :]`.
+5. Balance `o_proj` weight: `W_o *= b_o[None, :]`.
+6. Balance `fc2` weight: `W_fc2 *= b_fc2[None, :]`.
 7. Store `b_o_inv` and `b_fc2_inv` for online application.
 
 After all balancing is applied, quantize all 286 layers to W4.
@@ -598,7 +598,7 @@ After all balancing is applied, quantize all 286 layers to W4.
 
 ## 9. Special Layer Handling
 
-### 9.1 final_layer.linear
+### 9.1 final\_layer.linear
 
 Phase 1 findings: risk score 0.410 (rank 5/287), ρ = 0.673 (high — CSB less effective), CoV = 0.397 (highest — extreme temporal variation), early-late Jaccard = 0.103 (near-complete top-k turnover).
 
@@ -636,7 +636,7 @@ The adaLN has `num_modulation_params = 2` (only β₁, γ₁ — no gate, no MLP
 
 Absorption uses only `b_qkv` (no fc1 absorption needed).
 
-### 9.5 context_embedder
+### 9.5 context\_embedder
 
 Excluded from quantization as stated in Section 1. Kept at FP16. If future work includes it:
 - Strong anti-correlation (ρ = −0.34) → CSB very effective.
@@ -1025,12 +1025,12 @@ python -m src.phase2.run_diagnose --analysis-only --output-dir post_quant_diagno
 
 | Component | FP16 size | W4 size | Savings |
 |---|---|---|---|
-| q/k/v_proj (144 layers) | 144 × 1536² × 2B = 679 MB | 144 × 1536² × 0.5B = 170 MB | 75% |
-| o_proj (47 layers) | 47 × 1536² × 2B = 222 MB | 47 × 1536² × 0.5B = 55 MB | 75% |
-| fc1 (47 layers) | 47 × 6144 × 1536 × 2B = 887 MB | 222 MB | 75% |
-| fc2 (47 layers) | 47 × 1536 × 6144 × 2B = 887 MB | 222 MB | 75% |
-| final_layer.linear | 64 × 1536 × 2B = 192 KB | 48 KB | 75% |
-| Online b_inv vectors | — | ~1.4 MB | — |
+| `q/k/v_proj` (144 layers) | 144 × 1536² × 2B = 679 MB | 144 × 1536² × 0.5B = 170 MB | 75% |
+| `o_proj` (47 layers) | 47 × 1536² × 2B = 222 MB | 47 × 1536² × 0.5B = 55 MB | 75% |
+| `fc1` (47 layers) | 47 × 6144 × 1536 × 2B = 887 MB | 222 MB | 75% |
+| `fc2` (47 layers) | 47 × 1536 × 6144 × 2B = 887 MB | 222 MB | 75% |
+| `final_layer.linear` | 64 × 1536 × 2B = 192 KB | 48 KB | 75% |
+| Online `b_inv` vectors | — | ~1.4 MB | — |
 | **Total quantized layers** | **~2.67 GB** | **~0.67 GB** | **~2 GB saved** |
 
 Non-quantized components (adaLN, embedders, norms, SDPA, text encoders, VAE) remain at FP16 and are unchanged.

@@ -53,7 +53,7 @@ PTQ4DiT was designed and validated exclusively on class-conditional DiT-XL/2. Be
 Each difference above maps to a concrete risk for the PTQ4DiT method:
 
 **1. Joint attention mixes modality statistics.**
-In DiT-XL/2, the Q/K/V projections and the o_proj all operate on a single stream of image tokens. The activation statistics for any given layer come from one modality.
+In DiT-XL/2, the Q/K/V projections and the `o_proj` all operate on a single stream of image tokens. The activation statistics for any given layer come from one modality.
 
 In SD3 Medium, each `MultiModalTransformerBlock` computes Q/K/V separately for image and text via their own `TransformerBlock.attn.{q,k,v}_proj` (lines 471–473 of `mlx/mmdit.py`). These are concatenated before SDPA:
 
@@ -65,9 +65,9 @@ sdpa_output = scaled_dot_product_attention(q, k, v)
 ```
 
 After SDPA, the output is split back and routed through separate `o_proj` layers. This means:
-- **Pre-SDPA projections** (q_proj, k_proj, v_proj) see only their own modality's tokens. Their activation statistics are modality-pure.
-- **Post-SDPA projection** (o_proj) sees the SDPA output, which already contains cross-modal attention information. Its activation statistics reflect both modalities.
-- **FFN layers** (fc1, fc2) also see post-attention residual stream tokens that carry cross-modal information.
+- **Pre-SDPA projections** (`q_proj`, `k_proj`, `v_proj`) see only their own modality's tokens. Their activation statistics are modality-pure.
+- **Post-SDPA projection** (`o_proj`) sees the SDPA output, which already contains cross-modal attention information. Its activation statistics reflect both modalities.
+- **FFN layers** (`fc1`, `fc2`) also see post-attention residual stream tokens that carry cross-modal information.
 
 The diagnostic must track image-side and text-side projections separately and determine whether they exhibit different salience patterns.
 
@@ -109,7 +109,7 @@ SD3 Medium conditions on rich text embeddings from three encoders. Different pro
 - The calibration corpus must be deliberately diverse (not just "random ImageNet classes").
 
 **5. Token sequence length is variable and asymmetric.**
-In DiT-XL/2, all tokens are image tokens. The sequence length is fixed for a given resolution (e.g., 256 patches for 256×256 with patch_size=2).
+In DiT-XL/2, all tokens are image tokens. The sequence length is fixed for a given resolution (e.g., 256 patches for 256×256 with `patch_size=2`).
 
 In SD3 Medium, the joint attention sequence is `[image_tokens, text_tokens]` (for `depth_unified=0`, the code concatenates image-first: `mx.concatenate([image_q, text_q], axis=1)`), where:
 - Image tokens: `(H/patch_size) * (W/patch_size)` = 4096 tokens for 1024×1024 input (latent 128×128, patched to 64×64), or 1024 for 512×512
@@ -158,7 +158,7 @@ This has implications for activation statistics collection:
 - The text-side pathway sees rich prompt embeddings for the positive sample and near-zero embeddings for the negative sample simultaneously.
 - Phase 1 hooks should either record batch elements separately or at minimum record whether CFG was active, so we can determine whether CFG-induced distribution mixing affects salience estimates.
 
-For Phase 1 diagnostics, running with CFG disabled (cfg_weight=0, single batch element) simplifies the analysis and isolates the model's intrinsic activation statistics. A follow-up ablation with CFG enabled can determine whether the batch-mixed regime changes salience patterns.
+For Phase 1 diagnostics, running with CFG disabled (`cfg_weight=0`, single batch element) simplifies the analysis and isolates the model's intrinsic activation statistics. A follow-up ablation with CFG enabled can determine whether the batch-mixed regime changes salience patterns.
 
 **10. The modulation caching mechanism changes the execution pattern.**
 The DiffusionKit implementation pre-computes all `adaLN_modulation` outputs for all timesteps via `cache_modulation_params()` and offloads the modulation MLP weights to save memory. The cache key is `timestep.item()` (the sigma value × 1000). This means during actual inference, the adaLN MLP is not executed — only the cached parameters are looked up via `self._modulation_params[timestep.item()]`. For Phase 1 diagnostics, this is important because:
@@ -207,7 +207,7 @@ Plus these singleton layers:
 | `final_layer.linear` | `[64, 1536]` | Unpatchify projection |
 | `final_layer.adaLN_modulation.1` | `[3072, 1536]` | Final adaLN |
 
-This gives a total of approximately **24 × 12 + 8 = 296 linear layers** to analyze (excluding the last text block's missing o_proj/mlp).
+This gives a total of approximately **24 × 12 + 8 = 296 linear layers** to analyze (excluding the last text block's missing `o_proj`/mlp).
 
 **De-prioritize for Phase 1**
 - VAE encoder/decoder
@@ -252,7 +252,7 @@ Fix:
 - **Model**: SD3 Medium 2B (`SD3_2b` config: `depth_multimodal=24`, `num_heads=24`, `hidden_size=1536`)
 - **Model weights**: `stabilityai/stable-diffusion-3-medium` (specific revision)
 - **Precision for analysis collection**: fp16 model inference (SD3_2b config uses `mx.float16`; note: FLUX uses `mx.bfloat16`), fp32 for all diagnostic reductions
-- **Image resolution**: 1024×1024 (latent 128×128, yielding 4096 image tokens after patch_size=2)
+- **Image resolution**: 1024×1024 (latent 128×128, yielding 4096 image tokens after `patch_size=2`)
 - **Sampler**: Euler ODE (from `ModelSamplingDiscreteFlow` with `shift=1.0`)
 - **Number of inference steps**: 28 (SD3 Medium default) or 50 (for finer trajectory coverage)
 - **CFG scale**: 0.0 (disabled) for initial diagnostics to isolate intrinsic activation statistics; ablate with 5.0 or 7.0 later to assess CFG impact
@@ -481,16 +481,16 @@ Keep the analysis broken down by submodule family:
 
 | Group | Layers per block | Total layers (24 blocks) |
 |---|---|---|
-| Image-side attention (q/k/v_proj) | 3 | 72 |
-| Text-side attention (q/k/v_proj) | 3 | 72 |
-| Image-side o_proj | 1 | 24 |
-| Text-side o_proj | 1 | 23 (last block skips) |
-| Image-side FFN (fc1, fc2) | 2 | 48 |
-| Text-side FFN (fc1, fc2) | 2 | 46 (last block skips) |
+| Image-side attention (`q/k/v_proj`) | 3 | 72 |
+| Text-side attention (`q/k/v_proj`) | 3 | 72 |
+| Image-side `o_proj` | 1 | 24 |
+| Text-side `o_proj` | 1 | 23 (last block skips) |
+| Image-side FFN (`fc1`, `fc2`) | 2 | 48 |
+| Text-side FFN (`fc1`, `fc2`) | 2 | 46 (last block skips) |
 | Image-side adaLN modulation | 1 | 24 |
 | Text-side adaLN modulation | 1 | 24 |
-| context_embedder | — | 1 |
-| final_layer (linear + adaLN) | — | 2 |
+| `context_embedder` | — | 1 |
+| `final_layer` (linear + adaLN) | — | 2 |
 
 For each group, report:
 - prevalence of salient channels (what fraction of layers show outlier channels)
@@ -522,7 +522,7 @@ PTQ4DiT's re-parameterization absorbs \(B_\rho^X\) into adjacent operations to a
 
 This yields \(\tilde{X} = X B_\rho^X\) without any extra multiply at inference time. We need to verify that each absorption path exists in SD3 Medium.
 
-**Post-adaLN (q/k/v_proj, fc1):** The `adaLN_modulation` MLP produces `(γ, β)` that modulate the input before q/k/v_proj and fc1. In SD3 Medium, the adaLN integration matches PTQ4DiT's Eq. 13 exactly via `affine_transform()`:
+**Post-adaLN (`q/k/v_proj`, `fc1`):** The `adaLN_modulation` MLP produces `(γ, β)` that modulate the input before `q/k/v_proj` and `fc1`. In SD3 Medium, the adaLN integration matches PTQ4DiT's Eq. 13 exactly via `affine_transform()`:
 ```python
 def affine_transform(x, shift, residual_scale, norm_module):
     return norm_module(x) * (1.0 + residual_scale) + shift
@@ -540,9 +540,9 @@ Since `nn.Linear` in MLX stores weights as `[d_out, d_in]` and computes `x @ W.T
 W_new = B_rho_X @ W_old      (right-multiply the transposed weight)
 b_new = b_old @ B_rho_X.T    (for the relevant output slice)
 ```
-This works identically to DiT-XL/2 because the adaLN structure is the same. **However**: image-side and text-side adaLN MLPs are separate, so each needs its own \(B_\rho^X\). The `shift` and `scale` outputs for q/k/v_proj come from the first two chunks (indices 0, 1) of the 6-way split, while those for fc1 come from chunks 3, 4. Each pair needs its own balancing matrix from the corresponding downstream linear layer.
+This works identically to DiT-XL/2 because the adaLN structure is the same. **However**: image-side and text-side adaLN MLPs are separate, so each needs its own \(B_\rho^X\). The `shift` and `scale` outputs for `q/k/v_proj` come from the first two chunks (indices 0, 1) of the 6-way split, while those for `fc1` come from chunks 3, 4. Each pair needs its own balancing matrix from the corresponding downstream linear layer.
 
-**Post-SDPA (o_proj):** The SDPA output goes through `o_proj`. The \(B_\rho^X\) for o_proj must be absorbed into the SDPA de-quantization step (or equivalently, into the value projection's output scaling), matching PTQ4DiT's "Post-Matrix-Multiplication" case. In SD3 Medium, the joint SDPA output is split before being fed to separate image/text o_proj layers:
+**Post-SDPA (`o_proj`):** The SDPA output goes through `o_proj`. The \(B_\rho^X\) for o_proj must be absorbed into the SDPA de-quantization step (or equivalently, into the value projection's output scaling), matching PTQ4DiT's "Post-Matrix-Multiplication" case. In SD3 Medium, the joint SDPA output is split before being fed to separate image/text o_proj layers:
 ```python
 image_sdpa_output = sdpa_outputs[:, :img_seq_len, :, :]
 text_sdpa_output = sdpa_outputs[:, -txt_seq_len:, :, :]
@@ -557,27 +557,27 @@ The gate is applied **after** `o_proj`, not before it, so it does not interfere 
 
 **FC2:** The input to fc2 is the GELU output of fc1. The \(B_\rho^X\) for fc2 cannot be absorbed into fc1's weight matrix because GELU is nonlinear (i.e., \(\text{GELU}(x \cdot B) \neq \text{GELU}(x) \cdot B\)). PTQ4DiT treats fc2's activation balancing as a Post-Matrix-Multiplication case, absorbing it into fc1's output (equivalently, the de-quantization step). The same approach applies to SD3 Medium without modification.
 
-**context_embedder:** This is a standalone `nn.Linear(4096, 1536)` with no preceding adaLN. Its input comes from the concatenated CLIP + T5 text encoder output. Re-parameterization requires either:
+**`context_embedder`:** This is a standalone `nn.Linear(4096, 1536)` with no preceding adaLN. Its input comes from the concatenated CLIP + T5 text encoder output. Re-parameterization requires either:
 - Absorbing \(B_\rho^X\) into the text encoders' final layers (frozen and out of scope), or
 - Treating this layer differently (e.g., keep at higher precision, or apply online balancing at negligible cost since it runs only once per inference)
 
 Since `context_embedder` runs once per forward pass (not per denoising step), any runtime overhead from online balancing is amortized and negligible.
 
-**final_layer.linear:** This layer follows `final_layer.adaLN_modulation`, which has the same `nn.Sequential(SiLU(), nn.Linear(1536, 3072))` structure producing 2 parameters (shift, scale). Absorption into this adaLN MLP works identically to the block-level case.
+**`final_layer.linear`:** This layer follows `final_layer.adaLN_modulation`, which has the same `nn.Sequential(SiLU(), nn.Linear(1536, 3072))` structure producing 2 parameters (shift, scale). Absorption into this adaLN MLP works identically to the block-level case.
 
 **Summary of re-parameterization feasibility:**
 
 | Layer family | Absorption path | Feasible? | Notes |
 |---|---|---|---|
-| q/k/v_proj (image) | Image adaLN MLP (chunks 0, 1) | Yes | Standard post-adaLN |
-| q/k/v_proj (text) | Text adaLN MLP (chunks 0, 1) | Yes | Standard post-adaLN |
-| fc1 (image) | Image adaLN MLP (chunks 3, 4) | Yes | Standard post-adaLN |
-| fc1 (text) | Text adaLN MLP (chunks 3, 4) | Yes | Standard post-adaLN |
-| o_proj (image) | Post-SDPA (image slice) | Yes | Post-matrix-multiplication |
-| o_proj (text) | Post-SDPA (text slice) | Yes | Post-matrix-multiplication |
-| fc2 (image/text) | Post-GELU (fc1 output) | Yes | Post-matrix-multiplication |
-| context_embedder | No preceding adaLN | No | Use online balancing or higher precision |
-| final_layer.linear | final_layer adaLN MLP | Yes | Standard post-adaLN |
+| `q/k/v_proj` (image) | Image adaLN MLP (chunks 0, 1) | Yes | Standard post-adaLN |
+| `q/k/v_proj` (text) | Text adaLN MLP (chunks 0, 1) | Yes | Standard post-adaLN |
+| `fc1` (image) | Image adaLN MLP (chunks 3, 4) | Yes | Standard post-adaLN |
+| `fc1` (text) | Text adaLN MLP (chunks 3, 4) | Yes | Standard post-adaLN |
+| `o_proj` (image) | Post-SDPA (image slice) | Yes | Post-matrix-multiplication |
+| `o_proj` (text) | Post-SDPA (text slice) | Yes | Post-matrix-multiplication |
+| `fc2` (image/text) | Post-GELU (`fc1` output) | Yes | Post-matrix-multiplication |
+| `context_embedder` | No preceding adaLN | No | Use online balancing or higher precision |
+| `final_layer.linear` | `final_layer` adaLN MLP | Yes | Standard post-adaLN |
 
 Phase 1 should confirm this analysis by verifying that the gate parameters do not introduce unexpected interactions, and by checking that the `affine_transform` fast path (batch_size=1 optimization using `mx.fast.layer_norm` with fused scale/shift) is mathematically equivalent to the standard path for re-parameterization purposes.
 
@@ -589,7 +589,7 @@ Phase 1 should confirm this analysis by verifying that the gate parameters do no
 
 Each row should correspond to one linear layer and include:
 - layer id (e.g., `mm_blocks.12.image.attn.q_proj`)
-- submodule family (q_proj, k_proj, v_proj, o_proj, fc1, fc2, adaLN, context, final)
+- submodule family (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `fc1`, `fc2`, adaLN, context, final)
 - modality branch (image, text, shared)
 - block index
 - mean activation salience (averaged over sigma steps)
@@ -639,7 +639,7 @@ A short written summary answering:
 **Online accumulation.** Do not dump full activation tensors. For each hook call, compute per-channel statistics and discard the raw tensor. Use Welford's online algorithm for mean/variance, and track running max for salience.
 
 **Storage format.** Store statistics in a structured format:
-- one row per (layer, sigma_step, prompt_id, seed)
+- one row per (layer, `sigma_step`, `prompt_id`, seed)
 - separate arrays for per-channel summaries
 - a metadata file recording all inference settings
 
