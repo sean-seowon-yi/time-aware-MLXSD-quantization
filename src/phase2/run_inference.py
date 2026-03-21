@@ -57,32 +57,42 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _load_prompts_file(path: Path) -> list[str]:
-    """Read prompts from a text file (one prompt per line, skip blanks)."""
-    lines = path.read_text().strip().splitlines()
-    return [l.strip() for l in lines if l.strip()]
+def _load_seed_prompt_file(path: Path) -> list[tuple[int, str]]:
+    """Load ``(seed, prompt)`` pairs from a tab-separated text file.
+
+    Each non-blank line has the format ``<seed>\\t<prompt>``.
+    """
+    pairs: list[tuple[int, str]] = []
+    for line in path.read_text().strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        seed_str, prompt = line.split("\t", 1)
+        pairs.append((int(seed_str), prompt.strip()))
+    return pairs
 
 
 def _generate_batch(
     pipeline,
-    prompts: list[str],
+    seed_prompt_pairs: list[tuple[int, str]],
     output_dir: Path,
     *,
-    seed: int,
     num_steps: int,
     cfg_weight: float,
     latent_size: tuple[int, int],
 ) -> list[float]:
-    """Generate images for a list of prompts and save to *output_dir*.
+    """Generate images for a list of ``(seed, prompt)`` pairs and save to
+    *output_dir*.
 
     Returns a list of per-image generation times (seconds).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     timings: list[float] = []
-    for idx, prompt in enumerate(prompts):
+    total = len(seed_prompt_pairs)
+    for idx, (seed, prompt) in enumerate(seed_prompt_pairs):
         logger.info(
-            "[%d/%d] seed=%d  prompt=%r", idx + 1, len(prompts), seed, prompt[:80],
+            "[%d/%d] seed=%d  prompt=%r", idx + 1, total, seed, prompt[:80],
         )
         t0 = time.time()
         image, _log = pipeline.generate_image(
@@ -126,7 +136,10 @@ def main():
     )
 
     # --- Generation settings ---
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Seed for single --prompt mode (ignored when using --prompts-file)",
+    )
     parser.add_argument("--num-steps", type=int, default=30)
     parser.add_argument("--cfg-weight", type=float, default=4.0)
     parser.add_argument(
@@ -135,7 +148,7 @@ def main():
     )
     parser.add_argument(
         "--num-prompts", type=int, default=None,
-        help="Limit number of prompts from --prompts-file",
+        help="Limit number of prompt-seed pairs from --prompts-file",
     )
 
     # --- Output ---
@@ -150,16 +163,16 @@ def main():
     if args.mode == "w4a8" and args.quantized_dir is None:
         parser.error("--quantized-dir is required when --mode w4a8")
 
-    # --- Build prompt list ---
+    # --- Build prompt-seed pairs ---
     if args.prompt:
-        prompts = [args.prompt]
+        pairs: list[tuple[int, str]] = [(args.seed, args.prompt)]
     else:
-        prompts = _load_prompts_file(Path(args.prompts_file))
+        pairs = _load_seed_prompt_file(Path(args.prompts_file))
         if args.num_prompts is not None:
-            prompts = prompts[: args.num_prompts]
+            pairs = pairs[: args.num_prompts]
 
-    logger.info("Mode: %s  |  Prompts: %d  |  Seed: %d  |  Steps: %d  |  CFG: %.1f",
-                args.mode, len(prompts), args.seed, args.num_steps, args.cfg_weight)
+    logger.info("Mode: %s  |  Pairs: %d  |  Steps: %d  |  CFG: %.1f",
+                args.mode, len(pairs), args.num_steps, args.cfg_weight)
 
     # --- Load pipeline ---
     logger.info("Loading DiffusionPipeline ...")
@@ -191,14 +204,13 @@ def main():
 
     # --- Generate ---
     output_root = Path(args.output_dir) / args.mode
-    logger.info("=== GENERATING %d IMAGES → %s ===", len(prompts), output_root)
+    logger.info("=== GENERATING %d IMAGES → %s ===", len(pairs), output_root)
 
     t_total = time.time()
     timings = _generate_batch(
         pipeline,
-        prompts,
+        pairs,
         output_root,
-        seed=args.seed,
         num_steps=args.num_steps,
         cfg_weight=args.cfg_weight,
         latent_size=tuple(args.latent_size),
@@ -216,20 +228,18 @@ def main():
         "  Total time:     %.1f s\n"
         "  Mean per image: %.1f s\n"
         "  Min / Max:      %.1f / %.1f s",
-        args.mode, len(prompts), output_root,
+        args.mode, len(pairs), output_root,
         total_elapsed, timings_arr.mean(),
         timings_arr.min(), timings_arr.max(),
     )
 
-    # Save generation metadata for reproducibility
     run_meta = {
         "mode": args.mode,
-        "seed": args.seed,
         "num_steps": args.num_steps,
         "cfg_weight": args.cfg_weight,
         "latent_size": list(args.latent_size),
-        "num_prompts": len(prompts),
-        "prompts": prompts,
+        "num_pairs": len(pairs),
+        "seed_prompt_pairs": [[seed, prompt] for seed, prompt in pairs],
         "timings_s": timings,
         "total_time_s": round(total_elapsed, 2),
     }

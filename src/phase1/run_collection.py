@@ -34,13 +34,9 @@ def main():
         "--num-prompts", type=int, default=None,
         help="Limit number of prompts (default: all 100)",
     )
-    parser.add_argument(
-        "--num-seeds", type=int, default=None,
-        help="Limit number of seeds (default: 1)",
-    )
     args = parser.parse_args()
 
-    from .config import DIAG_CONFIG, DIAGNOSTIC_PROMPTS
+    from .config import CALIBRATION_PAIRS, DIAG_CONFIG
     from .collect import (
         collect_adaln_stats,
         compute_weight_salience,
@@ -54,16 +50,13 @@ def main():
     from .registry import build_layer_registry
 
     if args.pilot:
-        prompts = DIAGNOSTIC_PROMPTS[:2]
-        seeds = [42]
-        logger.info("=== PILOT RUN: 2 prompts, 1 seed ===")
+        pairs = CALIBRATION_PAIRS[:2]
+        logger.info("=== PILOT RUN: 2 prompt-seed pairs ===")
     else:
-        n_prompts = args.num_prompts or len(DIAGNOSTIC_PROMPTS)
-        n_seeds = args.num_seeds or len(DIAG_CONFIG["seed_range"])
-        prompts = DIAGNOSTIC_PROMPTS[:n_prompts]
-        seeds = DIAG_CONFIG["seed_range"][:n_seeds]
+        n = args.num_prompts or len(CALIBRATION_PAIRS)
+        pairs = CALIBRATION_PAIRS[:n]
 
-    logger.info("Prompts: %d,  Seeds: %d", len(prompts), len(seeds))
+    logger.info("Prompt-seed pairs: %d", len(pairs))
 
     # --- Load pipeline ---
     logger.info("Loading DiffusionPipeline ...")
@@ -96,7 +89,7 @@ def main():
     cfg_weight = DIAG_CONFIG["cfg_weight"]
     t0 = time.time()
     run_diagnostic_collection(
-        pipeline, prompts, seeds, collector,
+        pipeline, pairs, collector,
         num_steps=DIAG_CONFIG["num_steps"],
         latent_size=tuple(DIAG_CONFIG["latent_size"]),
         cfg_weight=cfg_weight,
@@ -105,16 +98,15 @@ def main():
     logger.info("Collection finished in %.1f s", elapsed)
 
     # --- Collect adaLN stats ---
-    # adaLN weights are already restored after run_diagnostic_collection;
-    # capture from memory instead of reloading full checkpoint from disk.
     from mlx.utils import tree_flatten
     adaln_cache = [
         (k, v) for k, v in tree_flatten(pipeline.mmdit.parameters())
         if "adaLN" in k
     ]
     pipeline.mmdit.load_weights(adaln_cache, strict=False)
+    first_prompt = pairs[0][1]
     conditioning, pooled_conditioning = pipeline.encode_text(
-        prompts[0], cfg_weight=cfg_weight,
+        first_prompt, cfg_weight=cfg_weight,
     )
     if cfg_weight <= 0:
         conditioning = conditioning[:1]
@@ -134,11 +126,11 @@ def main():
     # --- Save ---
     save_activation_stats(collector, registry)
     save_adaln_stats(adaln_stats)
-    save_config(prompts, seeds, registry)
+    save_config(pairs, registry)
 
     # --- Pilot validation ---
     if args.pilot:
-        expected_calls = 287 * DIAG_CONFIG["num_steps"] * len(prompts) * len(seeds)
+        expected_calls = 287 * DIAG_CONFIG["num_steps"] * len(pairs)
         actual = collector.call_count
         logger.info("Pilot hook calls: expected=%d  actual=%d", expected_calls, actual)
         if actual != expected_calls:

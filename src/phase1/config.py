@@ -1,16 +1,23 @@
 """Phase 1 diagnostic configuration: inference settings, prompts, and visual constants."""
 
-import csv
 from pathlib import Path
 
 SETTINGS_DIR = Path(__file__).resolve().parent.parent / "settings"
 
 
-def _load_prompts_csv(path: Path) -> list[str]:
-    """Load prompts from a CSV file with a 'prompt' column."""
-    with open(path) as f:
-        reader = csv.DictReader(f)
-        return [row["prompt"] for row in reader]
+def _load_seed_prompt_pairs(path: Path) -> list[tuple[int, str]]:
+    """Load ``(seed, prompt)`` pairs from a tab-separated text file.
+
+    Each non-blank line has the format ``<seed>\\t<prompt>``.
+    """
+    pairs: list[tuple[int, str]] = []
+    for line in path.read_text().strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        seed_str, prompt = line.split("\t", 1)
+        pairs.append((int(seed_str), prompt.strip()))
+    return pairs
 
 
 DIAG_CONFIG = {
@@ -22,7 +29,6 @@ DIAG_CONFIG = {
     "num_steps": 30,
     "cfg_weight": 4.0,
     "latent_size": (64, 64),
-    "seed_range": [42],
     "top_k": 32,
 }
 
@@ -30,8 +36,10 @@ OUTPUT_DIR = Path("diagnostics")
 PLOTS_DIR = OUTPUT_DIR / "plots"
 ACTIVATION_STATS_DIR = OUTPUT_DIR / "activation_stats"
 
-CALIBRATION_PROMPTS_CSV = SETTINGS_DIR / "coco_100_calibration_prompts.csv"
-DIAGNOSTIC_PROMPTS = _load_prompts_csv(CALIBRATION_PROMPTS_CSV)
+CALIBRATION_PROMPTS_FILE = SETTINGS_DIR / "coco_100_calibration_prompts.txt"
+CALIBRATION_PAIRS = _load_seed_prompt_pairs(CALIBRATION_PROMPTS_FILE)
+DIAGNOSTIC_PROMPTS = [prompt for _, prompt in CALIBRATION_PAIRS]
+DIAGNOSTIC_SEEDS = [seed for seed, _ in CALIBRATION_PAIRS]
 
 REPRESENTATIVE_LAYERS = [
     "blocks.0.image.attn.q_proj",

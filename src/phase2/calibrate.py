@@ -55,8 +55,8 @@ def compute_balancing_vector(
     act_trajectory: np.ndarray,
     wt_salience: np.ndarray,
     alpha: float = 0.5,
-    b_min: float = 1e-5,
-    b_max: float = 1e5,
+    b_min: float = 1e-2,
+    b_max: float = 1e2,
     w_eps: float = 1e-12,
 ) -> np.ndarray:
     """Compute the SSC-weighted balancing vector for a single layer.
@@ -87,8 +87,8 @@ def compute_qkv_balancing(
     diagnostics_dir: Path,
     method: str = "max",
     alpha: float = 0.5,
-    b_min: float = 1e-5,
-    b_max: float = 1e5,
+    b_min: float = 1e-2,
+    b_max: float = 1e2,
     w_eps: float = 1e-12,
 ) -> np.ndarray:
     """Compute the shared balancing vector for Q/K/V projections.

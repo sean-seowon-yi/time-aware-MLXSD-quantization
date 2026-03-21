@@ -8,7 +8,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import List
+
 
 import mlx.core as mx
 import numpy as np
@@ -96,15 +96,17 @@ def collect_adaln_stats(mmdit) -> dict:
 
 def run_diagnostic_collection(
     pipeline,
-    prompts: List[str],
-    seeds: List[int],
+    seed_prompt_pairs: list[tuple[int, str]],
     collector: ChannelStatsCollector,
     num_steps: int | None = None,
     latent_size: tuple[int, int] | None = None,
     cfg_weight: float | None = None,
 ) -> None:
-    """Run the Euler denoising loop for every (prompt, seed) pair, firing
+    """Run the Euler denoising loop for every ``(seed, prompt)`` pair, firing
     hooks on every denoising step so the collector accumulates statistics.
+
+    *seed_prompt_pairs* is a list of ``(seed, prompt)`` tuples — each prompt
+    has its own dedicated seed.
 
     When ``cfg_weight > 0``, classifier-free guidance is applied: the MMDiT
     receives batch=2 inputs (conditioned + unconditioned) per step, and the
@@ -115,19 +117,15 @@ def run_diagnostic_collection(
     cfg_weight = cfg_weight if cfg_weight is not None else DIAG_CONFIG["cfg_weight"]
     use_cfg = cfg_weight > 0
 
-    total_runs = len(prompts) * len(seeds)
-    run_idx = 0
+    total_runs = len(seed_prompt_pairs)
 
-    # Cache the original adaLN weights from the in-memory model to avoid
-    # reloading the full checkpoint from disk after every prompt
-    # (DiffusionKit's load_mmdit reads the entire safetensors file each call).
     from mlx.utils import tree_flatten
     _adaln_cache = [
         (k, v) for k, v in tree_flatten(pipeline.mmdit.parameters())
         if "adaLN" in k
     ]
 
-    for prompt_id, prompt in enumerate(prompts):
+    for run_idx, (seed, prompt) in enumerate(seed_prompt_pairs, 1):
         conditioning, pooled_conditioning = pipeline.encode_text(
             prompt, cfg_weight=cfg_weight,
         )
@@ -137,81 +135,79 @@ def run_diagnostic_collection(
         conditioning = conditioning.astype(pipeline.activation_dtype)
         pooled_conditioning = pooled_conditioning.astype(pipeline.activation_dtype)
         mx.eval(conditioning, pooled_conditioning)
-        batch_size = conditioning.shape[0]  # 2 with CFG, 1 without
+        batch_size = conditioning.shape[0]
 
-        for seed in seeds:
-            run_idx += 1
-            t0 = time.time()
-            logger.info(
-                "Run %d/%d  prompt=%d  seed=%d  cfg=%.1f",
-                run_idx, total_runs, prompt_id, seed, cfg_weight,
+        t0 = time.time()
+        logger.info(
+            "Run %d/%d  prompt=%d  seed=%d  cfg=%.1f",
+            run_idx, total_runs, run_idx - 1, seed, cfg_weight,
+        )
+
+        mx.random.seed(seed)
+        x_T = pipeline.get_empty_latent(*latent_size)
+        noise = pipeline.get_noise(seed, x_T)
+        sigmas = pipeline.get_sigmas(pipeline.sampler, num_steps)
+        noise_scaled = pipeline.sampler.noise_scaling(
+            sigmas[0], noise, x_T, True,
+        )
+
+        timesteps = pipeline.sampler.timestep(sigmas).astype(
+            pipeline.activation_dtype
+        )
+
+        pipeline.mmdit.cache_modulation_params(
+            pooled_conditioning, timesteps,
+        )
+
+        x = noise_scaled.astype(pipeline.activation_dtype)
+        mmdit = pipeline.mmdit
+
+        for i in range(len(sigmas) - 1):
+            sigma_val = float(sigmas[i].item())
+            collector.set_context(
+                step_idx=i,
+                sigma=sigma_val,
+                prompt_id=str(run_idx - 1),
+                seed=seed,
             )
 
-            mx.random.seed(seed)
-            x_T = pipeline.get_empty_latent(*latent_size)
-            noise = pipeline.get_noise(seed, x_T)
-            sigmas = pipeline.get_sigmas(pipeline.sampler, num_steps)
-            noise_scaled = pipeline.sampler.noise_scaling(
-                sigmas[0], noise, x_T, True,
+            if use_cfg:
+                x_in = mx.concatenate([x] * 2, axis=0)
+            else:
+                x_in = x
+
+            token_text = mx.expand_dims(conditioning, 2)
+            ts = mx.broadcast_to(timesteps[i], [batch_size])
+
+            mmdit_output = mmdit(
+                latent_image_embeddings=x_in,
+                token_level_text_embeddings=token_text,
+                timestep=ts,
             )
 
-            timesteps = pipeline.sampler.timestep(sigmas).astype(
-                pipeline.activation_dtype
-            )
-
-            pipeline.mmdit.cache_modulation_params(
-                pooled_conditioning, timesteps,
-            )
-
-            x = noise_scaled.astype(pipeline.activation_dtype)
-            mmdit = pipeline.mmdit
-
-            for i in range(len(sigmas) - 1):
-                sigma_val = float(sigmas[i].item())
-                collector.set_context(
-                    step_idx=i,
-                    sigma=sigma_val,
-                    prompt_id=str(prompt_id),
-                    seed=seed,
+            if use_cfg:
+                eps_pred = pipeline.sampler.calculate_denoised(
+                    sigmas[i], mmdit_output, x_in,
+                )
+                eps_cond, eps_uncond = eps_pred.split(2)
+                denoised = eps_uncond + cfg_weight * (eps_cond - eps_uncond)
+            else:
+                denoised = pipeline.sampler.calculate_denoised(
+                    sigmas[i], mmdit_output, x,
                 )
 
-                if use_cfg:
-                    x_in = mx.concatenate([x] * 2, axis=0)
-                else:
-                    x_in = x
+            d = (x - denoised) / sigmas[i]
+            x = x + d * (sigmas[i + 1] - sigmas[i])
+            mx.eval(x)
 
-                token_text = mx.expand_dims(conditioning, 2)
-                ts = mx.broadcast_to(timesteps[i], [batch_size])
+        pipeline.mmdit.load_weights(_adaln_cache, strict=False)
+        pipeline.mmdit.clear_modulation_params_cache()
 
-                mmdit_output = mmdit(
-                    latent_image_embeddings=x_in,
-                    token_level_text_embeddings=token_text,
-                    timestep=ts,
-                )
-
-                if use_cfg:
-                    eps_pred = pipeline.sampler.calculate_denoised(
-                        sigmas[i], mmdit_output, x_in,
-                    )
-                    eps_cond, eps_uncond = eps_pred.split(2)
-                    denoised = eps_uncond + cfg_weight * (eps_cond - eps_uncond)
-                else:
-                    denoised = pipeline.sampler.calculate_denoised(
-                        sigmas[i], mmdit_output, x,
-                    )
-
-                d = (x - denoised) / sigmas[i]
-                x = x + d * (sigmas[i + 1] - sigmas[i])
-                mx.eval(x)
-
-            pipeline.mmdit.load_weights(_adaln_cache, strict=False)
-            pipeline.mmdit.clear_modulation_params_cache()
-
-            elapsed = time.time() - t0
-            logger.info(
-                "  completed in %.1fs  (total hook calls so far: %d)",
-                elapsed, collector.call_count,
-            )
+        elapsed = time.time() - t0
+        logger.info(
+            "  completed in %.1fs  (total hook calls so far: %d)",
+            elapsed, collector.call_count,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -295,17 +291,15 @@ def save_adaln_stats(adaln_records: dict, output_dir: Path | None = None):
 
 
 def save_config(
-    prompts: list[str],
-    seeds: list[int],
+    seed_prompt_pairs: list[tuple[int, str]],
     registry: list[dict],
     output_dir: Path | None = None,
 ):
     out = output_dir or OUTPUT_DIR
     out.mkdir(parents=True, exist_ok=True)
     cfg = {
-        **{k: v for k, v in DIAG_CONFIG.items() if k != "seed_range"},
-        "seeds": seeds,
-        "prompts": prompts,
+        **DIAG_CONFIG,
+        "seed_prompt_pairs": [[seed, prompt] for seed, prompt in seed_prompt_pairs],
         "num_layers": len(registry),
         "layer_names": [e["name"] for e in registry],
     }

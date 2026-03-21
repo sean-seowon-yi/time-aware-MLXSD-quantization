@@ -7,7 +7,7 @@ CSB absorption, W4A8 quantization) and saves the quantized model.
 
 Usage
 -----
-# Full run with defaults (100 prompts, seed 42, 30 steps, CFG 4.0)
+# Full run with defaults (100 prompt-seed pairs, 30 steps, CFG 4.0)
 python -m src.phase2.run_e2e --output-dir quantized/
 
 # Quick test with 2 prompts
@@ -70,15 +70,10 @@ def main():
     )
     p1.add_argument(
         "--num-prompts", type=int, default=None,
-        help="Number of calibration prompts (default: all 100)",
-    )
-    p1.add_argument(
-        "--num-seeds", type=int, default=None,
-        help="Number of seeds (default: 1, i.e. seed 42)",
+        help="Number of calibration prompt-seed pairs (default: all 100)",
     )
     p1.add_argument("--num-steps", type=int, default=None, help="Denoising steps (default: 30)")
     p1.add_argument("--cfg-weight", type=float, default=None, help="CFG scale (default: 4.0)")
-    p1.add_argument("--seed", type=int, default=None, help="Override seed (default: 42)")
 
     # --- Phase 2: quantization settings ---
     p2 = parser.add_argument_group("Phase 2 — quantization")
@@ -152,7 +147,7 @@ def main():
         logger.info("STEP 2/6 — Phase 1: running prompts through denoiser with hooks")
         logger.info("=" * 60)
 
-        from ..phase1.config import DIAG_CONFIG, DIAGNOSTIC_PROMPTS
+        from ..phase1.config import CALIBRATION_PAIRS, DIAG_CONFIG
         from ..phase1.collect import (
             collect_adaln_stats,
             compute_weight_salience,
@@ -168,49 +163,38 @@ def main():
         cfg_weight = args.cfg_weight if args.cfg_weight is not None else DIAG_CONFIG["cfg_weight"]
         latent_size = tuple(DIAG_CONFIG["latent_size"])
 
-        n_prompts = args.num_prompts or len(DIAGNOSTIC_PROMPTS)
-        prompts = DIAGNOSTIC_PROMPTS[:n_prompts]
-
-        if args.seed is not None:
-            seeds = [args.seed]
-        elif args.num_seeds is not None:
-            seeds = DIAG_CONFIG["seed_range"][:args.num_seeds]
-        else:
-            seeds = DIAG_CONFIG["seed_range"]
+        n = args.num_prompts or len(CALIBRATION_PAIRS)
+        pairs = CALIBRATION_PAIRS[:n]
 
         logger.info(
-            "Collection settings: %d prompts, %d seeds, %d steps, CFG %.1f",
-            len(prompts), len(seeds), num_steps, cfg_weight,
+            "Collection settings: %d prompt-seed pairs, %d steps, CFG %.1f",
+            len(pairs), num_steps, cfg_weight,
         )
 
-        # Weight salience (time-independent, computed once)
         weight_stats = compute_weight_salience(registry)
         save_weight_stats(weight_stats, diagnostics_dir)
 
-        # Install hooks and run collection
         collector = ChannelStatsCollector()
         hooks = install_hooks(registry, collector)
 
         t_collect = time.time()
         run_diagnostic_collection(
-            pipeline, prompts, seeds, collector,
+            pipeline, pairs, collector,
             num_steps=num_steps,
             latent_size=latent_size,
             cfg_weight=cfg_weight,
         )
         logger.info("Collection finished in %.1f s", time.time() - t_collect)
 
-        # Collect adaLN stats
-        # adaLN weights are already restored after run_diagnostic_collection;
-        # capture from memory instead of reloading full checkpoint from disk.
         from mlx.utils import tree_flatten
         adaln_cache = [
             (k, v) for k, v in tree_flatten(pipeline.mmdit.parameters())
             if "adaLN" in k
         ]
         pipeline.mmdit.load_weights(adaln_cache, strict=False)
+        first_prompt = pairs[0][1]
         conditioning, pooled_conditioning = pipeline.encode_text(
-            prompts[0], cfg_weight=cfg_weight,
+            first_prompt, cfg_weight=cfg_weight,
         )
         if cfg_weight <= 0:
             conditioning = conditioning[:1]
@@ -224,23 +208,15 @@ def main():
         adaln_stats = collect_adaln_stats(pipeline.mmdit)
         pipeline.mmdit.clear_modulation_params_cache()
 
-        # Remove hooks
         remove_hooks(hooks)
 
-        # Restore adaLN weights (cache_modulation_params offloads them
-        # to empty arrays; clear_modulation_params_cache does NOT restore)
         pipeline.mmdit.load_weights(adaln_cache, strict=False)
-
-        # cache_modulation_params leaves a `to_offload` list of module refs
-        # on the MMDiT; remove it so tree_flatten during save doesn't pick
-        # up duplicate keys like `to_offload.0.weight`.
         if hasattr(pipeline.mmdit, "to_offload"):
             delattr(pipeline.mmdit, "to_offload")
 
-        # Save Phase 1 data
         save_activation_stats(collector, registry, diagnostics_dir / "activation_stats")
         save_adaln_stats(adaln_stats, diagnostics_dir)
-        save_config(prompts, seeds, registry, diagnostics_dir)
+        save_config(pairs, registry, diagnostics_dir)
 
         logger.info("Phase 1 data saved to %s", diagnostics_dir)
 

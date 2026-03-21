@@ -32,7 +32,7 @@
 **Input.** Phase 1 diagnostic data under `diagnostics/`:
 - Activation trajectories: `diagnostics/activation_stats/{layer_name}.npz` — per-layer `[num_steps, d_in]` arrays of per-channel max activation magnitudes across sigma steps.
 - Weight salience: `diagnostics/weight_stats.npz` — per-layer `[d_in]` arrays of per-channel max weight magnitudes.
-- Configuration: `diagnostics/config.json` — sigma schedule, prompts, seeds used during collection.
+- Configuration: `diagnostics/config.json` — sigma schedule, seed-prompt pairs, layer names used during collection.
 
 **Output.** A quantized model checkpoint with:
 - Balanced and 4-bit-quantized weights for all 286 target layers.
@@ -147,7 +147,7 @@ b = (weighted_act_salience / (wt_salience + eps)) ** alpha
 b = np.clip(b, b_min, b_max)
 ```
 
-Where `eps = 1e-12`, `alpha = 0.5`, `b_min = 1e-5`, `b_max = 1e5`.
+Where `eps = 1e-12`, `alpha = 0.5`, `b_min = 1e-2`, `b_max = 1e2`.
 
 ---
 
@@ -450,10 +450,10 @@ The online multiply is an element-wise operation:
 | o_proj | O(B·N·1536) | O(B·N·1536²) | 1/1536 ≈ 0.07% |
 | fc2 | O(B·N·6144) | O(B·N·6144·1536) | 1/1536 ≈ 0.07% |
 
-Memory: one `float16` vector per layer.
-- o_proj: 1536 × 2 bytes = 3 KB per layer, × 47 layers = 141 KB
-- fc2: 6144 × 2 bytes = 12 KB per layer, × 47 layers = 564 KB
-- **Total: ~705 KB** — negligible.
+Memory: one `float32` vector per layer (stored as float32 to avoid float16 overflow on `1/b` values near 100).
+- o_proj: 1536 × 4 bytes = 6 KB per layer, × 47 layers = 282 KB
+- fc2: 6144 × 4 bytes = 24 KB per layer, × 47 layers = 1.1 MB
+- **Total: ~1.4 MB** — negligible.
 
 ---
 
@@ -520,17 +520,20 @@ class W4A8Linear(nn.Module):
 
     def __init__(
         self,
-        quantized_linear: nn.QuantizedLinear,
+        qlinear: nn.QuantizedLinear,
         b_inv: mx.array | None = None,
     ):
         super().__init__()
-        self.qlinear = quantized_linear
-        self.b_inv = b_inv  # None for absorbed layers; [d_in] for online layers
+        self.qlinear = qlinear
+        if b_inv is not None:
+            self.b_inv = b_inv  # [d_in], stored as float32
 
     def __call__(self, x: mx.array) -> mx.array:
+        orig_dtype = x.dtype
+
         # 1. Online CSB balancing (for o_proj, fc2)
-        if self.b_inv is not None:
-            x = x * self.b_inv
+        if hasattr(self, "b_inv"):
+            x = (x * self.b_inv).astype(orig_dtype)
 
         # 2. A8 fake quantization
         x = fake_quantize_a8(x)
@@ -539,9 +542,11 @@ class W4A8Linear(nn.Module):
         return self.qlinear(x)
 ```
 
-For **post-adaLN layers** (q/k/v_proj, fc1, final_layer.linear): `b_inv = None` because the balancing is already absorbed into the adaLN parameters.
+**Precision note:** `b_inv` is stored as `mx.float32` because values near `1/b_min = 100` are within float16 range (~65504) but float32 provides a safety margin. The `(x * self.b_inv)` multiplication temporarily promotes to float32, and `.astype(orig_dtype)` casts the result back to fp16 to avoid dtype drift through the network.
 
-For **post-nonlinearity layers** (o_proj, fc2): `b_inv = mx.array(1.0 / b_vector)` stored as a model parameter.
+For **post-adaLN layers** (q/k/v_proj, fc1, final_layer.linear): `b_inv` is not set (the attribute does not exist) because the balancing is already absorbed into the adaLN parameters.
+
+For **post-nonlinearity layers** (o_proj, fc2): `b_inv = mx.array(1.0 / b_vector, dtype=mx.float32)` stored as a model parameter.
 
 ---
 
@@ -647,21 +652,25 @@ Excluded from quantization as stated in Section 1. Kept at FP16. If future work 
 ```
 src/phase2/
 ├── __init__.py
-├── config.py           # Hyperparameters and constants
-├── calibrate.py        # Load Phase 1 data, compute SSC weights + weighted salience
-├── balance.py          # Compute balancing vectors, absorb into adaLN, balance weights
-├── quantize.py         # W4A8Linear class, fake_quantize_a8, model quantization
-├── run_quantize.py     # CLI: load model → calibrate → balance → quantize → save
-└── run_inference.py    # CLI: load quantized model → generate images
+├── config.py             # Hyperparameters, constants, pipeline kwargs
+├── calibrate.py          # Load Phase 1 data, compute SSC weights + balancing vectors
+├── balance.py            # Absorb B⁻¹ into adaLN, balance weights, collect b_inv
+├── quantize.py           # W4A8Linear, fake_quantize_a8, quantize/save/load model
+├── diagnose.py           # Post-quantization diagnostics (W4A8 vs FP16 comparison)
+├── visualize_quant.py    # Post-quantization diagnostic plots
+├── run_quantize.py       # CLI: calibrate → balance → quantize → save (Phase 1 data required)
+├── run_e2e.py            # CLI: collection → calibrate → balance → quantize → save (all-in-one)
+├── run_inference.py      # CLI: load FP16 or W4A8 model → generate images
+└── run_diagnose.py       # CLI: collect W4A8 stats → compare vs FP16 → generate plots
 ```
 
 ### 10.2 config.py
 
 ```python
 PHASE2_CONFIG = {
-    "alpha": 0.5,                # CSB exponent
-    "b_min": 1e-5,               # Balancing factor floor
-    "b_max": 1e5,                # Balancing factor ceiling
+    "alpha": 0.5,                # CSB exponent (SmoothQuant default)
+    "b_min": 1e-2,               # Balancing factor floor (float16-safe)
+    "b_max": 1e2,                # Balancing factor ceiling (float16-safe)
     "w_eps": 1e-12,              # Weight salience floor (avoid div-by-zero)
     "group_size": 64,            # W4 quantization group size
     "bits": 4,                   # Weight quantization bits
@@ -672,237 +681,347 @@ PHASE2_CONFIG = {
         "context_embedder",
     ],
 }
+
+# Pipeline construction kwargs (mirrors Phase 1 DIAG_CONFIG)
+PIPELINE_KWARGS = {
+    "w16": True,                 # fp16 model weights
+    "shift": 1.0,                # Rectified flow sigma shift
+    "use_t5": True,              # Enable T5-XXL text encoder
+    "low_memory_mode": False,    # Keep full model in memory
+}
 ```
 
 ### 10.3 calibrate.py
 
-**Key functions:**
-
 ```python
-def load_phase1_data(
-    layer_name: str,
-    diagnostics_dir: Path,
-) -> dict:
-    """Load activation trajectory and weight salience for one layer.
+def load_phase1_data(layer_name, diagnostics_dir) -> dict:
+    """Returns {"act_trajectory": [T, d_in], "wt_salience": [d_in]}."""
 
-    Returns:
-        {"act_trajectory": ndarray [T, d_in],
-         "wt_salience": ndarray [d_in]}
-    """
+def compute_balancing_vector(act_trajectory, wt_salience, alpha, b_min, b_max, w_eps) -> ndarray:
+    """Single-layer SSC+CSB: rho → ssc_weights → weighted_act → b_j = (s̄/sW)^α."""
 
-def compute_balancing_data(
-    layer_name: str,
-    diagnostics_dir: Path,
-    alpha: float = 0.5,
-    b_min: float = 1e-5,
-    b_max: float = 1e5,
-) -> np.ndarray:
-    """Compute the SSC-weighted balancing vector for a single layer.
+def compute_qkv_balancing(block_idx, side, diagnostics_dir, method, ...) -> ndarray:
+    """Shared QKV balancing: merge weight salience via 'max' or 'geomean'."""
 
-    Steps:
-      1. Load activation trajectory and weight salience.
-      2. Compute Spearman ρ trajectory → SSC weights η_t.
-      3. Compute weighted activation salience s̄(X_j).
-      4. Compute b_j = (s̄(X_j) / s(W_j))^α, clamped.
+def calibrate_all_layers(registry, diagnostics_dir, config) -> dict:
+    """Calibrate all target layers.  Returns:
+    {"balancing_vectors": dict[name → ndarray], "b_inv_layers": list[str]}"""
 
-    Returns: b_vector of shape [d_in].
-    """
+def build_lightweight_registry(diagnostics_dir) -> list[dict]:
+    """Build registry from config.json (no model load needed for calibration-only)."""
 
-def compute_qkv_balancing(
-    block_idx: int,
-    side: str,
-    diagnostics_dir: Path,
-    method: str = "max",
-    alpha: float = 0.5,
-) -> np.ndarray:
-    """Compute the shared balancing vector for Q/K/V projections.
-
-    Loads weight salience for q_proj, k_proj, v_proj and merges
-    using the specified method ("max" or "geomean").
-    Uses the shared activation trajectory (from q_proj).
-
-    Returns: b_qkv of shape [hidden_size].
-    """
+def save_calibration(calibration, output_dir) -> None:
+def load_calibration(output_dir) -> dict:
 ```
 
 ### 10.4 balance.py
 
-**Key functions:**
-
 ```python
-def absorb_into_adaln(
-    adaln_linear: nn.Linear,
-    b_qkv: np.ndarray,
-    b_fc1: np.ndarray | None,
-    hidden_size: int = 1536,
-) -> None:
-    """Modify adaLN_modulation Linear in-place to absorb B⁻¹ for
-    q/k/v_proj (and optionally fc1).
+def absorb_into_adaln(adaln_linear, b_qkv, b_fc1=None, hidden_size=1536) -> None:
+    """Absorb B⁻¹ into adaLN_modulation.layers[1].  b_fc1=None for block 23 text."""
 
-    For block 23 text (num_modulation_params=2), pass b_fc1=None.
-    """
+def absorb_into_final_adaln(adaln_linear, b_final, hidden_size=1536) -> None:
+    """Absorb B⁻¹ into final_layer.adaLN_modulation.layers[1]."""
 
-def absorb_into_final_adaln(
-    adaln_linear: nn.Linear,
-    b_final: np.ndarray,
-    hidden_size: int = 1536,
-) -> None:
-    """Modify final_layer.adaLN_modulation Linear in-place."""
+def balance_weight(linear, b_vector) -> None:
+    """W_new = W * b[None, :].  Bias unchanged."""
 
-def balance_weight(
-    linear: nn.Linear,
-    b_vector: np.ndarray,
-) -> None:
-    """Modify linear.weight in-place: W_new = W * b[None, :].
-
-    The bias (if present) is unchanged.
-    """
-
-def apply_csb_to_model(
-    mmdit,
-    registry: list[dict],
-    diagnostics_dir: Path,
-    config: dict,
-) -> dict[str, np.ndarray]:
-    """Apply CSB to the entire MMDiT model.
-
-    For each block and modality:
-      1. Compute b_qkv, b_fc1, b_o, b_fc2.
-      2. Absorb b_qkv and b_fc1 into adaLN.
-      3. Balance q/k/v/o_proj and fc1/fc2 weights.
-      4. Collect b_inv vectors for o_proj and fc2.
-
-    Returns: dict mapping layer_name → b_inv (only for online-balanced layers).
-    """
+def apply_csb_to_model(mmdit, registry, calibration, hidden_size=1536) -> dict[str, ndarray]:
+    """Full CSB: absorb + balance + collect b_inv.
+    Takes pre-computed calibration dict (not diagnostics_dir).
+    Returns: dict[layer_name → b_inv] for online layers only."""
 ```
 
 ### 10.5 quantize.py
-
-**Key functions and classes:**
 
 ```python
 def fake_quantize_a8(x: mx.array) -> mx.array:
     """Dynamic per-tensor symmetric 8-bit fake quantization."""
 
 class W4A8Linear(nn.Module):
-    """W4A8 quantized linear with optional online CSB balancing.
-    See Section 7.3 for the full specification.
-    """
+    """Drop-in nn.Linear replacement.  See Section 7.3."""
 
-def quantize_model(
-    mmdit,
-    registry: list[dict],
-    b_inv_map: dict[str, np.ndarray],
-    config: dict,
-) -> None:
-    """Replace all target nn.Linear layers with W4A8Linear modules.
+def quantize_model(mmdit, registry, b_inv_map, config) -> dict[str, dict]:
+    """Replace target nn.Linear with W4A8Linear.  Returns layer_meta dict."""
 
-    For each layer in the registry:
-      1. Convert nn.Linear → nn.QuantizedLinear (W4).
-      2. Wrap in W4A8Linear with the appropriate b_inv (or None).
-      3. Replace the module in the model tree.
-    """
+def patch_pipeline_for_quantized_inference(pipeline) -> None:
+    """Capture post-CSB adaLN weights and monkey-patch pipeline.load_mmdit
+    so DiffusionKit restores absorbed (not original) adaLN weights."""
 
-def replace_module_in_model(
-    model,
-    layer_name: str,
-    new_module: nn.Module,
-) -> None:
-    """Navigate the model tree by dotted name and replace the leaf module.
+def save_quantized_model(mmdit, output_dir, config, layer_meta, b_inv_layers) -> None:
+    """Save mmdit_quantized.safetensors + quantize_config.json.
+    Filters out to_offload.* keys before saving."""
 
-    Example: "blocks.5.image.attn.q_proj" →
-      model.multimodal_transformer_blocks[5].image_transformer_block.attn.q_proj
-    """
+def load_quantized_model(pipeline, output_dir) -> dict:
+    """Create W4A8Linear stubs → load weights → patch pipeline."""
 ```
 
-### 10.6 run_quantize.py
-
-CLI entry point:
+### 10.6 diagnose.py (post-quantization diagnostics)
 
 ```python
-def main():
-    """
-    Usage: python -m src.phase2.run_quantize [--model-path PATH] [--output-dir DIR]
-                                             [--qkv-method max|geomean]
-                                             [--alpha 0.5] [--group-size 64]
+def build_quantized_registry(mmdit) -> list[dict]:
+    """Like Phase 1 registry but handles W4A8Linear modules.
+    Recovers d_in from packed QuantizedLinear weights."""
 
-    Steps:
-      1. Load DiffusionPipeline (FP16 model).
-      2. Build layer registry (from phase1.registry).
-      3. Load Phase 1 diagnostics.
-      4. Compute balancing vectors (calibrate.py).
-      5. Apply CSB: absorb into adaLN + balance weights (balance.py).
-      6. Quantize all target layers to W4A8 (quantize.py).
-      7. Save quantized model weights.
-    """
-```
+class QuantizedLinearHook:
+    """Monkey-patches W4A8Linear.__call__ to record input activations
+    BEFORE b_inv scaling and A8 fake-quantization."""
 
-### 10.7 run_inference.py
+def run_quantized_collection(pipeline, seed_prompt_pairs, collector, ...) -> None:
+    """Euler denoising loop on quantized model with hooks (mirrors Phase 1)."""
 
-CLI entry point for generating images with the quantized model:
+def compute_weight_errors(fp16_weight_stats, quantized_registry) -> list[dict]:
+    """Compare FP16 weight salience vs dequantized W4 weights.
+    Returns per-layer MSE, max error, SNR."""
 
-```python
-def main():
-    """
-    Usage: python -m src.phase2.run_inference --quantized-dir DIR
-                                              --prompt "..." [--seed 42]
-                                              [--num-steps 28] [--cfg-weight 5.0]
-                                              [--output image.png]
-
-    Steps:
-      1. Load DiffusionPipeline.
-      2. Load quantized weights (replacing nn.Linear with W4A8Linear).
-      3. Run standard inference pipeline (encode_text → denoise → decode).
-      4. Save output image.
-    """
+def compare_activation_trajectories(fp16_act_dir, w4a8_act_dir, layer_names) -> list[dict]:
+    """Per-step MSE, SNR, and relative shift between FP16 and W4A8 trajectories."""
 ```
 
 ---
 
-## 11. End-to-End Pipeline
+## 11. Calibration Settings
 
-The complete quantization process from Phase 1 data to quantized inference:
+| Parameter | Value | Notes |
+|---|---|---|
+| Calibration data | 100 MS-COCO prompt-seed pairs | `src/settings/coco_100_calibration_prompts.txt` |
+| Evaluation data | 256 prompt-seed pairs | `src/settings/evaluation_set.txt` |
+| Prompt-seed format | `<seed>\t<prompt>` per line | Each prompt has a dedicated seed |
+| Image resolution | 512×512 | Latent size (64, 64) |
+| CFG weight | 4.0 | Classifier-free guidance |
+| Denoising steps | 30 | Euler ODE sampler |
+| Sampler | Euler (rectified flow) | `shift=1.0` for SD3 Medium |
+| Model | `argmaxinc/mlx-stable-diffusion-3-medium` | SD3 2B, fp16 |
+
+The seed-prompt pair format means each calibration/evaluation prompt has its own dedicated seed. The pairs are loaded via `_load_seed_prompt_pairs()` and passed as `list[tuple[int, str]]` throughout the pipeline — no cross-product of prompts × seeds.
+
+---
+
+## 12. Precision Strategy
+
+Precision varies by pipeline stage to balance accuracy and efficiency:
+
+| Stage | Model Execution | Math / Statistics | Stored As |
+|---|---|---|---|
+| Phase 1: data collection | **fp16** (model forward pass) | **fp32** (all reductions via `.astype(mx.float32)`) | **fp32** numpy `.npz` |
+| Phase 2a: calibration | No model (pure computation) | **float64** (numpy default) | **fp64** `.npz` |
+| Phase 2b: CSB absorption | N/A (in-place weight modification) | **float64** (numpy arrays) | Written back as **fp16** (`adaln_linear.weight.dtype`) |
+| Phase 2b: weight balancing | N/A | **float64** (numpy) | Written back as **fp16** |
+| Phase 2c: W4 quantization | N/A | Internal to `mx.quantize` | **4-bit** packed `uint32` + fp16 scales/biases |
+| Online `b_inv` vectors | Used at inference time | **fp32** multiplication, cast back to fp16 | **fp32** (in model parameters) |
+| Inference: model forward | **fp16** | fp16 (+ fp32 for `b_inv` multiply) | — |
+| Inference: A8 fake-quant | Applied per-layer at runtime | fp16 | — |
+
+**Rationale:** High-precision math (fp32/fp64) during calibration and absorption prevents rounding errors from accumulating across hundreds of layers. The final model runs entirely in fp16 (the same precision as the original model), with the single exception of `b_inv` being fp32 for numerical safety.
+
+---
+
+## 13. DiffusionKit Integration: adaLN Cache and `to_offload`
+
+### 13.1 The Modulation Caching Mechanism
+
+DiffusionKit's `cache_modulation_params()` pre-computes all adaLN modulation outputs for all timesteps and stores them in `_modulation_params`. After caching, it **offloads** the adaLN MLP weights (sets them to empty arrays) to save memory, storing the list of offloaded modules in a `to_offload` attribute.
+
+During the denoising loop, the adaLN MLP is not executed — only cached parameters are looked up. `clear_modulation_params_cache()` clears the `_modulation_params` dict but does **not** restore the offloaded weights.
+
+### 13.2 Weight Restoration Pattern
+
+Both Phase 1 collection and Phase 2 diagnostics must handle this correctly for multi-prompt runs. The pattern used throughout:
+
+```python
+from mlx.utils import tree_flatten
+
+# Capture adaLN weights BEFORE the denoising loop
+_adaln_cache = [
+    (k, v) for k, v in tree_flatten(pipeline.mmdit.parameters())
+    if "adaLN" in k
+]
+
+for seed, prompt in seed_prompt_pairs:
+    # ... encode text, create noise ...
+    pipeline.mmdit.cache_modulation_params(pooled_conditioning, timesteps)
+    # ... run Euler denoising loop (adaLN weights are now empty arrays) ...
+
+    # Restore adaLN weights for the next iteration
+    pipeline.mmdit.load_weights(_adaln_cache, strict=False)
+    pipeline.mmdit.clear_modulation_params_cache()
+```
+
+### 13.3 The `to_offload` Problem
+
+After `cache_modulation_params()`, the model has a `to_offload` attribute containing references to the offloaded adaLN modules. This attribute:
+
+- Causes `ValueError` during `load_weights` if the saved checkpoint contains `to_offload.*` keys but a fresh model instance doesn't have them.
+- Must be filtered out when saving: `weights = {k: v for k, v in ... if not k.startswith("to_offload.")}`.
+- Must be filtered when loading: `filtered = [(k, v) for k, v in weights.items() if not k.startswith("to_offload.")]`.
+- Should be explicitly deleted after restoration: `delattr(pipeline.mmdit, "to_offload")`.
+
+### 13.4 Pipeline Patching for Quantized Inference
+
+After CSB absorption, the adaLN weights contain the modified (absorbed) values. DiffusionKit's `generate_image` internally calls `clear_modulation_params_cache()` which triggers `load_mmdit(only_modulation_dict=True)` — this would reload the **original** un-absorbed adaLN weights from the HuggingFace checkpoint, undoing the CSB absorption.
+
+`patch_pipeline_for_quantized_inference()` prevents this by:
+
+1. Capturing the current (post-CSB) adaLN weights.
+2. Monkey-patching `pipeline.load_mmdit` so that when called with `only_modulation_dict=True`, it returns the captured post-CSB weights instead of loading originals from disk.
+
+This patch is applied both during `run_quantize.py` (after CSB, before saving) and inside `load_quantized_model()` (after loading saved weights).
+
+---
+
+## 14. End-to-End Data Flow
+
+The complete pipeline from raw prompts to quantized inference, with precision annotations:
 
 ```
-Step 1: Load FP16 model
-         │
-Step 2: Build layer registry (287 layers, 286 targets)
-         │
-Step 3: For each target layer, load Phase 1 data:
-         ├─ activation trajectory [T, d_in]
-         └─ weight salience [d_in]
-         │
-Step 4: For each target layer, compute:
-         ├─ Spearman ρ trajectory [T]
-         ├─ SSC weights η_t [T]
-         ├─ Weighted activation salience s̄(X) [d_in]
-         └─ Balancing vector b [d_in]
-         │
-Step 5: For shared-input layers (QKV), merge balancing vectors
-         using Method 1 (max) or Method 2 (geomean)
-         │
-Step 6: Apply CSB re-parameterization:
-         ├─ Absorb b_qkv, b_fc1 into each block's adaLN weights
-         ├─ Absorb b_final into final_layer adaLN weights
-         ├─ Balance all target layer weights: W *= b[None, :]
-         └─ Store b_inv for o_proj and fc2 (online layers)
-         │
-Step 7: Quantize all target layers:
-         ├─ Convert balanced nn.Linear → nn.QuantizedLinear (W4)
-         └─ Wrap in W4A8Linear (adds A8 + optional online B⁻¹)
-         │
-Step 8: Replace modules in model tree
-         │
-Step 9: Save quantized checkpoint
-         │
-Step 10: Inference — standard DiffusionKit pipeline with quantized model
+src/settings/coco_100_calibration_prompts.txt
+│  (tab-separated: <seed>\t<prompt>)
+│
+▼
+Phase 1: Data Collection  [model runs in fp16, stats in fp32]
+├── build_layer_registry(mmdit)  →  287 layers (286 targets + context_embedder)
+├── compute_weight_salience()    →  s(W_j) = max_i|W_{i,j}|  [fp32]
+│                                    saved: diagnostics/weight_stats.npz
+├── install_hooks()              →  monkey-patch __call__ on all 287 layers
+├── run_diagnostic_collection()  →  Euler loop × 100 prompt-seed pairs
+│   ├── For each (seed, prompt):
+│   │   ├── encode_text → conditioning [fp16]
+│   │   ├── cache_modulation_params → offloads adaLN weights
+│   │   ├── 30 Euler steps: hooks fire, collector.record()
+│   │   │   └── s(X_j^σ) = max|X[:,:,:,j]|  [computed in fp32, stored in fp32 numpy]
+│   │   └── restore adaLN weights from _adaln_cache
+│   └── Aggregation: elementwise max across all runs per (layer, step_idx)
+│       saved: diagnostics/activation_stats/{layer_name}.npz  →  [T=30, d_in]
+└── save_config()  →  diagnostics/config.json  (seed_prompt_pairs, layer_names, etc.)
+│
+▼
+Phase 2a: Calibration  [pure numpy, float64]
+├── For each target layer:
+│   ├── load_phase1_data()          →  act_trajectory [30, d_in], wt_salience [d_in]
+│   ├── compute_spearman_trajectory →  ρ_t [30]  (Spearman ρ per step)
+│   ├── compute_ssc_weights         →  η_t [30]  (softmax of -ρ, Eq. 11)
+│   ├── weighted_act = η @ act      →  s̄(X_j) [d_in]  (SSC-weighted salience)
+│   └── b = (s̄/sW)^α clamped       →  b_j [d_in]  (balancing vector)
+├── For QKV groups: merge weight salience (max or geomean), shared b_qkv
+├── Mark o_proj and fc2 as b_inv_layers (need online balancing)
+└── save_calibration()  →  calibration.npz + calibration_meta.json
+│
+▼
+Phase 2b: CSB Re-parameterization  [numpy float64, written back to fp16]
+├── For each block × modality:
+│   ├── absorb_into_adaln(adaLN_linear, b_qkv, b_fc1)
+│   │   ├── Shift rows: W /= b[:, None],  bias /= b
+│   │   └── Scale rows: W /= b[:, None],  bias = (1+bias)/b - 1
+│   ├── balance_weight(q_proj, b_qkv)  →  W *= b[None, :]
+│   ├── balance_weight(k_proj, b_qkv)
+│   ├── balance_weight(v_proj, b_qkv)
+│   ├── balance_weight(fc1, b_fc1)
+│   ├── balance_weight(o_proj, b_o)    →  + store b_inv = 1/b [fp32]
+│   └── balance_weight(fc2, b_fc2)     →  + store b_inv = 1/b [fp32]
+├── absorb_into_final_adaln(final_adaln, b_final)
+├── balance_weight(final_layer.linear, b_final)
+└── patch_pipeline_for_quantized_inference()
+│
+▼
+Phase 2c: W4A8 Quantization
+├── For each of 286 target layers:
+│   ├── nn.QuantizedLinear.from_linear(linear, group_size=64, bits=4)
+│   │   └── mx.quantize: per-group affine 4-bit (Round-to-Nearest)
+│   ├── W4A8Linear(qlinear, b_inv)  (b_inv=None for absorbed layers)
+│   └── setattr(parent, attr, w4a8_module)  →  replace in model tree
+└── save_quantized_model()
+    ├── mmdit_quantized.safetensors  (filters to_offload.* keys)
+    └── quantize_config.json         (layer metadata, b_inv_layers, hyperparams)
+│
+▼
+Inference  [fp16 model, fp32 b_inv multiply]
+├── load_quantized_model(pipeline, output_dir)
+│   ├── Create W4A8Linear stubs from metadata
+│   ├── Load safetensors weights (filter to_offload.*)
+│   └── patch_pipeline_for_quantized_inference()
+└── pipeline.generate_image(prompt, seed=seed, ...)
+    └── For each denoising step:
+        └── For each W4A8Linear layer:
+            ├── x * b_inv [fp32] → .astype(fp16)   (online layers only)
+            ├── fake_quantize_a8(x)                  (per-tensor symmetric 8-bit)
+            └── qlinear(x)                           (4-bit × fp16 matmul)
 ```
 
 ---
 
-## 12. Practical Notes
+## 15. CLI Reference
 
-### 12.1 Memory Budget
+### 15.1 End-to-End Pipeline (recommended)
+
+```bash
+# Full run: collection + calibration + CSB + quantize + save
+python -m src.phase2.run_e2e --output-dir quantized/
+
+# Quick test with 2 prompt-seed pairs
+python -m src.phase2.run_e2e --output-dir quantized/ --num-prompts 2
+
+# Skip collection (reuse existing Phase 1 diagnostics)
+python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection
+
+# Override hyperparameters
+python -m src.phase2.run_e2e --output-dir quantized/ --alpha 0.3 --qkv-method geomean
+```
+
+### 15.2 Standalone Quantization (requires prior Phase 1 data)
+
+```bash
+# Full: calibrate → balance → quantize → save
+python -m src.phase2.run_quantize --output-dir quantized/
+
+# Calibrate only (no model load)
+python -m src.phase2.run_quantize --calibrate-only --output-dir quantized/
+
+# Use saved calibration, skip recalculation
+python -m src.phase2.run_quantize --from-calibration quantized/ --output-dir quantized/
+```
+
+### 15.3 Image Generation
+
+```bash
+# FP16 baseline — single prompt
+python -m src.phase2.run_inference --mode fp16 --prompt "a cat on a couch" --output-dir results/
+
+# W4A8 quantized — single prompt
+python -m src.phase2.run_inference --mode w4a8 --quantized-dir quantized/ \
+    --prompt "a cat on a couch" --output-dir results/
+
+# Batch evaluation (seed-prompt pairs from file)
+python -m src.phase2.run_inference --mode w4a8 --quantized-dir quantized/ \
+    --prompts-file src/settings/evaluation_set.txt --output-dir results/
+
+# Limit to first 5 pairs for quick test
+python -m src.phase2.run_inference --mode fp16 \
+    --prompts-file src/settings/evaluation_set.txt --num-prompts 5 --output-dir results/
+```
+
+Output layout: `results/fp16/000.png, 001.png, ...` and `results/w4a8/000.png, 001.png, ...`
+
+### 15.4 Post-Quantization Diagnostics
+
+```bash
+# Full diagnostics: collect W4A8 stats + compare vs FP16 + generate plots
+python -m src.phase2.run_diagnose --quantized-dir quantized/ --output-dir post_quant_diagnostics/
+
+# Quick test with 2 prompts
+python -m src.phase2.run_diagnose --quantized-dir quantized/ --num-prompts 2
+
+# Skip collection (reuse existing W4A8 stats)
+python -m src.phase2.run_diagnose --quantized-dir quantized/ --skip-collection
+
+# Analysis + plots only (no model loading)
+python -m src.phase2.run_diagnose --analysis-only --output-dir post_quant_diagnostics/
+```
+
+---
+
+## 16. Practical Notes
+
+### 16.1 Memory Budget
 
 | Component | FP16 size | W4 size | Savings |
 |---|---|---|---|
@@ -911,41 +1030,52 @@ Step 10: Inference — standard DiffusionKit pipeline with quantized model
 | fc1 (47 layers) | 47 × 6144 × 1536 × 2B = 887 MB | 222 MB | 75% |
 | fc2 (47 layers) | 47 × 1536 × 6144 × 2B = 887 MB | 222 MB | 75% |
 | final_layer.linear | 64 × 1536 × 2B = 192 KB | 48 KB | 75% |
-| Online b_inv vectors | — | ~705 KB | — |
+| Online b_inv vectors | — | ~1.4 MB | — |
 | **Total quantized layers** | **~2.67 GB** | **~0.67 GB** | **~2 GB saved** |
 
 Non-quantized components (adaLN, embedders, norms, SDPA, text encoders, VAE) remain at FP16 and are unchanged.
 
-### 12.2 Hyperparameter Sensitivity
+### 16.2 Hyperparameter Sensitivity
 
 - **α (CSB exponent):** α = 0.5 is the SmoothQuant default and a good starting point. Lower α (0.3) applies less balancing, preserving the original weight distribution at the cost of less activation compression. Higher α (0.7) compresses activations more aggressively. Tune based on output quality.
 - **group_size (W4):** Smaller groups (32) provide finer-grained quantization but increase scale/bias overhead. Larger groups (128) are more memory-efficient but may lose precision on layers with heterogeneous weight distributions. Default 64 is a standard balance.
 - **QKV method:** Test both Method 1 (max) and Method 2 (geomean) on a small validation set and compare output MSE.
 
-### 12.3 Validation Strategy
+### 16.3 Validation Strategy
 
 Before full evaluation, verify correctness at each stage:
 
 1. **After CSB absorption:** Run FP16 inference on the balanced (but unquantized) model. The output should be **numerically very close** to the original FP16 model (CSB is mathematically exact — the balancing cancels out). Small differences (max absolute error on the order of $10^{-3}$ for FP16) are expected due to floating-point rounding during weight modification. Larger discrepancies indicate a bug in absorption or weight modification.
 2. **After W4 quantization (no A8):** Run inference with 4-bit weights but FP16 activations. Compare output to FP16 baseline.
 3. **After W4A8:** Run full quantized inference. Compare to FP16 baseline.
+4. **Post-quantization diagnostics:** Use `run_diagnose.py` to collect internal activation statistics from the quantized model and compare per-layer trajectories against FP16 Phase 1 baselines (MSE, SNR, relative shift).
 
 For each comparison, compute:
 - Per-pixel MSE on the denoised latent.
 - Visual inspection on a fixed set of prompts and seeds.
 
-### 12.4 Saving and Loading
+### 16.4 Saving and Loading
 
-The quantized model can be saved as a standard MLX weight file (`.safetensors` or `.npz`). The `W4A8Linear` modules store:
-- Quantized weights (`quantized_weight`, `scales`, `biases`) — from `nn.QuantizedLinear`.
-- `b_inv` vectors (for online-balanced layers).
-- `group_size` and `bits` metadata.
+**Saved artifacts** (in `--output-dir`, default `quantized/`):
 
-A loading function reconstructs the `W4A8Linear` modules from the saved parameters and replaces the corresponding `nn.Linear` modules in the model tree.
+| File | Contents |
+|---|---|
+| `mmdit_quantized.safetensors` | All MMDiT parameters (quantized + non-quantized). `to_offload.*` keys filtered out. |
+| `quantize_config.json` | Hyperparameters, per-layer metadata (`d_in`, `d_out`, `has_bias`, `bits`, `has_b_inv`), `b_inv_layers` list. |
+| `calibration.npz` | Per-layer balancing vectors `b` (float64). |
+| `calibration_meta.json` | Layer names and `b_inv_layers` list. |
+
+**Loading sequence** (`load_quantized_model`):
+
+1. Read `quantize_config.json` to learn which layers are quantized and their shapes.
+2. For each quantized layer, create a `W4A8Linear` stub (with `nn.QuantizedLinear` of correct `d_in`/`d_out`/`bits`/`group_size` and a zero `b_inv` placeholder if needed).
+3. Replace the corresponding `nn.Linear` in the model tree.
+4. Load `mmdit_quantized.safetensors`, filtering out `to_offload.*` keys.
+5. Call `patch_pipeline_for_quantized_inference()` to prevent DiffusionKit from overwriting absorbed adaLN weights.
 
 ---
 
-## 13. References
+## 17. References
 
 - **Phase 1 diagnostics data:** `diagnostics/` (activation trajectories, weight salience, summary table)
 - **Phase 1 findings:** `src/phase1_findings.md` (salience patterns, complementarity, modality asymmetry, risk ranking)
