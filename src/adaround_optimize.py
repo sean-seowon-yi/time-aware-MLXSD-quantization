@@ -921,7 +921,12 @@ def _compute_sigma_weights(
 
     Low-σ (clean) samples get higher weight. offset prevents division
     by zero and controls how aggressively low-σ is emphasized.
-    offset=1.0 gives ~15× ratio between σ=0.03 and σ=14.6.
+
+    The useful offset range depends on σ_max for your noise schedule:
+      SD3 (rectified flow, σ_max=1.0):  offset=0.1 → ~6× ratio, offset=0.3 → ~3× ratio
+      SDXL (EDM-style, σ_max≈14.6):     offset=1.0 → ~15× ratio
+
+    offset=1.0 is nearly flat for SD3 (only ~1.8× ratio) — use 0.1–0.3 instead.
     """
     raw = 1.0 / (sample_sigmas + offset)
     return raw / raw.mean()  # Normalize so mean weight = 1.0
