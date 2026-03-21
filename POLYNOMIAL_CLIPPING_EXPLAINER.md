@@ -108,6 +108,11 @@ Instead of storing a clipping range `α` for every layer at every timestep, we f
 | Cubic R² gain > 0.15 over quadratic | 3 | Cubic captures significant additional structure |
 | Quartic R² gain > 0.10 over cubic | 4 | Reserved for rare complex trajectories |
 
+The choice of degree involves tradeoffs:
+- **Expressiveness**: Higher degree tracks activation changes more precisely
+- **Generalization**: Higher degree risks overfitting calibration data
+- **Inference cost**: Negligible (polynomial evaluation is fast — 2 multiplies and 2 adds per step per layer)
+
 **Per-stream fitting.** Crucially, we fit separate polynomials for the image and text streams. This directly addresses Failure Mode 5 (opposite trajectories) — the image stream's rising polynomial and the text stream's declining polynomial are captured independently.
 
 **How the polynomial connects to AdaRound weight optimization.** This is the part that's easy to miss, because AdaRound optimizes *weights* and the polynomial models *activations*. Here's how they connect:
@@ -147,11 +152,76 @@ The weight is computed per-layer — each linear projection has its own polynomi
 
 **Why this is safe with the p100 schedule.** The p100 schedule has no degree-0 layers. All 285 layers have degree ≥ 2 (quadratic or higher), so every layer has a non-zero derivative and contributes to the loss. The p99.9 schedule produced many flat fits because clipped maxima were more stable; the true-maximum trajectories in p100 have enough natural variation that the fitter always finds meaningful curvature.
 
-**Combined perceptual × sensitivity.** Multiply the trajectory derivative by the perceptual weight: `w(σ) = |dα/dσ| / (σ + offset)`. This focuses the optimizer on timesteps that are *both* perceptually important (low σ, fine detail) *and* where the clipping range is fragile (high derivative). A timestep at σ = 0.1 where α is changing fast gets maximum weight; a timestep at σ = 0.9 where α is flat gets minimal weight. This is the strategy most likely to outperform simple perceptual weighting, because it concentrates optimization effort exactly where quantization is both hardest and most consequential.
+**Combined perceptual × sensitivity.** Multiply the trajectory derivative by the perceptual weight: `w(σ) = |dα/dσ| / (σ + offset)`. This focuses the optimizer on timesteps that are *both* perceptually important (low σ, fine detail) *and* where the clipping range is fragile (high derivative). A timestep at σ = 0.1 where α is changing fast gets maximum weight; a timestep at σ = 0.9 where α is flat gets minimal weight.
+
+For **static (degree-0) layers** where `dα/dσ = 0` everywhere, the combined formula degrades gracefully: the derivative weight is 1.0 (uniform), so it reduces to pure sigma weighting `1 / (σ + offset)`. No timestep sensitivity signal → weight only by perceptual importance. This is the correct fallback.
 
 Both strategies fall directly out of the polynomial representation — a lookup table would require finite-difference approximations for the derivative, which adds noise. The polynomial gives an exact, smooth derivative for free.
 
 **Status:** All weighting strategies are implemented (`--sigma-weighted`, `--derivative-weighted`) but none have been benchmarked yet — the current `quantized_weights_poly` run used uniform weighting (`w = 1`). Perceptual and derivative-based weighting are ready to test but their benefit over uniform is unproven. To our knowledge, no prior work uses activation trajectory derivatives to weight quantization optimization — this would be novel if it works.
+
+### Sigma Weighting in Practice
+
+The perceptual weight `w(σ) = 1 / (σ + offset)` emphasizes low-σ (clean) timesteps over high-σ (noisy) timesteps.
+
+**Concrete examples** (with offset = 1.0):
+- At σ = 1.0 (high noise): w = 1/2 = 0.5
+- At σ = 0.1 (low noise): w = 1/1.1 ≈ 0.91
+- At σ = 0.03 (very clean): w = 1/1.03 ≈ 0.97
+- **Ratio**: ~2× (manageable, not extreme)
+
+**Why not just `1/σ`?** Without an offset, dividing by small σ creates extreme weights:
+```
+1 / 0.001 = 1000
+1 / 1.0   = 1.0
+Ratio: 1000×  ← Disastrous! Near-zero σ steps dominate everything
+```
+The offset **caps the weight ratio** to a reasonable magnitude, preventing single-timestep optimization pathologies.
+
+**Offset tradeoff:**
+- **Large offset** (e.g., 5.0): Flatter weighting; all timesteps matter nearly equally; less emphasis on clean steps
+- **Small offset** (e.g., 0.1): Steep curve; clean steps dominate; risk of ignoring noisy timesteps
+- **Default** (1.0): Balanced — reasonable emphasis on clean timesteps without extreme ratios
+
+### Optimizing the Offset Parameter
+
+**Method 1: Grid Search + Benchmarking (Gold Standard)**
+
+1. Run quantization with multiple offset values: `[0.1, 0.3, 0.5, 1.0, 2.0, 5.0]`
+2. For each, benchmark downstream image quality: PSNR, SSIM, FID
+3. Pick the offset with the best downstream metric
+4. **Cost**: 6× runs, but directly optimizes what matters
+
+```bash
+for offset in 0.1 0.3 0.5 1.0 2.0 5.0; do
+    python src/adaround_optimize.py \
+        --sigma-weighted --sigma-weight-offset $offset \
+        --output-dir "results_offset_${offset}"
+done
+```
+
+**Method 2: Derivative Sensitivity Analysis (Practical)**
+
+If you also use `--derivative-weighted`, inspect the derivative magnitude across σ:
+```
+|dα/dσ| = activation change per unit noise level
+```
+- **Large derivatives at low σ**: Polynomial changes rapidly when signal dominates → prefer smaller offset (emphasize these steps)
+- **Flat derivatives**: Activation trajectory is smooth → larger offset is fine
+- **Derivatives compress to zero**: Some regions are insensitive → larger offset acceptable
+
+Visualize with:
+```bash
+python src/analyze_sigma_weights.py --stats activation_stats_512.npz
+```
+
+**Method 3: Per-Layer Offset Analysis (Advanced)**
+
+Activation sensitivity varies per layer:
+- **Early layers** (embeddings, attention keys): Often stable across σ → tolerate larger offset
+- **Late layers** (outputs, MLP): Often sensitive at low σ → prefer smaller offset
+
+In principle you could learn per-layer offsets, but a fixed global offset is simpler and works well in practice.
 
 ### The Result: Degree Distribution
 
@@ -418,3 +488,44 @@ The complete implementation would require two separate activation collection pas
 7. **Evaluate** — benchmark against RTN baseline and AdaRound-without-CSB
 
 The main new piece of infrastructure is implementing CSB+SSC itself, which is not currently in the codebase. Everything else (activation collection, poly fitting, AdaRound) maps onto existing tooling.
+
+---
+
+## Appendix: Formulas
+
+**Sigma weighting alone:**
+```
+w(σ) = 1 / (σ + offset)
+```
+
+**Derivative weighting alone:**
+```
+w(σ) = |dα/dσ|_mean
+```
+where the mean is computed across all layers in a block, and zero-valued static layers return 1.
+
+**Combined (derivative + sigma):**
+```
+w(σ) = |dα/dσ|_mean × [1 / (σ + offset)]
+then re-normalize: w /= mean(w)
+```
+
+This preserves the relative shape of the derivative signal while emphasizing low-σ samples.
+
+**Inference-time quantization:**
+```
+α(σ)  = c₂·σ² + c₁·σ + c₀       (polynomial evaluation)
+scale = α / 127                    (scale conversion)
+x_q   = clip(round(x / scale), -127, 127) × scale
+```
+
+---
+
+## References
+
+- **Polynomial fitting**: Least-squares fit of degree-n polynomial to (σ, activation absmax) points
+- **AdaRound**: A. Nagel et al., "Up or Down? Adaptive Rounding for Post-Training Quantization" (2021)
+- **Noise schedules**: Karras et al., "Elucidating the Design Space of Diffusion-Based Generative Models" (2022)
+- **TaQ-DiT**: Timestep-aware Quantization for Diffusion Transformers
+- **PTQ4DiT**: Post-training Quantization for Diffusion Transformers
+- **HTG**: Hierarchical Timestep Grouping for DiT quantization
