@@ -181,7 +181,56 @@ The offset **caps the weight ratio** to a reasonable magnitude, preventing singl
 **Offset tradeoff:**
 - **Large offset** (e.g., 5.0): Flatter weighting; all timesteps matter nearly equally; less emphasis on clean steps
 - **Small offset** (e.g., 0.1): Steep curve; clean steps dominate; risk of ignoring noisy timesteps
-- **Default** (1.0): Balanced — reasonable emphasis on clean timesteps without extreme ratios
+- **Default** (1.0): Balanced for SDXL (σ_max≈14.6, gives ~15× ratio) — but nearly flat for SD3 (σ_max=1.0, gives only ~1.8× ratio)
+
+### Calibrating the Offset for Your Noise Schedule
+
+**The offset is not model-agnostic — it must be chosen relative to σ_max.**
+
+The weight ratio between the noisiest and cleanest timestep is:
+
+```
+ratio = w(σ_min) / w(σ_max) = (σ_max + offset) / (σ_min + offset)
+```
+
+For the offset to produce meaningful emphasis, you need a ratio that is large enough to matter but not so large that it destabilizes optimization. The problem is that σ_max differs dramatically between noise schedules:
+
+| Model / Schedule | σ_max | σ_min | offset=1.0 ratio |
+|------------------|-------|-------|-----------------|
+| SDXL (EDM-style) | ~14.6 | ~0.03 | (14.6+1)/(0.03+1) ≈ **15×** |
+| SD3 (rectified flow) | 1.0 | 0.09 | (1.0+1)/(0.09+1) ≈ **1.8×** |
+
+**offset=1.0 is essentially flat weighting for SD3.** The σ_max of 1.0 means the offset swamps the signal — the numerator and denominator differ by only 0.91 units, giving a barely-noticeable 1.8× tilt.
+
+To get a target ratio R for a given σ_max and σ_min, solve for the required offset:
+
+```
+R = (σ_max + offset) / (σ_min + offset)
+R·σ_min + R·offset = σ_max + offset
+offset·(R - 1) = σ_max - R·σ_min
+offset = (σ_max - R·σ_min) / (R - 1)
+```
+
+For SD3 (σ_max=1.0, σ_min=0.09), targeting common ratios:
+
+| Target ratio | Required offset |
+|-------------|----------------|
+| 2× | (1.0 − 2×0.09) / (2−1) = **0.82** |
+| 3× | (1.0 − 3×0.09) / (3−1) = **0.365** |
+| 5× | (1.0 − 5×0.09) / (5−1) = **0.138** |
+| 10× | (1.0 − 10×0.09) / (10−1) = **0.011** |
+
+Practically, offset=0.1–0.3 is the useful range for SD3 — giving 3–6× emphasis on clean timesteps, comparable to what offset=1.0 achieves for SDXL. The full table for SD3:
+
+| offset | w(σ=1.0) | w(σ=0.09) | ratio |
+|--------|----------|-----------|-------|
+| 1.00 | 0.500 | 0.917 | 1.8× |
+| 0.50 | 0.667 | 1.695 | 2.5× |
+| 0.30 | 0.769 | 2.564 | 3.3× |
+| 0.10 | 0.909 | 5.263 | 5.8× |
+| 0.05 | 0.952 | 7.143 | 7.5× |
+
+**Recommended starting point for SD3**: offset=0.1 (≈6× ratio) or offset=0.3 (≈3× ratio). The default offset=1.0 is appropriate for SDXL but nearly useless for SD3.
 
 ### Optimizing the Offset Parameter
 
