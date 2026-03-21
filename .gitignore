@@ -77,3 +77,4 @@ logs/
 *.log
 tmp/
 temp/
+results/
