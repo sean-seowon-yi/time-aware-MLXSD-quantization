@@ -269,7 +269,7 @@ The output (9216 = 6 × 1536) is split into 6 chunks along the last dimension:
 Let $W_{\text{mod}} \in \mathbb{R}^{9216 \times 1536}$ and $b_{\text{mod}} \in \mathbb{R}^{9216}$ denote the adaLN Linear's weight and bias. Given timestep embedding $e$ (after SiLU), each parameter chunk is:
 
 $$
-\beta_1 = e \cdot W_{\text{mod}}[0\!:\!1536]^T + b_{\text{mod}}[0\!:\!1536]
+\beta_1 = e \cdot W_{\text{mod}}[0{:}1536]^T + b_{\text{mod}}[0{:}1536]
 $$
 
 (and similarly for the other chunks).
