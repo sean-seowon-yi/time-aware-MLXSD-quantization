@@ -215,6 +215,7 @@ W_p_balanced = W_p * b_qkv[None, :]  # broadcast across rows (d_out)
 ```
 
 The balanced operation preserves the original output:
+
 $$
 \tilde{X} \cdot \tilde{W}_p^T = (X / b_{\text{qkv}}) \cdot (W_p \cdot b_{\text{qkv}})^T = X \cdot W_p^T
 $$
