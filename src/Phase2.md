@@ -45,7 +45,7 @@
 
 ### 2.1 Salience (PTQ4DiT Eq. 4)
 
-For a linear layer with input activation $X \in \mathbb{R}^{B \times N \times d_{in}}$ and weight $W \in \mathbb{R}^{d_{out} \times d_{in}}$:
+For a linear layer with input activation $X \in \mathbb{R}^{B \times N \times d_{\text{in}}}$ and weight $W \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$:
 
 $$
 s(X_j^{(\sigma)}) = \max_{b,n} |X_{b,n,j}^{(\sigma)}|, \quad s(W_j) = \max_{i} |W_{i,j}|
@@ -80,7 +80,9 @@ $$
 b_j = \left(\frac{\bar{s}(X_j)}{s(W_j)}\right)^{\alpha}, \quad \alpha \in (0, 1)
 $$
 
-Default $\alpha = 0.5$ (geometric mean, from SmoothQuant). The balancing matrix is $B = \text{diag}(b_1, \dots, b_{d_{in}})$.
+Default $\alpha = 0.5$ (geometric mean, from SmoothQuant). The balancing matrix is:
+
+$$B = \text{diag}(b_1, \dots, b_{d_{\text{in}}})$$
 
 The balanced linear operation:
 
@@ -89,8 +91,14 @@ Y = X W^T = \underbrace{(X \cdot B^{-1})}_{\text{balanced activation}} \cdot \un
 $$
 
 In element-wise terms:
-- Balanced activation: $\tilde{X}_j = X_j / b_j$ — reduces dynamic range of high-salience activation channels.
-- Balanced weight: $\tilde{W}_{i,j} = W_{i,j} \cdot b_j$ — increases weight magnitude for those channels (which had low weight salience due to complementarity).
+
+- Balanced activation: reduces dynamic range of high-salience activation channels.
+
+$$\tilde{X}_j = X_j / b_j$$
+
+- Balanced weight: increases weight magnitude for those channels (which had low weight salience due to complementarity).
+
+$$\tilde{W}_{i,j} = W_{i,j} \cdot b_j$$
 
 After balancing, both $\tilde{X}$ and $\tilde{W}$ have more uniform per-channel dynamic ranges, making uniform quantization significantly more effective.
 
@@ -102,7 +110,8 @@ $$
 b_j = \text{clamp}\left(b_j, \; b_{\min}, \; b_{\max}\right)
 $$
 
-Defaults: $b_{\min} = 10^{-2}$, $b_{\max} = 10^{2}$. These bounds ensure $b^{-1}$ stays within float16 range (~65,504) even after online scaling. Additionally, if $s(W_j) < \epsilon$ (dead weight channel), set $b_j = 1$ (no balancing).
+Defaults: $b_{\min} = 10^{-2}$ and $b_{\max} = 10^{2}$. These bounds ensure $b^{-1}$ stays within float16 range (~65,504) even after online scaling.
+Additionally, if $s(W_j) < \epsilon$ (dead weight channel), set $b_j = 1$ (no balancing).
 
 ---
 
@@ -273,7 +282,9 @@ $$
 \tilde{Z}_j = \frac{Z_j}{b_j} = \frac{\text{LN}(X)_j \cdot (1 + \gamma_{1,j}) + \beta_{1,j}}{b_j}
 $$
 
-This must equal $\text{LN}(X)_j \cdot (1 + \tilde{\gamma}_{1,j}) + \tilde{\beta}_{1,j}$ for the modified parameters $\tilde{\gamma}_1, \tilde{\beta}_1$:
+This must equal the following for the modified parameters $\tilde{\gamma}_1$ and $\tilde{\beta}_1$:
+
+$$\text{LN}(X)_j \cdot (1 + \tilde{\gamma}_{1,j}) + \tilde{\beta}_{1,j}$$
 
 $$
 (1 + \tilde{\gamma}_{1,j}) = \frac{1 + \gamma_{1,j}}{b_j}, \qquad \tilde{\beta}_{1,j} = \frac{\beta_{1,j}}{b_j}
@@ -285,7 +296,9 @@ $$
 \tilde{\gamma}_{1,j} = \frac{1 + \gamma_{1,j}}{b_j} - 1
 $$
 
-Since $\gamma_{1,j} = e \cdot W_{\text{mod}}[j']^T + b_{\text{mod}}[j']$ where $j' = j + 1536$:
+Since $j' = j + 1536$ and:
+
+$$\gamma_{1,j} = e \cdot W_{\text{mod}}[j']^T + b_{\text{mod}}[j']$$
 
 $$
 \tilde{\gamma}_{1,j} = \frac{1 + e \cdot W_{\text{mod}}[j']^T + b_{\text{mod}}[j']}{b_j} - 1
@@ -348,8 +361,13 @@ Output is split into 2 chunks:
 Absorption of $b_{\text{final}}$ follows the same derivation:
 
 - **Shift rows `[0:1536]`:** weight divided by $b_j$, bias divided by $b_j$.
-- **Scale rows `[1536:3072]`:** weight divided by $b_j$, bias → $(1 + b_{\text{old}}) / b_j - 1$.
-- **Weight:** `final_layer.linear.weight` balanced as $W_{\text{new}} = W \cdot \text{diag}(b_{\text{final}})$.
+- **Scale rows `[1536:3072]`:** weight divided by $b_j$, bias:
+
+$$(1 + b_{\text{old}}) / b_j - 1$$
+
+- **Weight:** `final_layer.linear.weight` balanced as:
+
+$$W_{\text{new}} = W \cdot \text{diag}(b_{\text{final}})$$
 
 ### 5.6 Combined adaLN Modification (Implementation)
 
@@ -404,7 +422,9 @@ Two layer families cannot absorb $B^{-1}$ into a preceding operation:
 - **`o_proj`**: input is the per-modality SDPA output slice. The preceding operation (joint SDPA) is not modified.
 - **`fc2`**: input is `GELU(fc1(x))`. GELU is nonlinear, so $B^{-1}$ cannot pass through it.
 
-For these layers, $B^{-1}$ is applied **online** as an element-wise multiply at inference time. This happens per-modality (image `o_proj` uses $b_{\text{o\_proj,img}}^{-1}$, text `fc2` uses $b_{\text{fc2,txt}}^{-1}$, etc.).
+For these layers, $B^{-1}$ is applied **online** as an element-wise multiply at inference time. This happens per-modality:
+- Image `o_proj` uses $b_{\text{o\_proj,img}}^{-1}$
+- Text `fc2` uses $b_{\text{fc2,txt}}^{-1}$
 
 ### 6.1 Data Flow with Online Balancing
 
@@ -466,7 +486,7 @@ After CSB balancing, quantize the balanced weight matrix to 4-bit using MLX's bu
 
 **Per-group affine quantization (MLX default):**
 
-For a weight matrix $\tilde{W} \in \mathbb{R}^{d_{out} \times d_{in}}$, partition the $d_{in}$ dimension into groups of size $G$ (default 64). For each group $g$, let $\alpha_g = \max(\tilde{W}_g)$ and $\beta_g = \min(\tilde{W}_g)$:
+For a weight matrix $\tilde{W} \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$, partition the $d_{\text{in}}$ dimension into groups of size $G$ (default 64). For each group $g$, let $\alpha_g = \max(\tilde{W}_g)$ and $\beta_g = \min(\tilde{W}_g)$:
 
 $$
 \text{scale}_g = \frac{\alpha_g - \beta_g}{2^{b} - 1} = \frac{\alpha_g - \beta_g}{15} \quad \text{(for 4-bit)}
