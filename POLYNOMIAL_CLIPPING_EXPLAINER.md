@@ -298,6 +298,20 @@ The degree distribution differs between p99.9 and p100 schedules, because clippe
 
 ---
 
+## 4b. A Note on Layer Counting
+
+The MM-DiT architecture has 24 blocks (mm0 through mm23), each with a dual stream. Naively, that would be 24 × 2 streams × 6 components (k, q, v, o, fc1, fc2) = **288 layers**. The actual count is **285** because the final block (mm23) is architecturally incomplete:
+
+| Block | img stream | txt stream | Total |
+|-------|-----------|-----------|-------|
+| mm0–mm22 (23 blocks) | 12 layers each | 12 layers each | 23 × 12 = 276 |
+| mm23 (last block) | 6 layers (k, q, v, o, fc1, fc2) | 3 layers (k, q, v only) | 6 + 3 = 9 |
+| **Total** | 138 + 66 | 138 + 39 | **285** |
+
+The text stream in mm23 is missing the attention output projection (o_proj) and the entire MLP (fc1, fc2). This architectural choice likely reflects an optimization in the final diffusion step — at that point, the text conditioning has less to contribute, so some pathways are elided. The polynomial schedule captures all 285 layers correctly.
+
+---
+
 ## 5. Why This Is New
 
 ### The idea: continuous σ-dependent clipping
