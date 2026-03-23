@@ -44,6 +44,7 @@ import argparse
 import csv
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -1250,6 +1251,72 @@ def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict],
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint metrics helper
+# ---------------------------------------------------------------------------
+
+def _compute_checkpoint_metrics(
+    gen_dir: Path,
+    n: int,
+    ref_dir: Optional[Path],
+    baseline_dir: Optional[Path],
+    gen_emb_full: Optional[np.ndarray],
+    ref_emb: Optional[np.ndarray],
+    skip_fidelity: bool,
+    skip_clip: bool,
+    skip_paired: bool,
+) -> Dict:
+    """
+    Compute all enabled metrics for the first *n* images in gen_dir.
+
+    CLIP-based metrics (CMMD/PRDC/cos-sim) reuse the already-computed
+    embeddings by slicing gen_emb_full[:n].  All other metrics use a
+    temporary directory of symlinks so the existing metric functions need
+    no changes.
+    """
+    gen_paths_sorted = sorted(gen_dir.glob("*.png"))[:n]
+    result: Dict = {"n_images": n}
+
+    # CLIP-based metrics — free (just slice the embeddings array)
+    if not skip_clip and gen_emb_full is not None and ref_emb is not None:
+        gen_emb_n = gen_emb_full[:n]
+        prdc = compute_prdc_metrics(gen_emb_n, ref_emb, k=5)
+        cmmd_val = compute_cmmd_from_embeddings(gen_emb_n, ref_emb)
+        cos_sim = compute_clip_cosine_similarity(gen_emb_n, ref_emb)
+        if prdc:
+            result.update(prdc)
+        if cmmd_val is not None:
+            result["cmmd"] = cmmd_val
+        if cos_sim is not None:
+            result["clip_cosine_sim"] = cos_sim
+
+    with tempfile.TemporaryDirectory() as _tmpdir:
+        tmp = Path(_tmpdir)
+        for p in gen_paths_sorted:
+            (tmp / p.name).symlink_to(p.resolve())
+
+        # FID / IS / KID / sFID
+        if not skip_fidelity and ref_dir is not None:
+            raw = compute_fidelity_metrics(tmp, ref_dir)
+            if raw:
+                result.update(raw)
+            sfid_val = compute_sfid(str(tmp), str(ref_dir))
+            if sfid_val is not None:
+                result["sfid"] = sfid_val
+
+        # PSNR / LPIPS
+        if not skip_paired and baseline_dir is not None:
+            psnr = compute_psnr_paired(str(tmp), str(baseline_dir))
+            lpips = compute_lpips_paired(str(tmp), str(baseline_dir))
+            if psnr:
+                result.update(psnr)
+            if lpips:
+                result["lpips_mean"] = lpips["lpips_mean"]
+                result["lpips_std"] = lpips["lpips_std"]
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main CLI
 # ---------------------------------------------------------------------------
 
@@ -1319,6 +1386,9 @@ def main() -> None:
                         help="Warmup images excluded from latency stats (default: 2)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip images whose PNG already exists in output_dir/images/")
+    parser.add_argument("--eval-interval", type=int, default=0,
+                        help="Compute cumulative metrics every N images and save to "
+                             "benchmark_checkpoints.json (0 = disabled)")
 
     args = parser.parse_args()
 
@@ -1347,6 +1417,8 @@ def main() -> None:
     timings: List[float] = []
     memory_stats: Dict = {"peak_metal_mb": 0.0, "peak_rss_mb": 0.0}
     fidelity_result: Optional[Dict] = None
+    _clip_gen_emb: Optional[np.ndarray] = None  # kept for checkpoint loop
+    _clip_ref_emb: Optional[np.ndarray] = None
     paired_result: Optional[Dict] = None
     model_stats: Optional[Dict] = None
 
@@ -1439,6 +1511,8 @@ def main() -> None:
                 if clip_cache is not None:
                     gen_emb = clip_cache["generated_embeddings"]
                     ref_emb = clip_cache["reference_embeddings"]
+                    _clip_gen_emb = gen_emb
+                    _clip_ref_emb = ref_emb
                     prdc = compute_prdc_metrics(gen_emb, ref_emb, k=5)
                     cmmd_val = compute_cmmd_from_embeddings(gen_emb, ref_emb)
                     cos_sim = compute_clip_cosine_similarity(gen_emb, ref_emb)
@@ -1475,6 +1549,47 @@ def main() -> None:
                 paired_result["lpips_mean"] = lpips_result["lpips_mean"]
                 paired_result["lpips_std"] = lpips_result["lpips_std"]
             paired_result["baseline_dir"] = str(base_dir)
+
+    # ------------------------------------------------------------------
+    # Phase 4 — Cumulative checkpoint metrics (every --eval-interval images)
+    # ------------------------------------------------------------------
+    checkpoints: Optional[Dict] = None
+    if args.eval_interval > 0:
+        n_total = len(list(generated_dir.glob("*.png")))
+        ns = list(range(args.eval_interval, n_total, args.eval_interval))
+        # Always include the full set as the final checkpoint
+        if not ns or ns[-1] != n_total:
+            ns.append(n_total)
+
+        print(f"\n=== Computing checkpoint metrics at {ns} images ===")
+        checkpoints = {}
+        ref_dir_ck = args.reference_dir if (
+            not args.skip_metrics and args.reference_dir is not None
+            and args.reference_dir.exists()
+        ) else None
+        base_dir_ck = args.baseline_dir if (
+            not args.skip_paired_metrics and args.baseline_dir is not None
+            and args.baseline_dir.exists()
+        ) else None
+
+        for n in ns:
+            print(f"  checkpoint n={n} …")
+            checkpoints[str(n)] = _compute_checkpoint_metrics(
+                gen_dir=generated_dir,
+                n=n,
+                ref_dir=ref_dir_ck,
+                baseline_dir=base_dir_ck,
+                gen_emb_full=_clip_gen_emb,
+                ref_emb=_clip_ref_emb,
+                skip_fidelity=args.skip_metrics,
+                skip_clip=args.skip_clip_metrics,
+                skip_paired=args.skip_paired_metrics,
+            )
+
+        ck_path = output_dir / "benchmark_checkpoints.json"
+        with open(ck_path, "w") as f:
+            json.dump(checkpoints, f, indent=2)
+        print(f"✓ benchmark_checkpoints.json → {ck_path}")
 
     # ------------------------------------------------------------------
     # Latency stats
