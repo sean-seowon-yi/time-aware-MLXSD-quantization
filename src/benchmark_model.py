@@ -1287,7 +1287,7 @@ def main() -> None:
                         help="Number of images to generate (default: 150)")
     parser.add_argument("--num-steps", type=int, default=30,
                         help="Denoising steps per image (default: 28)")
-    parser.add_argument("--cfg-scale", type=float, default=1.5,
+    parser.add_argument("--cfg-scale", type=float, default=4.0,
                         help="CFG guidance weight (default: 1.5)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Base seed; image i uses seed+i (default: 42)")
