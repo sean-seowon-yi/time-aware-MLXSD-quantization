@@ -1285,7 +1285,7 @@ def main() -> None:
                         help="CSV file with 'prompt' column (default: all_prompts.csv)")
     parser.add_argument("--num-images", type=int, default=150,
                         help="Number of images to generate (default: 150)")
-    parser.add_argument("--num-steps", type=int, default=28,
+    parser.add_argument("--num-steps", type=int, default=30,
                         help="Denoising steps per image (default: 28)")
     parser.add_argument("--cfg-scale", type=float, default=1.5,
                         help="CFG guidance weight (default: 1.5)")
