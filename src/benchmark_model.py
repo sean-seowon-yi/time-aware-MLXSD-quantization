@@ -1260,8 +1260,10 @@ def main() -> None:
     # Config
     parser.add_argument(
         "--config", type=str, default="fp16",
-        choices=["fp16", "naive_int8", "adaround_w4", "adaround_w4a8", "taqdit_w4a8", "mlx_int4"],
-        help="Quantization config to benchmark",
+        help="Quantization config label (e.g. fp16, w4a8_rtn, adaround_w4a8_poly). "
+             "Use 'fp16' or 'naive_int8' for built-in configs; any other string is a "
+             "descriptive label and the actual quantization is determined by "
+             "--adaround-output, --poly-schedule, etc.",
     )
     parser.add_argument("--adaround-output", type=Path, default=None,
                         help="AdaRound weights dir (from adaround_optimize.py)")
