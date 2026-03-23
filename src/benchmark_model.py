@@ -402,6 +402,24 @@ def compute_prdc_metrics(
     }
 
 
+def compute_clip_cosine_similarity(
+    gen_emb: np.ndarray,
+    ref_emb: np.ndarray,
+) -> Optional[float]:
+    """
+    Compute mean cosine similarity between generated and reference CLIP embeddings.
+
+    Embeddings are L2-normalized 768-d CLS vectors from ViT-L/14, so
+    cosine similarity reduces to a dot product.  Returns the mean over all
+    cross-set pairs (n_gen × n_ref), giving a distribution-level similarity
+    score in [-1, 1] (higher = more similar).
+    """
+    if gen_emb.shape[0] < 1 or ref_emb.shape[0] < 1:
+        return None
+    sim_matrix = gen_emb @ ref_emb.T  # (n_gen, n_ref)
+    return float(sim_matrix.mean())
+
+
 def compute_cmmd_from_embeddings(
     gen_emb: np.ndarray,
     ref_emb: np.ndarray,
@@ -1075,6 +1093,9 @@ def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict]) 
         cmmd = fidelity.get("cmmd")
         if cmmd is not None:
             print(f"CMMD:          {cmmd:.4f}")
+        cos_sim = fidelity.get("clip_cosine_sim")
+        if cos_sim is not None:
+            print(f"CLIP cos sim:  {cos_sim:.4f}")
         prdc_p = fidelity.get("prdc_precision")
         prdc_r = fidelity.get("prdc_recall")
         prdc_d = fidelity.get("prdc_density")
@@ -1273,12 +1294,15 @@ def main() -> None:
                     ref_emb = clip_cache["reference_embeddings"]
                     prdc = compute_prdc_metrics(gen_emb, ref_emb, k=5)
                     cmmd_val = compute_cmmd_from_embeddings(gen_emb, ref_emb)
+                    cos_sim = compute_clip_cosine_similarity(gen_emb, ref_emb)
                     if fidelity_result is None:
                         fidelity_result = {}
                     if prdc is not None:
                         fidelity_result.update(prdc)
                     if cmmd_val is not None:
                         fidelity_result["cmmd"] = cmmd_val
+                    if cos_sim is not None:
+                        fidelity_result["clip_cosine_sim"] = cos_sim
                     fidelity_result["clip_model"] = clip_cache.get("clip_model_id")
                 else:
                     print("WARNING: CLIP metrics unavailable — skipping PRDC/CMMD.")
