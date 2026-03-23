@@ -692,11 +692,23 @@ def compute_model_size(pipeline) -> Dict:
 # Prompt loading
 # ---------------------------------------------------------------------------
 
-def load_prompts(prompt_path: Path, max_count: int) -> List[str]:
+def load_prompts(
+    prompt_path: Path, max_count: int
+) -> Tuple[List[str], Optional[List[int]]]:
     """
     Load up to max_count prompts from a CSV ('prompt' column) or a plain-text
     file (.txt, one prompt per line).  Falls back to three synthetic prompts if
     the file does not exist.
+
+    Tab-separated .txt files with format ``seed<TAB>prompt`` are detected
+    automatically; in that case a list of per-image seeds is also returned.
+
+    Returns
+    -------
+    prompts : list of str
+    seeds : list of int or None
+        Per-image seeds when the file has the ``seed<TAB>prompt`` format,
+        otherwise None (caller should use seed_base + img_idx).
     """
     if not prompt_path.exists():
         fallback = [
@@ -704,19 +716,35 @@ def load_prompts(prompt_path: Path, max_count: int) -> List[str]:
             "abstract art with vibrant colors",
             "a landscape with mountains",
         ]
-        return fallback[:max_count]
+        return fallback[:max_count], None
 
     prompts: List[str] = []
+    seeds: Optional[List[int]] = None
 
     if prompt_path.suffix.lower() == ".txt":
         with open(prompt_path, encoding="utf-8") as f:
-            for line in f:
+            lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+
+        # Detect tab-separated seed<TAB>prompt format from first non-empty line
+        if lines and "\t" in lines[0]:
+            seeds = []
+            for line in lines:
                 if len(prompts) >= max_count:
                     break
-                p = line.strip()
-                if p:
-                    prompts.append(p)
-        return prompts
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    try:
+                        seeds.append(int(parts[0].strip()))
+                        prompts.append(parts[1].strip())
+                    except ValueError:
+                        pass  # skip malformed lines
+        else:
+            for line in lines:
+                if len(prompts) >= max_count:
+                    break
+                if line:
+                    prompts.append(line)
+        return prompts, seeds
 
     with open(prompt_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -726,7 +754,7 @@ def load_prompts(prompt_path: Path, max_count: int) -> List[str]:
             p = row.get("prompt", "").strip()
             if p:
                 prompts.append(p)
-    return prompts
+    return prompts, None
 
 
 # ---------------------------------------------------------------------------
@@ -1049,6 +1077,7 @@ def generate_images(
     poly_schedule: Optional[Dict] = None,
     lut_schedule: Optional[Dict] = None,
     poly_margin: float = 1.0,
+    seeds: Optional[List[int]] = None,
 ) -> Tuple[List[float], Dict]:
     """
     Generate images for all prompts and return timing + memory stats.
@@ -1096,7 +1125,7 @@ def generate_images(
                 print(f"  [resume] skipping {img_idx:04d}.png")
             continue
 
-        seed = seed_base + img_idx
+        seed = seeds[img_idx] if seeds is not None else seed_base + img_idx
         reset_metal_peak_memory()
 
         t0 = time.time()
@@ -1323,9 +1352,11 @@ def main() -> None:
     # Phase 1 — Image generation
     # ------------------------------------------------------------------
     if not args.skip_generation:
-        prompts = load_prompts(prompt_csv, args.num_images)
+        prompts, prompt_seeds = load_prompts(prompt_csv, args.num_images)
         print(f"=== Generating {len(prompts)} images (config={args.config}) ===")
         print(f"  Output: {output_dir / 'images'}")
+        if prompt_seeds is not None:
+            print("  Seeds: per-image seeds loaded from prompt file")
         if args.resume:
             print("  Resume mode: existing PNGs will be skipped")
 
@@ -1345,6 +1376,7 @@ def main() -> None:
             poly_schedule=poly_schedule,
             lut_schedule=lut_schedule,
             poly_margin=args.poly_margin,
+            seeds=prompt_seeds,
         )
 
         # Compute model size once after generation (pipeline discarded per-image;
