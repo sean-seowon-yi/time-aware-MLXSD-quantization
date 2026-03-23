@@ -420,6 +420,103 @@ def compute_clip_cosine_similarity(
     return float(sim_matrix.mean())
 
 
+def compute_psnr_paired(
+    generated_dir: str,
+    baseline_dir: str,
+) -> Optional[Dict]:
+    """
+    Compute mean PSNR between matched image pairs (same filename in both dirs).
+
+    Matches images by sorted filename (0000.png vs 0000.png, etc.).  Warns
+    and skips unmatched files when counts differ.
+
+    Returns dict with keys psnr_mean, psnr_std, n_pairs, or None if no pairs found.
+    """
+    from PIL import Image as PILImage
+
+    gen_paths = {p.name: p for p in sorted(Path(generated_dir).glob("*.png"))}
+    base_paths = {p.name: p for p in sorted(Path(baseline_dir).glob("*.png"))}
+    common = sorted(set(gen_paths) & set(base_paths))
+
+    if not common:
+        print("WARNING: PSNR — no matching filenames between generated and baseline dirs.")
+        return None
+
+    n_gen, n_base = len(gen_paths), len(base_paths)
+    if n_gen != n_base:
+        print(f"WARNING: PSNR — {n_gen} generated vs {n_base} baseline images; "
+              f"computing on {len(common)} matched pairs.")
+
+    psnr_values = []
+    for name in common:
+        gen_img = np.array(PILImage.open(gen_paths[name]).convert("RGB"), dtype=np.float64)
+        base_img = np.array(PILImage.open(base_paths[name]).convert("RGB"), dtype=np.float64)
+        mse = np.mean((gen_img - base_img) ** 2)
+        psnr = 20.0 * np.log10(255.0 / np.sqrt(mse)) if mse > 0 else float("inf")
+        psnr_values.append(psnr)
+
+    finite = [v for v in psnr_values if np.isfinite(v)]
+    return {
+        "psnr_mean": float(np.mean(psnr_values)),
+        "psnr_std": float(np.std(finite)) if finite else 0.0,
+        "n_pairs": len(psnr_values),
+    }
+
+
+def compute_lpips_paired(
+    generated_dir: str,
+    baseline_dir: str,
+) -> Optional[Dict]:
+    """
+    Compute mean LPIPS between matched image pairs using AlexNet.
+
+    Requires ``pip install lpips``.  Returns None gracefully if unavailable.
+    Images are resized to 256×256 and normalised to [-1, 1].
+
+    Returns dict with keys lpips_mean, lpips_std, n_pairs.
+    """
+    try:
+        import lpips as lpips_lib
+        import torch
+    except ImportError:
+        print("WARNING: lpips not installed — skipping LPIPS. "
+              "Install with: pip install lpips")
+        return None
+
+    from PIL import Image as PILImage
+    import torchvision.transforms as T
+
+    loss_fn = lpips_lib.LPIPS(net="alex", verbose=False)
+    loss_fn.eval()
+
+    preprocess = T.Compose([
+        T.Resize((256, 256)),
+        T.ToTensor(),                        # [0, 1]
+        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # [-1, 1]
+    ])
+
+    gen_paths = {p.name: p for p in sorted(Path(generated_dir).glob("*.png"))}
+    base_paths = {p.name: p for p in sorted(Path(baseline_dir).glob("*.png"))}
+    common = sorted(set(gen_paths) & set(base_paths))
+
+    if not common:
+        print("WARNING: LPIPS — no matching filenames between generated and baseline dirs.")
+        return None
+
+    scores = []
+    with torch.no_grad():
+        for name in common:
+            gen_t = preprocess(PILImage.open(gen_paths[name]).convert("RGB")).unsqueeze(0)
+            base_t = preprocess(PILImage.open(base_paths[name]).convert("RGB")).unsqueeze(0)
+            scores.append(float(loss_fn(gen_t, base_t).item()))
+
+    return {
+        "lpips_mean": float(np.mean(scores)),
+        "lpips_std": float(np.std(scores)),
+        "n_pairs": len(scores),
+    }
+
+
 def compute_cmmd_from_embeddings(
     gen_emb: np.ndarray,
     ref_emb: np.ndarray,
@@ -1062,7 +1159,8 @@ def generate_images(
 # Section 5 — Console output helpers
 # ---------------------------------------------------------------------------
 
-def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict]) -> None:
+def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict],
+                   paired: Optional[Dict] = None) -> None:
     print(f"\n{'='*50}")
     print(f"=== Benchmark Results: {config} ===")
     print(f"{'='*50}")
@@ -1110,6 +1208,16 @@ def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict]) 
             print(f"PRDC Coverage: {prdc_c:>10.4f}")
     else:
         print("FID/IS/KID:    skipped")
+
+    if paired is not None:
+        psnr = paired.get("psnr_mean")
+        lpips_val = paired.get("lpips_mean")
+        if psnr is not None:
+            print(f"PSNR:          {psnr:.2f} dB  (std={paired.get('psnr_std', 0):.2f}, "
+                  f"n={paired.get('n_pairs', 0)})")
+        if lpips_val is not None:
+            print(f"LPIPS:         {lpips_val:.4f}  (std={paired.get('lpips_std', 0):.4f}, "
+                  f"n={paired.get('n_pairs', 0)})")
 
 
 # ---------------------------------------------------------------------------
@@ -1164,8 +1272,12 @@ def main() -> None:
                         help="Reference image dir for FID/IS/KID (omit to skip metrics)")
     parser.add_argument("--generated-dir", type=Path, default=None,
                         help="Override generated image dir for metrics phase")
+    parser.add_argument("--baseline-dir", type=Path, default=None,
+                        help="FP16 baseline image dir for paired metrics (PSNR + LPIPS)")
     parser.add_argument("--skip-clip-metrics", action="store_true",
                         help="Skip CLIP-based metrics (PRDC + CMMD)")
+    parser.add_argument("--skip-paired-metrics", action="store_true",
+                        help="Skip paired metrics (PSNR + LPIPS) even if --baseline-dir is set")
 
     # Phase control
     parser.add_argument("--skip-generation", action="store_true",
@@ -1204,6 +1316,7 @@ def main() -> None:
     timings: List[float] = []
     memory_stats: Dict = {"peak_metal_mb": 0.0, "peak_rss_mb": 0.0}
     fidelity_result: Optional[Dict] = None
+    paired_result: Optional[Dict] = None
     model_stats: Optional[Dict] = None
 
     # ------------------------------------------------------------------
@@ -1308,6 +1421,28 @@ def main() -> None:
                     print("WARNING: CLIP metrics unavailable — skipping PRDC/CMMD.")
 
     # ------------------------------------------------------------------
+    # Phase 3 — Paired metrics (PSNR + LPIPS vs FP16 baseline)
+    # ------------------------------------------------------------------
+    if not args.skip_paired_metrics and args.baseline_dir is not None:
+        base_dir = args.baseline_dir
+        if not base_dir.exists():
+            print(f"WARNING: baseline_dir {base_dir} does not exist — skipping paired metrics")
+        else:
+            n_gen = len(list(generated_dir.glob("*.png")))
+            n_base = len(list(base_dir.glob("*.png")))
+            print(f"\n=== Computing paired metrics "
+                  f"({n_gen} generated vs {n_base} baseline) ===")
+            psnr_result = compute_psnr_paired(str(generated_dir), str(base_dir))
+            lpips_result = compute_lpips_paired(str(generated_dir), str(base_dir))
+            paired_result = {}
+            if psnr_result is not None:
+                paired_result.update(psnr_result)
+            if lpips_result is not None:
+                paired_result["lpips_mean"] = lpips_result["lpips_mean"]
+                paired_result["lpips_std"] = lpips_result["lpips_std"]
+            paired_result["baseline_dir"] = str(base_dir)
+
+    # ------------------------------------------------------------------
     # Latency stats
     # ------------------------------------------------------------------
     # Filter out resume-skipped images (timings == 0.0) before computing stats
@@ -1333,6 +1468,7 @@ def main() -> None:
         "memory": memory_stats,
         "model": model_stats,
         "fidelity": fidelity_result,
+        "paired": paired_result,
     }
 
     json_path = output_dir / "benchmark.json"
@@ -1343,7 +1479,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Console summary
     # ------------------------------------------------------------------
-    _print_results(args.config, lat_stats, memory_stats, fidelity_result)
+    _print_results(args.config, lat_stats, memory_stats, fidelity_result, paired=paired_result)
     print("\n✓ Complete")
 
 
