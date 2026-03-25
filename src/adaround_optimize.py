@@ -569,6 +569,7 @@ class _QuantProxy:
         qmax_a: int,
         poly_alpha: Optional[float] = None,  # if set, overrides a_scale
         poly_shift: Optional[float] = None,  # if set, uses asymmetric quant
+        sq_scale: Optional[mx.array] = None,  # SmoothQuant per-channel scale s[c]
     ):
         self._orig = orig_layer
         self._soft_weight = soft_weight
@@ -577,8 +578,15 @@ class _QuantProxy:
         self._qmax_a = qmax_a
         self._poly_alpha = poly_alpha
         self._poly_shift = poly_shift
+        self._sq_scale = sq_scale
 
     def __call__(self, x: mx.array) -> mx.array:
+        # SmoothQuant: divide activations by per-channel scale before fake-quant
+        sq_vec = None
+        if self._sq_scale is not None:
+            sq_vec = self._sq_scale
+            x = x / sq_vec
+
         if self._poly_alpha is not None and self._poly_shift is not None:
             # Asymmetric path: center ± range → [min_val, max_val]
             center = self._poly_shift
@@ -592,6 +600,9 @@ class _QuantProxy:
             x_q = fake_quant_per_tensor(x, scale, self._qmin_a, self._qmax_a)
         else:
             x_q = fake_quant_per_tensor(x, self._a_scale, self._qmin_a, self._qmax_a)
+
+        # No SQ restore needed: soft_weight already contains W' = W*diag(s),
+        # so W' @ fake_quant(x/s) ≈ W @ x (the s factors cancel).
         y = x_q @ self._soft_weight.T
         if hasattr(self._orig, "bias") and self._orig.bias is not None:
             y = y + self._orig.bias
@@ -684,6 +695,7 @@ def block_loss_fn(
     b_val: float,
     poly_alphas: Optional[List[Optional[float]]] = None,  # per-linear poly α for this sample's σ
     poly_shifts: Optional[List[Optional[float]]] = None,  # per-linear poly shift for asymmetric quant
+    sq_scales_list: Optional[List[Optional[np.ndarray]]] = None,  # SmoothQuant per-channel scales
 ) -> mx.array:
     """
     Compute block-level reconstruction + round loss for one mini-batch sample.
@@ -723,6 +735,8 @@ def block_loss_fn(
         orig_layers.append(_get_nested(block, path))
         pa = poly_alphas[i] if poly_alphas else None
         ps = poly_shifts[i] if poly_shifts else None
+        sq_arr = sq_scales_list[i] if sq_scales_list else None
+        sq_mx = mx.array(sq_arr, dtype=mx.float32) if sq_arr is not None else None
         proxy = _QuantProxy(
             linear_layers[i],
             soft_weights[i],
@@ -731,6 +745,7 @@ def block_loss_fn(
             params.qmax_a,
             poly_alpha=pa,
             poly_shift=ps,
+            sq_scale=sq_mx,
         )
         _set_nested(block, path, proxy)
 
@@ -775,6 +790,7 @@ def batched_block_reconstruction_loss_fn(
     sample_weights_batch: Optional[mx.array],  # [B] weights or None
     bits_w: int = 4,
     bits_a: int = 8,
+    sq_scales_list: Optional[List[Optional[np.ndarray]]] = None,  # SmoothQuant per-channel scales
 ) -> Tuple[mx.array, mx.array]:  # (weighted_loss, unweighted_loss)
     """
     Single batched forward pass for B samples stacked along the batch axis.
@@ -822,6 +838,8 @@ def batched_block_reconstruction_loss_fn(
         original_layers.append((path, _get_nested(block, path)))
         pa = poly_alphas[i] if poly_alphas is not None else None
         ps = poly_shifts[i] if poly_shifts is not None else None
+        sq_arr = sq_scales_list[i] if sq_scales_list else None
+        sq_mx = mx.array(sq_arr, dtype=mx.float32) if sq_arr is not None else None
         proxy = _QuantProxy(
             linear_layers[i],
             soft_weights[i],
@@ -830,6 +848,7 @@ def batched_block_reconstruction_loss_fn(
             p_qmax_a,
             poly_alpha=pa,
             poly_shift=ps,
+            sq_scale=sq_mx,
         )
         _set_nested(block, path, proxy)
 
@@ -1135,6 +1154,7 @@ def optimize_block(
     derivative_weighted: bool = False,
     exclude_keys: Optional[set] = None,
     asymmetric_act: bool = False,
+    sq_scales: Optional[Dict] = None,
 ) -> Tuple[AdaRoundParams, Dict]:
     """
     Run AdaRound optimisation for a single transformer block.
@@ -1167,6 +1187,28 @@ def optimize_block(
     linear_paths = [p for i, (p, _, _) in enumerate(linears) if i not in excluded_indices]
     linear_layers = [l for i, (_, l, _) in enumerate(linears) if i not in excluded_indices]
     W_fps_np = [np.array(l.weight) for l in linear_layers]
+
+    # SmoothQuant Path B: pre-scale FP16 weights by s[c] before AdaRound optimization.
+    # W' = W * diag(s)  — the optimizer learns rounding on the smoothed distribution.
+    sq_scales_list: Optional[List[Optional[np.ndarray]]] = None
+    if sq_scales is not None:
+        sq_layer_scales = sq_scales.get("layers", {})
+        sq_scales_list = []
+        smoothed_count = 0
+        for W, path in zip(W_fps_np, linear_paths):
+            key = _path_to_poly_key(block_name, is_mm, path)
+            if key in sq_layer_scales:
+                sq_scales_list.append(np.array(sq_layer_scales[key], dtype=np.float32))
+                smoothed_count += 1
+            else:
+                sq_scales_list.append(None)
+        W_fps_np = [
+            W * sq_scales_list[i][np.newaxis, :] if sq_scales_list[i] is not None else W
+            for i, W in enumerate(W_fps_np)
+        ]
+        if smoothed_count:
+            print(f"  SmoothQuant: pre-scaled {smoothed_count}/{len(linear_paths)} layers", flush=True)
+
     w_scales_np = [compute_per_channel_scale(W, bits_w) for W in W_fps_np]
 
     # Initialize a_scale from poly schedule when no prior is provided.
@@ -1336,6 +1378,7 @@ def optimize_block(
                         s_inputs_b, s_kwargs_b, s_outputs_b,
                         b_val, poly_alphas_b, poly_shifts_b, B, w_batch,
                         params.bits_w, params.bits_a,
+                        sq_scales_list,
                     )
                 finally:
                     clear_batched_mod_params(block, is_mm)
@@ -1422,6 +1465,7 @@ def optimize_block(
                         W_fps_np, w_scales_np,
                         s_inputs, s_kwargs, s_outputs,
                         b_val, poly_alphas, poly_shifts,
+                        sq_scales_list,
                     )
                     # NO mx.eval here — keep everything lazy within the chunk.
                     # Accumulate loss and grads in the computation graph so MLX can
@@ -1633,6 +1677,10 @@ def main() -> None:
                         help="bb_config.json from src.bayesianbits_optimize; uses per-layer bit widths")
     parser.add_argument("--poly-schedule", type=Path, default=None,
                         help="polynomial_clipping_schedule.json; enables σ-aware A8 fake quant")
+    parser.add_argument("--smoothquant-scales", type=Path, default=None,
+                        help="smoothquant_scales.json from src.compute_smoothquant_scales; "
+                             "pre-scales FP16 weights by s[c] and divides activations by s[c] "
+                             "before fake-quant (Path B: AdaRound on SQ-smoothed distribution)")
     parser.add_argument("--sigma-map", type=Path, default=None,
                         help="Path to layer_statistics.json containing sigma_map "
                              "(default: auto-detect from activations dir)")
@@ -1734,6 +1782,13 @@ def main() -> None:
         print(f"  Poly schedule: {args.poly_schedule} ({len(poly_schedule.get('layers', {}))} layers)")
         if sigma_map:
             print(f"  Sigma range: [{sample_sigmas.min():.3f}, {sample_sigmas.max():.3f}]")
+
+    # Load optional SmoothQuant scales
+    sq_scales: Optional[Dict] = None
+    if args.smoothquant_scales is not None:
+        with open(args.smoothquant_scales) as f:
+            sq_scales = json.load(f)
+        print(f"  SmoothQuant scales: {args.smoothquant_scales} ({len(sq_scales.get('layers', {}))} layers)")
 
     # Load optional HTG groups and BB config
     htg_groups: Optional[Dict] = None
@@ -1953,6 +2008,7 @@ def main() -> None:
                     derivative_weighted=args.derivative_weighted,
                     exclude_keys=exclude_set if exclude_set else None,
                     asymmetric_act=args.asymmetric_act,
+                    sq_scales=sq_scales,
                 )
                 tqdm.write(f"  {block_name} (group {group_id}) done — "
                            f"final_loss={metrics['final_loss']:.4f}")
@@ -2141,6 +2197,7 @@ def main() -> None:
             derivative_weighted=args.derivative_weighted,
             exclude_keys=exclude_set if exclude_set else None,
             asymmetric_act=args.asymmetric_act,
+            sq_scales=sq_scales,
         )
         if metrics.get("refined") and metrics["initial_loss"] is not None:
             improvement = metrics["initial_loss"] - metrics["final_loss"]
