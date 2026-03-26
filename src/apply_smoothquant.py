@@ -45,22 +45,50 @@ from src.compute_smoothquant_scales import (
 # Per-output-channel quantization (W4)
 # ---------------------------------------------------------------------------
 
-def quantize_per_output_channel(w_fp: np.ndarray, bits: int = 4) -> tuple:
+def quantize_per_output_channel(
+    w_fp: np.ndarray, bits: int = 4, group_size: int = 0,
+) -> tuple:
     """
-    Symmetric per-output-channel quantization.
+    Symmetric per-output-channel (or per-group) quantization.
 
     w_fp shape: (out_channels, in_channels)
 
+    Parameters
+    ----------
+    group_size : int
+        0 = per-row scale (original), >0 = per-group-of-columns scale.
+
     Returns:
         w_int : int8 ndarray, shape (out_channels, in_channels)
-        scale : float16 ndarray, shape (out_channels, 1)
+        scale : float16 ndarray, shape (out_channels, 1) or (out_channels, n_groups)
     """
     qmax = 2 ** (bits - 1) - 1
-    per_row_max = np.max(np.abs(w_fp), axis=1, keepdims=True)  # (out, 1)
-    scale = (per_row_max / qmax).astype(np.float16)
-    scale_safe = np.where(scale == 0, np.float16(1.0), scale)
-    w_int = np.round(w_fp / scale_safe.astype(np.float32))
-    w_int = np.clip(w_int, -qmax, qmax).astype(np.int8)
+    out, in_ = w_fp.shape
+
+    if group_size <= 0 or group_size >= in_:
+        # Original per-row behaviour
+        per_row_max = np.max(np.abs(w_fp), axis=1, keepdims=True)  # (out, 1)
+        scale = (per_row_max / qmax).astype(np.float16)
+        scale_safe = np.where(scale == 0, np.float16(1.0), scale)
+        w_int = np.round(w_fp / scale_safe.astype(np.float32))
+        w_int = np.clip(w_int, -qmax, qmax).astype(np.int8)
+        return w_int, scale
+
+    # Per-group quantization
+    n_groups = (in_ + group_size - 1) // group_size
+    scale = np.empty((out, n_groups), dtype=np.float16)
+    w_int = np.empty_like(w_fp, dtype=np.int8)
+    for g in range(n_groups):
+        c0 = g * group_size
+        c1 = min(c0 + group_size, in_)
+        grp = w_fp[:, c0:c1]
+        grp_max = np.max(np.abs(grp), axis=1, keepdims=True)  # (out, 1)
+        grp_scale = (grp_max / qmax).astype(np.float16)
+        grp_scale_safe = np.where(grp_scale == 0, np.float16(1.0), grp_scale)
+        w_int[:, c0:c1] = np.round(
+            grp / grp_scale_safe.astype(np.float32)
+        ).clip(-qmax, qmax).astype(np.int8)
+        scale[:, g:g+1] = grp_scale
     return w_int, scale
 
 
@@ -73,6 +101,7 @@ def apply_smoothquant(
     scales: dict,
     output_dir: Path,
     bits: int = 4,
+    group_size: int = 0,
 ):
     """
     Create a new weights directory with SQ scales absorbed into weights.
@@ -142,14 +171,22 @@ def apply_smoothquant(
             s = np.array(layer_scales[calib_name], dtype=np.float32)  # (in_channels,)
 
             w_int = data[wi_key].astype(np.float32)   # (out, in)
-            w_scale = data[sc_key].astype(np.float32)  # (out, 1)
+            w_scale = data[sc_key].astype(np.float32)  # (out, 1) or (out, n_groups)
+            # Expand compact group scale if needed
+            if w_scale.ndim == 2 and w_scale.shape[1] > 1 and w_scale.shape[1] < w_int.shape[1]:
+                in_ = w_int.shape[1]
+                n_groups = w_scale.shape[1]
+                gs = (in_ + n_groups - 1) // n_groups
+                w_scale = np.repeat(w_scale, gs, axis=1)[:, :in_]
             w_fp = w_int * w_scale                     # dequantized
 
             # Absorb SQ scale: multiply each input channel column by s[c]
             w_smooth = w_fp * s[None, :]               # (out, in)
 
-            # Re-quantize
-            w_int_new, scale_new = quantize_per_output_channel(w_smooth, bits=bits)
+            # Re-quantize (with optional group quantization)
+            w_int_new, scale_new = quantize_per_output_channel(
+                w_smooth, bits=bits, group_size=group_size,
+            )
 
             new_data[wi_key] = w_int_new
             new_data[sc_key] = scale_new
@@ -187,6 +224,9 @@ def main():
                         help="Output directory for SQ-absorbed weights")
     parser.add_argument("--bits", type=int, default=4,
                         help="Weight quantization bits (default 4)")
+    parser.add_argument("--group-size", type=int, default=0,
+                        help="Weight quantization group size. 0 = per-row (default), "
+                             "32/64/128 = per-group.")
     args = parser.parse_args()
 
     print(f"Loading SQ scales from {args.scales}...")
@@ -195,7 +235,10 @@ def main():
     print(f"  alpha={scales.get('alpha')}  layers={scales.get('n_layers')}")
 
     print(f"Absorbing SQ scales into weights from {args.weights_dir}...")
-    apply_smoothquant(args.weights_dir, scales, args.output_dir, bits=args.bits)
+    apply_smoothquant(
+        args.weights_dir, scales, args.output_dir,
+        bits=args.bits, group_size=args.group_size,
+    )
 
 
 if __name__ == "__main__":

@@ -657,9 +657,16 @@ def dequantize(weight_int: np.ndarray, scale: np.ndarray) -> np.ndarray:
 
     weight_int : int8, shape (out, in)   values in [-8, 7] for 4-bit
     scale      : float32, shape (out, 1) per-output-channel scale
+                 OR shape (out, n_groups) for group quantization
 
     Returns float16 array of the same shape.
     """
+    # Expand compact group scale (out, n_groups) → (out, in) if needed
+    if scale.ndim == 2 and scale.shape[1] > 1 and scale.shape[1] < weight_int.shape[1]:
+        in_ = weight_int.shape[1]
+        n_groups = scale.shape[1]
+        group_size = (in_ + n_groups - 1) // n_groups
+        scale = np.repeat(scale, group_size, axis=1)[:, :in_]
     return (weight_int.astype(np.float32) * scale).astype(np.float16)
 
 
