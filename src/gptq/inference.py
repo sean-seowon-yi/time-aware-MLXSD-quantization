@@ -23,6 +23,7 @@ from .utils import (
     full_path_to_poly_key,
     get_poly_alpha,
     _set_nested,
+    dequantize,
 )
 
 
@@ -37,37 +38,43 @@ def load_gptq_weights(gptq_dir: Path):
     weights = {}
     weights_dir = gptq_dir / "weights"
     for npz_path in sorted(weights_dir.glob("mm*.npz")):
-        data = np.load(npz_path)
-        # Keys are like "mm0_img_attn_q_proj__weight_int", "mm0_img_attn_q_proj__scale"
-        layer_keys = set(k.rsplit("__", 1)[0] for k in data.files)
-        for poly_key in layer_keys:
-            W_q_int = data[f"{poly_key}__weight_int"]
-            scales = data[f"{poly_key}__scale"]
-            weights[poly_key] = (W_q_int, scales)
+        with np.load(npz_path) as data:
+            # Keys are like "mm0_img_attn_q_proj__weight_int", "mm0_img_attn_q_proj__scale"
+            layer_keys = set(k.rsplit("__", 1)[0] for k in data.files)
+            for poly_key in layer_keys:
+                W_q_int = data[f"{poly_key}__weight_int"]
+                scales = data[f"{poly_key}__scale"]
+                weights[poly_key] = (W_q_int, scales)
 
     return config, weights
 
 
-def patch_model_weights(pipeline, gptq_weights: dict):
+def patch_model_weights(pipeline, gptq_weights: dict, skip_blocks=None):
     """Replace model linear weights with dequantized GPTQ weights.
 
     Args:
         pipeline: DiffusionPipeline instance.
         gptq_weights: {poly_key: (W_q_int, scales)} from load_gptq_weights.
+        skip_blocks: Set of block indices to leave at FP16 (no weight patching).
     """
+    skip_blocks = skip_blocks or set()
     mmdit = pipeline.mmdit
     patched = 0
+    skipped = 0
     for block_idx, block in enumerate(mmdit.multimodal_transformer_blocks):
+        if block_idx in skip_blocks:
+            skipped += len(list(_get_block_linears(block, is_mm=True)))
+            continue
         for full_path, layer in _get_block_linears(block, is_mm=True):
             poly_key = full_path_to_poly_key(block_idx, full_path)
             if poly_key not in gptq_weights:
                 continue
             W_q_int, scales = gptq_weights[poly_key]
-            W_dequant = W_q_int.astype(np.float32) * scales[:, None]
+            W_dequant = dequantize(W_q_int, scales)
             layer.weight = mx.array(W_dequant, dtype=pipeline.activation_dtype)
             patched += 1
 
-    print(f"Patched {patched} layers with GPTQ weights")
+    print(f"Patched {patched} layers with GPTQ weights (skipped {skipped} in blocks {sorted(skip_blocks)})")
 
 
 def compute_static_alphas(poly_schedule: dict, n_points: int = 200) -> dict:
@@ -121,17 +128,24 @@ class _ActQuantHook:
         self._sigma = sigma
 
 
-def install_act_quant_hooks(pipeline, config: dict, poly_schedule: dict):
+def install_act_quant_hooks(pipeline, config: dict, poly_schedule: dict,
+                            skip_blocks=None):
     """Install activation quantization hooks on all linears.
+
+    Args:
+        skip_blocks: Set of block indices to leave without activation quantization.
 
     Returns list of hooks for sigma updates.
     """
+    skip_blocks = skip_blocks or set()
     mmdit = pipeline.mmdit
     alpha_scales = config.get("alpha_scales", {})
     layers_dict = poly_schedule.get("layers", {})
     hooks = []
 
     for block_idx, block in enumerate(mmdit.multimodal_transformer_blocks):
+        if block_idx in skip_blocks:
+            continue
         for full_path, layer in _get_block_linears(block, is_mm=True):
             poly_key = full_path_to_poly_key(block_idx, full_path)
             poly_entry = layers_dict.get(poly_key)
@@ -140,7 +154,9 @@ def install_act_quant_hooks(pipeline, config: dict, poly_schedule: dict):
             _set_nested(block, full_path, hook)
             hooks.append(hook)
 
-    print(f"Installed {len(hooks)} activation quantization hooks")
+    print(f"Installed {len(hooks)} activation quantization hooks"
+          f" (skipped blocks {sorted(skip_blocks)})" if skip_blocks else
+          f"Installed {len(hooks)} activation quantization hooks")
     return hooks
 
 
@@ -189,10 +205,14 @@ def generate_comparison(
     seed: int = 42,
     latent_size: int = 64,
     quantize_activations: bool = True,
+    no_alpha_scale: bool = False,
+    skip_blocks: set = None,
+    no_baseline: bool = False,
 ):
     """Generate FP16 baseline and GPTQ-quantized images side by side.
 
     Saves into output_dir/<prompt_slug>/: fp16.png, gptq.png, comparison.png
+    If no_baseline=True, only gptq.png is generated.
     """
     from diffusionkit.mlx import DiffusionPipeline
     from PIL import Image
@@ -214,34 +234,42 @@ def generate_comparison(
     )
     pipeline.check_and_load_models()
 
-    # 1. FP16 baseline
-    print(f"\nGenerating FP16 baseline (seed={seed})...")
-    fp16_img, fp16_log = pipeline.generate_image(
-        text=prompt,
-        num_steps=num_steps,
-        cfg_weight=cfg_weight,
-        latent_size=(latent_size, latent_size),
-        seed=seed,
-        verbose=False,
-    )
-    fp16_img.save(output_dir / "fp16.png")
-    print(f"  Saved fp16.png ({fp16_log['total_time']:.1f}s)")
+    # 1. FP16 baseline (optional)
+    fp16_img = None
+    if not no_baseline:
+        print(f"\nGenerating FP16 baseline (seed={seed})...")
+        fp16_img, fp16_log = pipeline.generate_image(
+            text=prompt,
+            num_steps=num_steps,
+            cfg_weight=cfg_weight,
+            latent_size=(latent_size, latent_size),
+            seed=seed,
+            verbose=False,
+        )
+        fp16_img.save(output_dir / "fp16.png")
+        print(f"  Saved fp16.png ({fp16_log['total_time']:.1f}s)")
 
     # 2. Load and apply GPTQ weights
     print("\nApplying GPTQ weights...")
     config, gptq_weights = load_gptq_weights(gptq_dir)
-    patch_model_weights(pipeline, gptq_weights)
+    patch_model_weights(pipeline, gptq_weights, skip_blocks=skip_blocks)
 
     # 3. Optionally install activation quantization hooks
     hooks = None
     if quantize_activations:
         with open(poly_schedule_path) as f:
             poly_schedule = json.load(f)
-        act_mode = config.get("act_quant_mode", "poly")
-        if act_mode == "static":
-            hooks = install_static_act_quant_hooks(pipeline, config, poly_schedule)
+        if no_alpha_scale:
+            dummy_config = {"alpha_scales": {}}
+            hooks = install_act_quant_hooks(
+                pipeline, dummy_config, poly_schedule, skip_blocks=skip_blocks)
         else:
-            hooks = install_act_quant_hooks(pipeline, config, poly_schedule)
+            act_mode = config.get("act_quant_mode", "poly")
+            if act_mode == "static":
+                hooks = install_static_act_quant_hooks(pipeline, config, poly_schedule)
+            else:
+                hooks = install_act_quant_hooks(
+                    pipeline, config, poly_schedule, skip_blocks=skip_blocks)
 
     # 4. Generate GPTQ image
     # If using act quant hooks, we need to manually set sigma each step.
@@ -267,12 +295,13 @@ def generate_comparison(
     gptq_img.save(output_dir / "gptq.png")
     print(f"  Saved gptq.png")
 
-    # 5. Side-by-side comparison
-    comparison = Image.new("RGB", (fp16_img.width * 2, fp16_img.height))
-    comparison.paste(fp16_img, (0, 0))
-    comparison.paste(gptq_img, (fp16_img.width, 0))
-    comparison.save(output_dir / "comparison.png")
-    print(f"  Saved comparison.png (left=FP16, right=GPTQ)")
+    # 5. Side-by-side comparison (only if baseline was generated)
+    if fp16_img is not None:
+        comparison = Image.new("RGB", (fp16_img.width * 2, fp16_img.height))
+        comparison.paste(fp16_img, (0, 0))
+        comparison.paste(gptq_img, (fp16_img.width, 0))
+        comparison.save(output_dir / "comparison.png")
+        print(f"  Saved comparison.png (left=FP16, right=GPTQ)")
 
     # Cleanup
     if hooks:
@@ -418,8 +447,16 @@ def main():
     parser.add_argument("--latent-size", type=int, default=64)
     parser.add_argument("--no-act-quant", action="store_true",
                         help="Disable activation quantization (weight-only)")
+    parser.add_argument("--no-alpha-scale", action="store_true",
+                        help="Use poly clipping with alpha_scale=1.0 for all layers "
+                        "(ignores learned alpha_scales from GPTQ config)")
     parser.add_argument("--poly-only", action="store_true",
                         help="W16A8: poly activation clipping only, no weight quantization")
+    parser.add_argument("--skip-blocks", type=int, nargs="+", default=None,
+                        help="Block indices to leave at FP16 (no weight or activation "
+                        "quantization). Example: --skip-blocks 22 23")
+    parser.add_argument("--no-baseline", action="store_true",
+                        help="Skip FP16 baseline generation (only produce quantized image)")
     args = parser.parse_args()
 
     if args.poly_only:
@@ -433,6 +470,7 @@ def main():
             latent_size=args.latent_size,
         )
     else:
+        skip = set(args.skip_blocks) if args.skip_blocks else None
         generate_comparison(
             prompt=args.prompt,
             gptq_dir=args.gptq_dir,
@@ -443,6 +481,9 @@ def main():
             seed=args.seed,
             latent_size=args.latent_size,
             quantize_activations=not args.no_act_quant,
+            no_alpha_scale=args.no_alpha_scale,
+            skip_blocks=skip,
+            no_baseline=args.no_baseline,
         )
 
 

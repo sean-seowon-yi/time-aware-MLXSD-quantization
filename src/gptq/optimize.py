@@ -1,42 +1,67 @@
 """GPTQ pipeline orchestrator for SD3 MMDiT.
 
-Two-phase design for ~5× speedup over naive per-block collection:
+Two-phase design:
 
   Phase A — Global Hessian pass: install collectors on ALL 285 linears
             across all 24 blocks. Run all prompts once (900 fwd passes).
-            No I/O caching — only Hessian accumulation.
+            Only Hessian accumulation, no I/O caching.
 
-  Phase B — Per-block alpha search: for each block, install cache-only
-            collectors, run a small subset of prompts (e.g. 5), cache I/O,
-            GPTQ-quantize using Phase A Hessians, then alpha search.
+  Phase B — GPTQ quantize all layers, then global alpha search: install
+            alpha accumulators on ALL linears, run a small subset of
+            prompts. Each accumulator evaluates 22 alpha_scale candidates
+            (0.01–100.0) via vectorized matmuls and accumulates MSE.
+
+Weight modes (--weight-mode):
+  gptq   — Full GPTQ pipeline (Phase A + B). Default.
+  rtn    — Round-to-nearest per-channel quantization (skip Phase A).
+  fp16   — No weight quantization; alpha search only (activation-only W16A8).
+
+Prompt file format: tab-separated ``seed<TAB>prompt`` per line.
 
 Usage:
-    python -m src.gptq.optimize \
-        --prompts src/calibration_sample_generation/sample_prompts.txt \
-        --poly-schedule polynomial_clipping_schedule.json \
-        --bits-w 4 \
-        --output-dir gptq_output \
-        --num-steps 30 --cfg-weight 4.0 --seed 42 \
-        --damp-percent 0.01 --block-size 128 \
+    python -m src.gptq.optimize \\
+        --prompts src/calibration_sample_generation/sample_prompts.txt \\
+        --poly-schedule polynomial_clipping_schedule.json \\
+        --bits-w 4 \\
+        --output-dir gptq_output \\
+        --num-steps 30 --cfg-weight 4.0 \\
+        --damp-percent 0.01 --block-size 128 \\
         --max-prompts 30 --alpha-prompts 5
+
+    # RTN W4A8:
+    python -m src.gptq.optimize \\
+        --prompts sample_prompts.txt \\
+        --poly-schedule polynomial_clipping_schedule.json \\
+        --weight-mode rtn --bits-w 4 \\
+        --output-dir rtn_w4a8_output --alpha-prompts 5
+
+    # Activation-only W16A8:
+    python -m src.gptq.optimize \\
+        --prompts sample_prompts.txt \\
+        --poly-schedule polynomial_clipping_schedule.json \\
+        --weight-mode fp16 \\
+        --output-dir w16a8_output --alpha-prompts 5
 """
 
 import argparse
 import json
 import time
 from pathlib import Path
+from typing import List, Tuple
 
 import numpy as np
 from tqdm import tqdm
 
-from .utils import _get_block_linears, full_path_to_poly_key
+from .utils import (
+    _get_block_linears, full_path_to_poly_key, load_prompt_file,
+    compute_scales, dequantize,
+)
 from .gptq_quantize import gptq_quantize
 from .hessian_collector import (
     collect_hessians_global,
-    collect_io_for_block,
+    collect_alpha_mse_global,
 )
-from .alpha_search import search_alpha_scale, search_alpha_scale_static
-from .inference import compute_static_alphas
+from .inference import compute_static_alphas, load_gptq_weights
 
 
 def save_block(output_dir: Path, block_idx: int, block_weight_results: dict):
@@ -63,9 +88,11 @@ def save_config(output_dir: Path, args, all_metrics: dict):
         weight_mses[poly_key] = metrics["weight_mse"]
         activation_mses[poly_key] = metrics["activation_mse"]
 
+    weight_mode = getattr(args, "weight_mode", "gptq")
     config = {
-        "method": "gptq",
-        "bits_w": args.bits_w,
+        "method": weight_mode,
+        "bits_w": args.bits_w if weight_mode != "fp16" else 16,
+        "group_size": args.group_size,
         "act_quant_mode": "static" if args.static_act_quant else "poly",
         "damp_percent": args.damp_percent,
         "block_size": args.block_size,
@@ -74,7 +101,7 @@ def save_config(output_dir: Path, args, all_metrics: dict):
         "alpha_prompts": args.alpha_prompts,
         "num_steps": args.num_steps,
         "cfg_weight": args.cfg_weight,
-        "seed": args.seed,
+        "seeds": "per-prompt",
         "alpha_scales": alpha_scales,
         "weight_mse": weight_mses,
         "activation_mse": activation_mses,
@@ -90,7 +117,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--prompts", type=Path, required=True,
-                        help="Text file with one prompt per line")
+                        help="Tab-separated file: seed<TAB>prompt per line")
     parser.add_argument("--poly-schedule", type=Path, required=True,
                         help="Path to polynomial_clipping_schedule.json")
     parser.add_argument("--bits-w", type=int, default=4, choices=[4, 8],
@@ -98,16 +125,19 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=Path("gptq_output"))
     parser.add_argument("--num-steps", type=int, default=30)
     parser.add_argument("--cfg-weight", type=float, default=4.0)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--latent-size", type=int, default=64)
     parser.add_argument("--damp-percent", type=float, default=0.01)
     parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--group-size", type=int, default=128,
+                        help="Group size for per-group weight quantization (default: 128). "
+                        "Use 0 for per-channel (no grouping).")
     parser.add_argument("--max-prompts", type=int, default=None,
                         help="Limit number of prompts for Hessian collection")
     parser.add_argument("--alpha-prompts", type=int, default=5,
-                        help="Number of prompts for Phase B alpha search I/O cache")
-    parser.add_argument("--alpha-max-cache", type=int, default=50,
-                        help="Max cached I/O samples per layer for alpha search")
+                        help="Number of prompts for Phase B alpha search")
+    parser.add_argument("--subsample-rows", type=int, default=128,
+                        help="Max activation rows sampled per forward call in Phase B "
+                        "alpha search (default: 128). Lower = faster but noisier MSE.")
     parser.add_argument("--hessian-cache", type=Path, default=None,
                         help="Path to save/load Hessian .npz checkpoint. "
                         "If the file exists, Phase A is skipped and Hessians "
@@ -115,21 +145,33 @@ def main():
     parser.add_argument("--static-act-quant", action="store_true",
                         help="Use static (timestep-agnostic) activation clipping "
                         "instead of polynomial clipping for alpha search")
+    parser.add_argument("--skip-gptq", action="store_true",
+                        help="Skip Phase A and B.1 (Hessian collection and GPTQ "
+                        "quantization). Loads existing weights from output-dir/weights/ "
+                        "and reruns alpha search only.")
+    parser.add_argument("--weight-mode", type=str, default="gptq",
+                        choices=["gptq", "rtn", "fp16"],
+                        help="Weight quantization method: "
+                        "'gptq' = full GPTQ (default), "
+                        "'rtn' = round-to-nearest per-channel, "
+                        "'fp16' = no weight quant (activation-only alpha search)")
+    parser.add_argument("--raw-hessian", action="store_true",
+                        help="Use full-precision activations (not fake-quantized) "
+                        "when accumulating Hessians in Phase A. Avoids conditioning "
+                        "weight quantization on activation clipping parameters that "
+                        "are not finalized until Phase B alpha search.")
     args = parser.parse_args()
 
-    # Load prompts
-    all_prompts = [
-        line.strip() for line in args.prompts.read_text().splitlines()
-        if line.strip()
-    ]
+    # Load prompts (seed, prompt) pairs
+    all_prompt_entries = load_prompt_file(args.prompts)
     if args.max_prompts is not None:
-        all_prompts = all_prompts[:args.max_prompts]
-    print(f"Loaded {len(all_prompts)} prompts from {args.prompts}")
+        all_prompt_entries = all_prompt_entries[:args.max_prompts]
+    print(f"Loaded {len(all_prompt_entries)} prompts from {args.prompts}")
 
     # Split prompts: all for Phase A, first alpha_prompts for Phase B
-    alpha_prompts = all_prompts[:args.alpha_prompts]
-    print(f"Phase A: {len(all_prompts)} prompts for Hessian collection")
-    print(f"Phase B: {len(alpha_prompts)} prompts for alpha search I/O cache")
+    alpha_prompt_entries = all_prompt_entries[:args.alpha_prompts]
+    print(f"Phase A: {len(all_prompt_entries)} prompts for Hessian collection")
+    print(f"Phase B: {len(alpha_prompt_entries)} prompts for alpha search I/O cache")
 
     # Load poly schedule
     with open(args.poly_schedule) as f:
@@ -160,125 +202,204 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+    phase_a_elapsed = 0.0
 
-    # -----------------------------------------------------------------------
-    # Phase A: Global Hessian collection (all blocks, one pass)
-    # -----------------------------------------------------------------------
-    hessian_cache_path = args.hessian_cache
-    if hessian_cache_path is None:
-        hessian_cache_path = args.output_dir / "hessians.npz"
+    if args.weight_mode == "fp16":
+        # -----------------------------------------------------------------
+        # FP16 mode: no weight quantization, use original weights as-is
+        # -----------------------------------------------------------------
+        print("Weight mode: fp16 (no weight quantization)")
+        n_blocks = len(pipeline.mmdit.multimodal_transformer_blocks)
+        all_weight_results = {}
+        for block_idx in range(n_blocks):
+            block = pipeline.mmdit.multimodal_transformer_blocks[block_idx]
+            for full_path, layer in _get_block_linears(block, is_mm=True):
+                poly_key = full_path_to_poly_key(block_idx, full_path)
+                W = np.array(layer.weight, dtype=np.float32)
+                # 8-bit identity quantization to fit the (W_q_int, scales) format
+                scales = compute_scales(W, 8, args.group_size)
+                if scales.ndim == 1:
+                    s_expand = scales[:, None]
+                else:
+                    n_groups = scales.shape[1]
+                    gs = (W.shape[1] + n_groups - 1) // n_groups
+                    s_expand = np.repeat(scales, gs, axis=1)[:, :W.shape[1]]
+                W_q_int = np.clip(np.round(W / s_expand), -127, 127).astype(np.int8)
+                W_dequant = dequantize(W_q_int, scales)
+                weight_mse = float(np.sum((W - W_dequant) ** 2))
+                all_weight_results[poly_key] = (W_q_int, scales, weight_mse)
 
-    if hessian_cache_path.exists():
-        print(f"Loading cached Hessians from {hessian_cache_path}")
-        phase_a_t0 = time.time()
-        loaded = np.load(hessian_cache_path)
-        hessians = {key: loaded[key] for key in loaded.files}
-        phase_a_elapsed = time.time() - phase_a_t0
-        print(f"Loaded {len(hessians)} Hessians in {phase_a_elapsed:.1f}s")
-    else:
-        phase_a_t0 = time.time()
-        all_collectors = collect_hessians_global(
-            pipeline, denoiser, all_prompts, poly_schedule,
-            num_steps=args.num_steps,
-            cfg_weight=args.cfg_weight,
-            seed=args.seed,
-            latent_size=args.latent_size,
-            static_alphas=static_alphas,
-        )
-        phase_a_elapsed = time.time() - phase_a_t0
-        print(f"Phase A done: {phase_a_elapsed:.0f}s")
+        weight_mses = {
+            pk: float(wmse)
+            for pk, (_, _, wmse) in all_weight_results.items()
+        }
+        print(f"FP16 mode: {len(all_weight_results)} layers (no weight quant)")
 
-        # Extract Hessians into NumPy (free MLX memory)
-        hessians = {}  # poly_key -> np.ndarray
-        for block_idx, collectors in all_collectors.items():
-            for poly_key, collector in collectors.items():
-                hessians[poly_key] = collector.get_hessian()
-        del all_collectors
+    elif args.weight_mode == "rtn":
+        # -----------------------------------------------------------------
+        # RTN mode: round-to-nearest per-channel quantization
+        # -----------------------------------------------------------------
+        print(f"Weight mode: rtn (round-to-nearest, {args.bits_w}-bit, group_size={args.group_size})")
+        n_blocks = len(pipeline.mmdit.multimodal_transformer_blocks)
+        all_weight_results = {}
+        qmax = 2 ** (args.bits_w - 1) - 1
 
-        # Save checkpoint
-        hessian_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(hessian_cache_path, **hessians)
-        print(f"Saved Hessian checkpoint to {hessian_cache_path}")
+        for block_idx in tqdm(range(n_blocks), desc="RTN quantize"):
+            block = pipeline.mmdit.multimodal_transformer_blocks[block_idx]
+            for full_path, layer in _get_block_linears(block, is_mm=True):
+                poly_key = full_path_to_poly_key(block_idx, full_path)
+                W = np.array(layer.weight, dtype=np.float32)
+                scales = compute_scales(W, args.bits_w, args.group_size)
+                if scales.ndim == 1:
+                    s_expand = scales[:, None]
+                else:
+                    n_groups = scales.shape[1]
+                    gs = (W.shape[1] + n_groups - 1) // n_groups
+                    s_expand = np.repeat(scales, gs, axis=1)[:, :W.shape[1]]
+                W_q_int = np.clip(
+                    np.round(W / s_expand), -qmax, qmax
+                ).astype(np.int8)
+                W_dequant = dequantize(W_q_int, scales)
+                weight_mse = float(np.sum((W - W_dequant) ** 2))
+                all_weight_results[poly_key] = (W_q_int, scales, weight_mse)
 
-    # -----------------------------------------------------------------------
-    # Phase B: Per-block GPTQ + alpha search
-    # -----------------------------------------------------------------------
-    all_metrics = {}
-    n_blocks = len(pipeline.mmdit.multimodal_transformer_blocks)
-    phase_b_t0 = time.time()
-
-    for block_idx in tqdm(range(n_blocks), desc="Blocks (GPTQ + alpha)"):
-        block_t0 = time.time()
-        block = pipeline.mmdit.multimodal_transformer_blocks[block_idx]
-
-        # 1. GPTQ quantize using Phase A Hessians
-        block_weight_results = {}
-        for full_path, layer in _get_block_linears(block, is_mm=True):
-            poly_key = full_path_to_poly_key(block_idx, full_path)
-            W = np.array(layer.weight, dtype=np.float32)
-            H = hessians[poly_key]
-            W_q_int, scales, weight_mse = gptq_quantize(
-                W, H, args.bits_w, args.damp_percent, args.block_size
-            )
-            block_weight_results[poly_key] = (W_q_int, scales, weight_mse)
-
-        # 2. Collect I/O cache for alpha search (short pass)
-        io_collectors = collect_io_for_block(
-            pipeline, denoiser, block_idx, alpha_prompts, poly_schedule,
-            num_steps=args.num_steps,
-            max_cache=args.alpha_max_cache,
-            cfg_weight=args.cfg_weight,
-            seed=args.seed,
-            latent_size=args.latent_size,
-            static_alphas=static_alphas,
-        )
-
-        # 3. Alpha search for each linear
-        block_alpha_results = {}
-        layers_dict = poly_schedule.get("layers", {})
-        static_alphas = compute_static_alphas(poly_schedule) if args.static_act_quant else {}
-        for poly_key, (W_q_int, scales, weight_mse) in block_weight_results.items():
-            io_collector = io_collectors[poly_key]
-            W_q_dequant = W_q_int.astype(np.float32) * scales[:, None]
-
-            wrapped = io_collector._wrapped
-            bias = None
-            if hasattr(wrapped, "bias") and wrapped.bias is not None:
-                bias = np.array(wrapped.bias, dtype=np.float32)
-
-            cached_inputs, cached_outputs = io_collector.get_cached_io()
-
-            if args.static_act_quant:
-                static_alpha = static_alphas.get(poly_key, 1.0)
-                best_alpha, best_act_mse = search_alpha_scale_static(
-                    W_q_dequant, bias, cached_inputs, cached_outputs, static_alpha
-                )
-            else:
-                poly_entry = layers_dict.get(poly_key)
-                best_alpha, best_act_mse = search_alpha_scale(
-                    W_q_dequant, bias, cached_inputs, cached_outputs, poly_entry
-                )
-            block_alpha_results[poly_key] = (best_alpha, best_act_mse)
-
-        # 4. Save block weights
-        save_block(args.output_dir, block_idx, block_weight_results)
-
-        # 5. Accumulate metrics
-        for poly_key in block_weight_results:
-            _, _, weight_mse = block_weight_results[poly_key]
-            alpha_scale, act_mse = block_alpha_results[poly_key]
-            all_metrics[poly_key] = {
-                "weight_mse": float(weight_mse),
-                "activation_mse": float(act_mse),
-                "alpha_scale": float(alpha_scale),
+            # Save block weights
+            prefix = f"mm{block_idx}_"
+            block_results = {
+                k: v for k, v in all_weight_results.items()
+                if k.startswith(prefix) and k[len(prefix):].split("_")[0] in ("img", "txt")
             }
+            save_block(args.output_dir, block_idx, block_results)
 
-        # Free per-block I/O cache
-        del io_collectors
+        weight_mses = {
+            pk: float(wmse)
+            for pk, (_, _, wmse) in all_weight_results.items()
+        }
+        print(f"RTN done: {len(all_weight_results)} layers quantized")
 
-        block_elapsed = time.time() - block_t0
-        n_layers = len(block_weight_results)
-        print(f"  Block {block_idx}: {n_layers} layers, {block_elapsed:.1f}s")
+    elif args.skip_gptq:
+        # -----------------------------------------------------------------
+        # Skip Phase A and B.1 — load existing weights from disk
+        # -----------------------------------------------------------------
+        print("Skipping Phase A and B.1 (--skip-gptq)")
+        print(f"Loading existing GPTQ weights from {args.output_dir}/weights/")
+        existing_config, gptq_weights = load_gptq_weights(args.output_dir)
+
+        # Reconstruct all_weight_results with weight_mse from existing config
+        existing_wmses = existing_config.get("weight_mse", {})
+        all_weight_results = {}
+        for poly_key, (W_q_int, scales) in gptq_weights.items():
+            wmse = existing_wmses.get(poly_key, 0.0)
+            all_weight_results[poly_key] = (W_q_int, scales, wmse)
+
+        weight_mses = {
+            poly_key: float(wmse)
+            for poly_key, wmse in existing_wmses.items()
+        }
+        print(f"Loaded {len(all_weight_results)} layers from disk")
+
+    else:
+        # -----------------------------------------------------------------
+        # GPTQ mode: Phase A (Hessian) + B.1 (GPTQ quantize)
+        # -----------------------------------------------------------------
+        hessian_cache_path = args.hessian_cache
+        if hessian_cache_path is None:
+            hessian_cache_path = args.output_dir / "hessians.npz"
+
+        if hessian_cache_path.exists():
+            print(f"Loading cached Hessians from {hessian_cache_path}")
+            phase_a_t0 = time.time()
+            with np.load(hessian_cache_path) as loaded:
+                hessians = {key: loaded[key] for key in loaded.files}
+            phase_a_elapsed = time.time() - phase_a_t0
+            print(f"Loaded {len(hessians)} Hessians in {phase_a_elapsed:.1f}s")
+        else:
+            phase_a_t0 = time.time()
+            all_collectors = collect_hessians_global(
+                pipeline, denoiser, all_prompt_entries, poly_schedule,
+                num_steps=args.num_steps,
+                cfg_weight=args.cfg_weight,
+                latent_size=args.latent_size,
+                static_alphas=static_alphas,
+                raw_hessian=args.raw_hessian,
+            )
+            phase_a_elapsed = time.time() - phase_a_t0
+            print(f"Phase A done: {phase_a_elapsed:.0f}s")
+
+            # Extract Hessians into NumPy (free MLX memory)
+            hessians = {}  # poly_key -> np.ndarray
+            for block_idx, collectors in all_collectors.items():
+                for poly_key, collector in collectors.items():
+                    hessians[poly_key] = collector.get_hessian()
+            del all_collectors
+
+            # Save checkpoint
+            hessian_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(hessian_cache_path, **hessians)
+            print(f"Saved Hessian checkpoint to {hessian_cache_path}")
+
+        # -------------------------------------------------------------------
+        # B.1: GPTQ quantize all blocks (pure NumPy, fast)
+        # -------------------------------------------------------------------
+        n_blocks = len(pipeline.mmdit.multimodal_transformer_blocks)
+        all_weight_results = {}  # poly_key -> (W_q_int, scales, weight_mse)
+        for block_idx in tqdm(range(n_blocks), desc="GPTQ quantize"):
+            block = pipeline.mmdit.multimodal_transformer_blocks[block_idx]
+            for full_path, layer in _get_block_linears(block, is_mm=True):
+                poly_key = full_path_to_poly_key(block_idx, full_path)
+                W = np.array(layer.weight, dtype=np.float32)
+                H = hessians[poly_key]
+                W_q_int, scales, weight_mse = gptq_quantize(
+                    W, H, args.bits_w, args.damp_percent, args.block_size,
+                    group_size=args.group_size,
+                )
+                all_weight_results[poly_key] = (W_q_int, scales, weight_mse)
+
+            # Save block weights immediately
+            prefix = f"mm{block_idx}_"
+            block_results = {
+                k: v for k, v in all_weight_results.items()
+                if k.startswith(prefix) and k[len(prefix):].split("_")[0] in ("img", "txt")
+            }
+            save_block(args.output_dir, block_idx, block_results)
+
+        print(f"GPTQ done: {len(all_weight_results)} layers quantized")
+
+        # Free Hessians — no longer needed, already saved to disk
+        del hessians
+
+        # Extract weight MSEs before alpha search (so we can free weight arrays)
+        weight_mses = {
+            poly_key: float(weight_mse)
+            for poly_key, (_W_q_int, _scales, weight_mse) in all_weight_results.items()
+        }
+
+    # -----------------------------------------------------------------------
+    # B.2: Global alpha search (all blocks, one pass)
+    # -----------------------------------------------------------------------
+    phase_b_t0 = time.time()
+    alpha_results = collect_alpha_mse_global(
+        pipeline, denoiser, alpha_prompt_entries, poly_schedule,
+        all_weight_results,
+        num_steps=args.num_steps,
+        cfg_weight=args.cfg_weight,
+        latent_size=args.latent_size,
+        static_alphas=static_alphas,
+        subsample_rows=args.subsample_rows,
+    )
+
+    # Free weight arrays — no longer needed (already saved to disk per-block)
+    del all_weight_results
+
+    # B.3: Assemble metrics
+    all_metrics = {}
+    for poly_key, wmse in weight_mses.items():
+        alpha_scale, act_mse = alpha_results.get(poly_key, (1.0, float("inf")))
+        all_metrics[poly_key] = {
+            "weight_mse": wmse,
+            "activation_mse": float(act_mse),
+            "alpha_scale": float(alpha_scale),
+        }
 
     phase_b_elapsed = time.time() - phase_b_t0
 
@@ -286,9 +407,11 @@ def main():
     save_config(args.output_dir, args, all_metrics)
 
     elapsed = time.time() - t0
-    print(f"\nPhase A (Hessian): {phase_a_elapsed:.0f}s")
-    print(f"Phase B (GPTQ + alpha): {phase_b_elapsed:.0f}s")
-    print(f"Total: {len(all_metrics)} layers quantized in {elapsed:.0f}s")
+    print(f"\nWeight mode: {args.weight_mode}")
+    if args.weight_mode == "gptq":
+        print(f"Phase A (Hessian): {phase_a_elapsed:.0f}s")
+    print(f"Phase B (alpha search): {phase_b_elapsed:.0f}s")
+    print(f"Total: {len(all_metrics)} layers in {elapsed:.0f}s")
     print(f"Output: {args.output_dir}/")
 
 

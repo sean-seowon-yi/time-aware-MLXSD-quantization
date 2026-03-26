@@ -64,13 +64,23 @@ from calibration_config import (
 from calibration_collector import sample_euler_with_calibration
 
 
-def load_prompts(path: str) -> list[str]:
-    """Load prompts from a text file (one per line, blank lines ignored)."""
+def load_prompts(path: str) -> list[tuple[int, str]]:
+    """Load tab-separated (seed, prompt) pairs from a prompt file.
+
+    Each line is: <seed>\\t<prompt text>
+    Returns list of (seed, prompt) tuples.
+    """
+    entries = []
     with open(path) as f:
-        prompts = [line.strip() for line in f if line.strip()]
-    if not prompts:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            seed_str, prompt = line.split("\t", 1)
+            entries.append((int(seed_str), prompt))
+    if not entries:
         raise ValueError(f"No prompts found in {path}")
-    return prompts
+    return entries
 
 
 def encode_all_prompts(pipeline, prompts, cfg_weight):
@@ -203,9 +213,11 @@ def main():
     assert latent_size[0] % 2 == 0 and latent_size[1] % 2 == 0, "Latent H,W must be even"
 
     # --- Load prompts ---
-    prompts = load_prompts(args.prompt_file)
+    prompt_entries = load_prompts(args.prompt_file)
     if args.num_prompts is not None:
-        prompts = prompts[:args.num_prompts]
+        prompt_entries = prompt_entries[:args.num_prompts]
+    prompts = [prompt for _, prompt in prompt_entries]
+    prompt_seeds = [seed for seed, _ in prompt_entries]
     print(f"Loaded {len(prompts)} prompts from {args.prompt_file}")
 
     # --- Load pipeline ---
@@ -251,7 +263,7 @@ def main():
         cond_mx = mx.array(all_cond[prompt_idx])
         pooled_mx = mx.array(all_pooled[prompt_idx])
 
-        seed = args.seed + sample_idx
+        seed = prompt_seeds[prompt_idx] + (sample_idx // n_prompts)
         x_init, sigmas = get_initial_latent(pipeline, latent_size, seed)
         mx.eval(x_init)
 

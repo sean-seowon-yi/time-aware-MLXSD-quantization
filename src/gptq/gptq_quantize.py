@@ -6,8 +6,9 @@ Implements column-wise quantization with Hessian-weighted error compensation.
 import warnings
 
 import numpy as np
+import scipy.linalg
 
-from .utils import compute_per_channel_scale
+from .utils import compute_scales, dequantize
 
 
 def gptq_quantize(
@@ -16,6 +17,7 @@ def gptq_quantize(
     bits: int,
     damp_percent: float = 0.01,
     block_size: int = 128,
+    group_size: int = 128,
 ):
     """GPTQ quantization of a single weight matrix.
 
@@ -25,19 +27,21 @@ def gptq_quantize(
         bits: quantization bit-width (e.g. 4 or 8).
         damp_percent: diagonal damping factor.
         block_size: column block size for error compensation.
+        group_size: columns per quantization group (default 128).
+                    Use 0 for per-channel (no grouping).
 
     Returns:
         W_q_int: (d_out, d_in) int8 — quantized integer weights.
-        scales: (d_out,) float32 — per-channel scales.
+        scales: (d_out, n_groups) or (d_out,) float32 — quantization scales.
         weight_mse: float — total squared error ||W - dequant(W_q)||^2.
     """
     d_out, d_in = W.shape
     qmax = 2 ** (bits - 1) - 1
     W_orig = W.copy()
-    W = W.copy()
+    W = W_orig.copy()
 
-    # Per-channel scales
-    scales = compute_per_channel_scale(W_orig, bits)
+    # Compute scales (per-group or per-channel)
+    scales = compute_scales(W_orig, bits, group_size)
 
     # Sanitize: replace NaN/Inf with 0 (can occur from float16 overflow
     # in upstream accumulation, though this should be fixed now).
@@ -55,15 +59,20 @@ def gptq_quantize(
     damp = damp_percent * diag_max
     H = H + damp * np.eye(d_in, dtype=H.dtype)
 
-    # Inverse + Cholesky of inverse (upper triangular)
+    # Compute Cholesky of H^{-1} via cho_solve (avoids explicit inverse).
+    # Factor H = L L^T, then solve L L^T @ H_inv = I column-by-column.
     try:
-        H_inv = np.linalg.inv(H)
+        H_chol = scipy.linalg.cholesky(H, lower=True)
+        H_inv = scipy.linalg.cho_solve((H_chol, True), np.eye(d_in, dtype=H.dtype))
         H_inv_chol = np.linalg.cholesky(H_inv).T
     except np.linalg.LinAlgError:
         warnings.warn("Cholesky failed, increasing damping 10x")
         H = H + 9 * damp * np.eye(d_in, dtype=H.dtype)
         try:
-            H_inv = np.linalg.inv(H)
+            H_chol = scipy.linalg.cholesky(H, lower=True)
+            H_inv = scipy.linalg.cho_solve(
+                (H_chol, True), np.eye(d_in, dtype=H.dtype)
+            )
             H_inv_chol = np.linalg.cholesky(H_inv).T
         except np.linalg.LinAlgError:
             warnings.warn("Cholesky still failed, using pseudoinverse + diagonal")
@@ -81,6 +90,17 @@ def gptq_quantize(
 
     W_q_int = np.zeros_like(W, dtype=np.int8)
 
+    # Pre-compute per-column scale vector for the inner loop.
+    # scales is either (d_out,) for per-channel or (d_out, n_groups) for per-group.
+    if scales.ndim == 1:
+        # Per-channel: same scale for every column
+        _col_scales = np.broadcast_to(scales[:, None], (d_out, d_in))
+    else:
+        # Per-group: expand to (d_out, d_in)
+        n_groups = scales.shape[1]
+        gs = (d_in + n_groups - 1) // n_groups
+        _col_scales = np.repeat(scales, gs, axis=1)[:, :d_in]
+
     # Column-wise quantization with block error compensation
     for i in range(0, d_in, block_size):
         j_end = min(i + block_size, d_in)
@@ -90,11 +110,12 @@ def gptq_quantize(
 
         for j in range(i, j_end):
             w_col = W[:, j]
-            # Per-channel quantize
-            w_q_col = np.clip(np.round(w_col / scales), -qmax, qmax).astype(np.int8)
+            s_col = _col_scales[:, j]  # (d_out,) scale for this column
+            w_q_col = np.clip(np.round(w_col / s_col), -qmax, qmax).astype(np.int8)
             W_q_int[:, j] = w_q_col
-            w_dequant = w_q_col.astype(np.float32) * scales
-            err = (w_col - w_dequant) / H_inv_chol[j, j]
+            w_dequant = w_q_col.astype(np.float32) * s_col
+            diag_j = max(H_inv_chol[j, j], 1e-6)
+            err = (w_col - w_dequant) / diag_j
             E[:, j - i] = err
             # Intra-block compensation
             if j + 1 < j_end:
@@ -105,7 +126,7 @@ def gptq_quantize(
             W[:, j_end:] -= E @ H_inv_chol[i:j_end, j_end:]
 
     # Compute total MSE
-    W_dequant = W_q_int.astype(np.float32) * scales[:, None]
+    W_dequant = dequantize(W_q_int, scales)
     weight_mse = float(np.sum((W_orig - W_dequant) ** 2))
 
     return W_q_int, scales, weight_mse

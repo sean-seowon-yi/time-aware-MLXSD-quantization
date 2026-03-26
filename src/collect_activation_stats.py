@@ -10,6 +10,8 @@ Outputs the ``activations/`` directory format consumed by
         timestep_stats/
             step_<idx>_index.json      # per-layer scalar stats
 
+Prompt file format: tab-separated ``seed<TAB>prompt`` per line.
+
 Usage:
     python -m src.collect_activation_stats \
         --prompts src/calibration_sample_generation/sample_prompts.txt \
@@ -27,6 +29,8 @@ import numpy as np
 from tqdm import tqdm
 
 import mlx.core as mx
+
+from .gptq.utils import load_prompt_file
 
 # ---------------------------------------------------------------------------
 # Linear layer enumeration (self-contained, no external deps)
@@ -155,10 +159,17 @@ def collect_step_stats(hooks) -> Dict[str, Dict[str, float]]:
     for key, (hook, _, _) in hooks.items():
         if hook._last_output is not None:
             arr = np.array(hook._last_output)
+            abs_arr = np.abs(arr).ravel()
+            n = abs_arr.size
+            k99 = int(n * 0.99)
+            k999 = int(n * 0.999)
+            partitioned = np.partition(abs_arr, [k99, k999])
             stats[key] = {
-                "tensor_absmax": float(np.abs(arr).max()),
+                "tensor_absmax": float(partitioned[-1]) if n > 0 else 0.0,
                 "tensor_min": float(arr.min()),
                 "tensor_max": float(arr.max()),
+                "hist_p99": float(partitioned[k99]),
+                "hist_p999": float(partitioned[k999]),
             }
         hook.clear()
     return stats
@@ -224,26 +235,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--prompts", type=Path, required=True,
-                        help="Text file with one prompt per line")
+                        help="Tab-separated file: seed<TAB>prompt per line")
     parser.add_argument("--output-dir", type=Path,
                         default=Path("calibration_data_100/activations"))
     parser.add_argument("--num-steps", type=int, default=30)
     parser.add_argument("--cfg-weight", type=float, default=4.0)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--latent-size", type=int, default=64,
                         help="Spatial size of latent (64 = 512px)")
     parser.add_argument("--max-prompts", type=int, default=None,
                         help="Limit number of prompts (for testing)")
     args = parser.parse_args()
 
-    # Load prompts
-    prompts = [
-        line.strip() for line in args.prompts.read_text().splitlines()
-        if line.strip()
-    ]
+    # Load prompts (seed, prompt) pairs
+    prompt_entries = load_prompt_file(args.prompts)
     if args.max_prompts is not None:
-        prompts = prompts[:args.max_prompts]
-    print(f"Loaded {len(prompts)} prompts from {args.prompts}")
+        prompt_entries = prompt_entries[:args.max_prompts]
+    print(f"Loaded {len(prompt_entries)} prompts from {args.prompts}")
 
     # Load pipeline
     print("Loading pipeline...")
@@ -269,12 +276,12 @@ def main():
     acc = defaultdict(lambda: defaultdict(list))
     all_sigmas = None
 
-    for prompt in tqdm(prompts, desc="Prompts"):
+    for seed, prompt in tqdm(prompt_entries, desc="Prompts"):
         try:
             step_stats, sigmas = run_prompt(
                 pipeline, denoiser, prompt, hooks,
                 args.num_steps, args.cfg_weight, args.latent_size,
-                seed=args.seed,
+                seed=seed,
             )
             if all_sigmas is None:
                 all_sigmas = sigmas
@@ -307,11 +314,15 @@ def main():
             absmax_vals = [s["tensor_absmax"] for s in stat_list]
             min_vals = [s["tensor_min"] for s in stat_list]
             max_vals = [s["tensor_max"] for s in stat_list]
+            p99_vals = [s["hist_p99"] for s in stat_list]
+            p999_vals = [s["hist_p999"] for s in stat_list]
             index[layer_key] = {
                 "n_batches": len(stat_list),
                 "tensor_absmax": float(np.max(absmax_vals)),
                 "tensor_min": float(np.min(min_vals)),
                 "tensor_max": float(np.max(max_vals)),
+                "hist_p99": float(np.max(p99_vals)),
+                "hist_p999": float(np.max(p999_vals)),
             }
         idx_path = ts_dir / f"step_{step_idx}_index.json"
         with open(idx_path, "w") as f:
@@ -321,7 +332,7 @@ def main():
     meta = {
         "step_keys": step_keys,
         "sigma_map": sigma_map,
-        "num_prompts": len(prompts),
+        "num_prompts": len(prompt_entries),
         "num_steps": num_steps_actual,
         "num_layers": len(hooks),
     }
@@ -329,7 +340,7 @@ def main():
         json.dump(meta, f, indent=2)
 
     print(f"Done: {num_steps_actual} steps x {len(hooks)} layers "
-          f"x {len(prompts)} prompts")
+          f"x {len(prompt_entries)} prompts")
     print(f"  sigma range: [{all_sigmas.min():.4f}, {all_sigmas.max():.4f}]")
 
 
