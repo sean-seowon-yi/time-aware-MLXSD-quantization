@@ -197,4 +197,36 @@ See: `slides/smooth_quant_explainer.md` § "Bucket Utilization Results"
 
 ---
 
+---
+
+### 2026-03-27 — --deriv-agg max: prevent dilution of fc1/fc2 derivative signal
+
+**Hypothesis:** The existing `--derivative-weighted` flag averages `|dα/dσ|` across all
+linear layers in a block. For blocks like mm20–22, the txt mlp_fc1/fc2 layers have large
+derivatives but are averaged with ~8 stable attention/other layers, diluting the signal
+by ~5×. Taking the per-sample max across layers instead would let the most
+temporally-sensitive layer drive the block's weighting without dilution.
+
+**Experiment:** Added `--deriv-agg {mean,max}` flag to `adaround_optimize.py`.
+`max` takes `np.max` across `layer_derivs` instead of `np.mean`; `mean` remains the
+default for backwards compatibility. Value recorded in `config.json`.
+
+**Result:** Flag implemented and verified via `--help`. Not yet run as a full AdaRound
+experiment — pending completion of the group_size=64 baseline run first.
+
+**Decision:** Keep `mean` as default. Run `--derivative-weighted --deriv-agg max` as a
+comparison experiment after group_size=64 results are available.
+
+Command:
+```bash
+conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \
+    --adaround-cache calibration_data_512/adaround_cache \
+    --output quantized_weights_w4a8_adaround_poly_p100_derivmax \
+    --poly-schedule polynomial_clipping_schedule_512_p100.json \
+    --derivative-weighted --deriv-agg max \
+    --iters 3000 --batch-size 8
+```
+
+---
+
 *Append new entries above this line as experiments complete.*
