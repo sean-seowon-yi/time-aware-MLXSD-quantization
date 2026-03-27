@@ -97,7 +97,7 @@ Instead of storing a clipping range `α` for every layer at every timestep, we f
 
 ### The Technical Details
 
-**Data collection.** We collect the p99.9 percentile of activation magnitudes for each of the 285 layers at each of the 25 `σ` steps, averaged across 30 calibration images. This gives us 285 trajectories, each with 25 data points.
+**Data collection.** We collect the p100 absolute maximum (tensor absmax) of activation magnitudes for each of the 285 layers at each of the 25 `σ` steps, averaged across 30 calibration images. This gives us 285 trajectories, each with 25 data points. (We originally used p99.9, but it introduced too much clipping error during AdaRound training — see [Choosing the clipping percentile](#choosing-the-clipping-percentile-p999-vs-p9999-vs-p100) below.)
 
 **Tiered degree selection.** Not every layer needs a polynomial — many are nearly constant. We use a tiered fitting strategy:
 
