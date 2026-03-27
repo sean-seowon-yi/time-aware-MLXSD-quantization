@@ -44,6 +44,7 @@ import argparse
 import csv
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -402,6 +403,121 @@ def compute_prdc_metrics(
     }
 
 
+def compute_clip_cosine_similarity(
+    gen_emb: np.ndarray,
+    ref_emb: np.ndarray,
+) -> Optional[float]:
+    """
+    Compute mean cosine similarity between generated and reference CLIP embeddings.
+
+    Embeddings are L2-normalized 768-d CLS vectors from ViT-L/14, so
+    cosine similarity reduces to a dot product.  Returns the mean over all
+    cross-set pairs (n_gen × n_ref), giving a distribution-level similarity
+    score in [-1, 1] (higher = more similar).
+    """
+    if gen_emb.shape[0] < 1 or ref_emb.shape[0] < 1:
+        return None
+    sim_matrix = gen_emb @ ref_emb.T  # (n_gen, n_ref)
+    return float(sim_matrix.mean())
+
+
+def compute_psnr_paired(
+    generated_dir: str,
+    baseline_dir: str,
+) -> Optional[Dict]:
+    """
+    Compute mean PSNR between matched image pairs (same filename in both dirs).
+
+    Matches images by sorted filename (0000.png vs 0000.png, etc.).  Warns
+    and skips unmatched files when counts differ.
+
+    Returns dict with keys psnr_mean, psnr_std, n_pairs, or None if no pairs found.
+    """
+    from PIL import Image as PILImage
+
+    gen_paths = {p.name: p for p in sorted(Path(generated_dir).glob("*.png"))}
+    base_paths = {p.name: p for p in sorted(Path(baseline_dir).glob("*.png"))}
+    common = sorted(set(gen_paths) & set(base_paths))
+
+    if not common:
+        print("WARNING: PSNR — no matching filenames between generated and baseline dirs.")
+        return None
+
+    n_gen, n_base = len(gen_paths), len(base_paths)
+    if n_gen != n_base:
+        print(f"WARNING: PSNR — {n_gen} generated vs {n_base} baseline images; "
+              f"computing on {len(common)} matched pairs.")
+
+    psnr_values = []
+    for name in common:
+        gen_img = np.array(PILImage.open(gen_paths[name]).convert("RGB"), dtype=np.float64)
+        base_img = np.array(PILImage.open(base_paths[name]).convert("RGB"), dtype=np.float64)
+        mse = np.mean((gen_img - base_img) ** 2)
+        psnr = 20.0 * np.log10(255.0 / np.sqrt(mse)) if mse > 0 else float("inf")
+        psnr_values.append(psnr)
+
+    finite = [v for v in psnr_values if np.isfinite(v)]
+    return {
+        "psnr_mean": float(np.mean(psnr_values)),
+        "psnr_std": float(np.std(finite)) if finite else 0.0,
+        "n_pairs": len(psnr_values),
+    }
+
+
+def compute_lpips_paired(
+    generated_dir: str,
+    baseline_dir: str,
+) -> Optional[Dict]:
+    """
+    Compute mean LPIPS between matched image pairs using AlexNet.
+
+    Requires ``pip install lpips``.  Returns None gracefully if unavailable.
+    Images are resized to 256×256 and normalised to [-1, 1].
+
+    Returns dict with keys lpips_mean, lpips_std, n_pairs.
+    """
+    try:
+        import lpips as lpips_lib
+        import torch
+    except ImportError:
+        print("WARNING: lpips not installed — skipping LPIPS. "
+              "Install with: pip install lpips")
+        return None
+
+    from PIL import Image as PILImage
+    import torchvision.transforms as T
+
+    loss_fn = lpips_lib.LPIPS(net="alex", verbose=False)
+    loss_fn.eval()
+
+    preprocess = T.Compose([
+        T.Resize((256, 256)),
+        T.ToTensor(),                        # [0, 1]
+        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # [-1, 1]
+    ])
+
+    gen_paths = {p.name: p for p in sorted(Path(generated_dir).glob("*.png"))}
+    base_paths = {p.name: p for p in sorted(Path(baseline_dir).glob("*.png"))}
+    common = sorted(set(gen_paths) & set(base_paths))
+
+    if not common:
+        print("WARNING: LPIPS — no matching filenames between generated and baseline dirs.")
+        return None
+
+    scores = []
+    with torch.no_grad():
+        for name in common:
+            gen_t = preprocess(PILImage.open(gen_paths[name]).convert("RGB")).unsqueeze(0)
+            base_t = preprocess(PILImage.open(base_paths[name]).convert("RGB")).unsqueeze(0)
+            scores.append(float(loss_fn(gen_t, base_t).item()))
+
+    return {
+        "lpips_mean": float(np.mean(scores)),
+        "lpips_std": float(np.std(scores)),
+        "n_pairs": len(scores),
+    }
+
+
 def compute_cmmd_from_embeddings(
     gen_emb: np.ndarray,
     ref_emb: np.ndarray,
@@ -577,21 +693,61 @@ def compute_model_size(pipeline) -> Dict:
 # Prompt loading
 # ---------------------------------------------------------------------------
 
-def load_prompts(csv_path: Path, max_count: int) -> List[str]:
+def load_prompts(
+    prompt_path: Path, max_count: int
+) -> Tuple[List[str], Optional[List[int]]]:
     """
-    Load up to max_count prompts from a CSV with a single 'prompt' column.
-    Falls back to three synthetic prompts if the file does not exist.
+    Load up to max_count prompts from a CSV ('prompt' column) or a plain-text
+    file (.txt, one prompt per line).  Falls back to three synthetic prompts if
+    the file does not exist.
+
+    Tab-separated .txt files with format ``seed<TAB>prompt`` are detected
+    automatically; in that case a list of per-image seeds is also returned.
+
+    Returns
+    -------
+    prompts : list of str
+    seeds : list of int or None
+        Per-image seeds when the file has the ``seed<TAB>prompt`` format,
+        otherwise None (caller should use seed_base + img_idx).
     """
-    if not csv_path.exists():
+    if not prompt_path.exists():
         fallback = [
             "a photo of a cat",
             "abstract art with vibrant colors",
             "a landscape with mountains",
         ]
-        return fallback[:max_count]
+        return fallback[:max_count], None
 
     prompts: List[str] = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
+    seeds: Optional[List[int]] = None
+
+    if prompt_path.suffix.lower() == ".txt":
+        with open(prompt_path, encoding="utf-8") as f:
+            lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+
+        # Detect tab-separated seed<TAB>prompt format from first non-empty line
+        if lines and "\t" in lines[0]:
+            seeds = []
+            for line in lines:
+                if len(prompts) >= max_count:
+                    break
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    try:
+                        seeds.append(int(parts[0].strip()))
+                        prompts.append(parts[1].strip())
+                    except ValueError:
+                        pass  # skip malformed lines
+        else:
+            for line in lines:
+                if len(prompts) >= max_count:
+                    break
+                if line:
+                    prompts.append(line)
+        return prompts, seeds
+
+    with open(prompt_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             if len(prompts) >= max_count:
@@ -599,7 +755,7 @@ def load_prompts(csv_path: Path, max_count: int) -> List[str]:
             p = row.get("prompt", "").strip()
             if p:
                 prompts.append(p)
-    return prompts
+    return prompts, None
 
 
 # ---------------------------------------------------------------------------
@@ -753,7 +909,10 @@ def _load_pipeline(
     adaround_act_config: Optional[Path],
     mlx_int4: bool = False,
     group_size: int = 64,
-    poly_schedule_path: Optional[Path] = None,
+    poly_schedule: Optional[Dict] = None,
+    lut_schedule: Optional[Dict] = None,
+    poly_margin: float = 1.0,
+    gptq_dir: Optional[Path] = None,
 ):
     """
     Load DiffusionPipeline and apply quantization config.
@@ -791,6 +950,29 @@ def _load_pipeline(
         quant_ctx["remove_act_fn"] = remove_dynamic_int8_act_hooks
         return pipeline, quant_ctx
 
+    if config == "gptq":
+        if gptq_dir is None:
+            raise ValueError("--gptq-dir is required when --config gptq")
+        from src.gptq.inference import (
+            load_gptq_weights, patch_model_weights,
+            install_act_quant_hooks, install_static_act_quant_hooks,
+            remove_act_quant_hooks as _gptq_remove,
+        )
+        gptq_config, gptq_weights = load_gptq_weights(gptq_dir)
+        patch_model_weights(pipeline, gptq_weights)
+
+        hooks = []
+        if poly_schedule is not None:
+            act_mode = gptq_config.get("act_quant_mode", "poly")
+            if act_mode == "static":
+                hooks = install_static_act_quant_hooks(pipeline, gptq_config, poly_schedule)
+            else:
+                hooks = install_act_quant_hooks(pipeline, gptq_config, poly_schedule)
+
+        quant_ctx["gptq_hooks"] = hooks if hooks else None
+        quant_ctx["remove_act_fn"] = lambda _: _gptq_remove(pipeline, hooks)
+        return pipeline, quant_ctx
+
     # Weight injection (adaround_w4 / adaround_w4a8 / taqdit_w4a8 / mlx_int4)
     if adaround_output is not None:
         from src.load_adaround_model import (
@@ -806,27 +988,32 @@ def _load_pipeline(
         else:
             inject_weights(pipeline, quant_weights)
 
-    # Load polynomial schedule if provided
-    poly_schedule = None
-    if poly_schedule_path is not None:
-        with open(poly_schedule_path) as f:
-            poly_schedule = json.load(f)
-
     # Activation quantization hooks
+    # Supports three modes (in priority order):
+    #   1. --adaround-act-config  : static per-timestep config JSON
+    #   2. --poly-schedule        : sigma-polynomial clipping schedule
+    #   3. --lut-schedule         : per-timestep lookup table schedule
+    # Modes 2 and 3 can be combined (poly takes priority per-layer).
     act_config_path = adaround_act_config
-    if act_config_path is not None or poly_schedule is not None:
+    per_timestep: Dict = {}
+    outlier_config: Dict = {}
+    if act_config_path is not None:
+        with open(act_config_path) as f:
+            quant_cfg = json.load(f)
+        per_timestep = quant_cfg.get("per_timestep", {})
+        outlier_config = quant_cfg.get("outlier_config", {})
+
+    if act_config_path is not None or poly_schedule is not None or lut_schedule is not None:
         from src.load_adaround_model import apply_act_quant_hooks
-        per_timestep = {}
-        outlier_config = {}
-        if act_config_path is not None:
-            with open(act_config_path) as f:
-                quant_cfg = json.load(f)
-            per_timestep = quant_cfg.get("per_timestep", {})
-            outlier_config = quant_cfg.get("outlier_config", {})
-        step_keys_sorted = sorted(int(k) for k in per_timestep.keys()) if per_timestep else []
+        step_keys_sorted = sorted(int(k) for k in per_timestep.keys())
         proxies, patches = apply_act_quant_hooks(
-            pipeline.mmdit, per_timestep, outlier_config, poly_schedule=poly_schedule
+            pipeline.mmdit, per_timestep, outlier_config,
+            poly_schedule=poly_schedule,
+            lut_schedule=lut_schedule,
         )
+        if poly_margin != 1.0:
+            for proxy in proxies:
+                proxy.poly_margin = poly_margin
         quant_ctx["proxies"] = proxies
         quant_ctx["act_quant_patches"] = patches
         quant_ctx["step_keys_sorted"] = step_keys_sorted
@@ -846,6 +1033,13 @@ def _generate_single_image(
     Generate one image using the given pipeline + quant_ctx.
     Returns a PIL.Image.
     """
+    gptq_hooks = quant_ctx.get("gptq_hooks")
+    if gptq_hooks is not None:
+        from src.gptq.inference import _generate_with_sigma_hooks
+        return _generate_with_sigma_hooks(
+            pipeline, prompt, gptq_hooks, num_steps, cfg_scale, 64, seed,
+        )
+
     proxies = quant_ctx.get("proxies", [])
     step_keys_sorted = quant_ctx.get("step_keys_sorted", [])
 
@@ -868,6 +1062,7 @@ def _generate_single_image(
             num_steps=num_steps,
             seed=seed,
             negative_text="",
+            verbose=False,
         )
         return images
 
@@ -912,13 +1107,19 @@ def generate_images(
     adaround_act_config: Optional[Path] = None,
     mlx_int4: bool = False,
     group_size: int = 64,
-    poly_schedule_path: Optional[Path] = None,
+    poly_schedule: Optional[Dict] = None,
+    lut_schedule: Optional[Dict] = None,
+    poly_margin: float = 1.0,
+    seeds: Optional[List[int]] = None,
+    gptq_dir: Optional[Path] = None,
+    reload_n: Optional[int] = None,
 ) -> Tuple[List[float], Dict]:
     """
     Generate images for all prompts and return timing + memory stats.
 
-    Pipeline is reloaded per image (mirrors generate_calibration_data.py)
-    for consistent memory measurements.
+    Pipeline is reloaded per image for the first reload_n images (for accurate
+    memory measurements), then persisted for the remainder. If reload_n is None,
+    the pipeline is reloaded for every image.
 
     Returns
     -------
@@ -944,6 +1145,18 @@ def generate_images(
 
     total = len(prompts)
     completed = 0
+    _pipeline_cache: Optional[tuple] = None  # (pipeline, quant_ctx) when persisted
+
+    _load_pipeline_kwargs = dict(
+        adaround_output=adaround_output,
+        adaround_act_config=adaround_act_config,
+        mlx_int4=mlx_int4,
+        group_size=group_size,
+        poly_schedule=poly_schedule,
+        lut_schedule=lut_schedule,
+        poly_margin=poly_margin,
+        gptq_dir=gptq_dir,
+    )
 
     pbar = tqdm(enumerate(prompts), total=len(prompts),
                 desc=f"  {config}", unit="img", dynamic_ncols=True)
@@ -960,27 +1173,37 @@ def generate_images(
                 print(f"  [resume] skipping {img_idx:04d}.png")
             continue
 
-        seed = seed_base + img_idx
-        reset_metal_peak_memory()
+        seed = seeds[img_idx] if seeds is not None else seed_base + img_idx
+
+        # Decide whether to reload or reuse the persisted pipeline.
+        # reload_n=None means always reload (original behaviour).
+        persist = reload_n is not None and img_idx >= reload_n
+        if persist and _pipeline_cache is not None:
+            pipeline, quant_ctx = _pipeline_cache
+            reset_metal_peak_memory()
+        else:
+            reset_metal_peak_memory()
+            pipeline, quant_ctx = _load_pipeline(config, **_load_pipeline_kwargs)
+            if persist:
+                _pipeline_cache = (pipeline, quant_ctx)
 
         t0 = time.time()
-        pipeline, quant_ctx = _load_pipeline(
-            config, adaround_output, adaround_act_config, mlx_int4, group_size,
-            poly_schedule_path=poly_schedule_path,
-        )
         image = _generate_single_image(
             pipeline, quant_ctx, prompt, seed, num_steps, cfg_scale
         )
         elapsed = time.time() - t0
 
-        # Remove hooks before pipeline goes out of scope
-        if quant_ctx["act_quant_patches"]:
-            remove_fn = quant_ctx.get("remove_act_fn")
-            if remove_fn is not None:
-                remove_fn(quant_ctx["act_quant_patches"])
-            else:
-                from src.load_adaround_model import remove_act_quant_hooks
-                remove_act_quant_hooks(quant_ctx["act_quant_patches"])
+        # Remove hooks only when we are discarding the pipeline (reload path).
+        if not persist:
+            if quant_ctx.get("gptq_hooks") is not None:
+                quant_ctx["remove_act_fn"](None)
+            elif quant_ctx["act_quant_patches"]:
+                remove_fn = quant_ctx.get("remove_act_fn")
+                if remove_fn is not None:
+                    remove_fn(quant_ctx["act_quant_patches"])
+                else:
+                    from src.load_adaround_model import remove_act_quant_hooks
+                    remove_act_quant_hooks(quant_ctx["act_quant_patches"])
 
         image.save(img_path)
         timings.append(elapsed)
@@ -1022,7 +1245,8 @@ def generate_images(
 # Section 5 — Console output helpers
 # ---------------------------------------------------------------------------
 
-def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict]) -> None:
+def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict],
+                   paired: Optional[Dict] = None) -> None:
     print(f"\n{'='*50}")
     print(f"=== Benchmark Results: {config} ===")
     print(f"{'='*50}")
@@ -1053,6 +1277,9 @@ def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict]) 
         cmmd = fidelity.get("cmmd")
         if cmmd is not None:
             print(f"CMMD:          {cmmd:.4f}")
+        cos_sim = fidelity.get("clip_cosine_sim")
+        if cos_sim is not None:
+            print(f"CLIP cos sim:  {cos_sim:.4f}")
         prdc_p = fidelity.get("prdc_precision")
         prdc_r = fidelity.get("prdc_recall")
         prdc_d = fidelity.get("prdc_density")
@@ -1068,6 +1295,82 @@ def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict]) 
     else:
         print("FID/IS/KID:    skipped")
 
+    if paired is not None:
+        psnr = paired.get("psnr_mean")
+        lpips_val = paired.get("lpips_mean")
+        if psnr is not None:
+            print(f"PSNR:          {psnr:.2f} dB  (std={paired.get('psnr_std', 0):.2f}, "
+                  f"n={paired.get('n_pairs', 0)})")
+        if lpips_val is not None:
+            print(f"LPIPS:         {lpips_val:.4f}  (std={paired.get('lpips_std', 0):.4f}, "
+                  f"n={paired.get('n_pairs', 0)})")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint metrics helper
+# ---------------------------------------------------------------------------
+
+def _compute_checkpoint_metrics(
+    gen_dir: Path,
+    n: int,
+    ref_dir: Optional[Path],
+    baseline_dir: Optional[Path],
+    gen_emb_full: Optional[np.ndarray],
+    ref_emb: Optional[np.ndarray],
+    skip_fidelity: bool,
+    skip_clip: bool,
+    skip_paired: bool,
+) -> Dict:
+    """
+    Compute all enabled metrics for the first *n* images in gen_dir.
+
+    CLIP-based metrics (CMMD/PRDC/cos-sim) reuse the already-computed
+    embeddings by slicing gen_emb_full[:n].  All other metrics use a
+    temporary directory of symlinks so the existing metric functions need
+    no changes.
+    """
+    gen_paths_sorted = sorted(gen_dir.glob("*.png"))[:n]
+    result: Dict = {"n_images": n}
+
+    # CLIP-based metrics — free (just slice the embeddings array)
+    if not skip_clip and gen_emb_full is not None and ref_emb is not None:
+        gen_emb_n = gen_emb_full[:n]
+        prdc = compute_prdc_metrics(gen_emb_n, ref_emb, k=5)
+        cmmd_val = compute_cmmd_from_embeddings(gen_emb_n, ref_emb)
+        cos_sim = compute_clip_cosine_similarity(gen_emb_n, ref_emb)
+        if prdc:
+            result.update(prdc)
+        if cmmd_val is not None:
+            result["cmmd"] = cmmd_val
+        if cos_sim is not None:
+            result["clip_cosine_sim"] = cos_sim
+
+    with tempfile.TemporaryDirectory() as _tmpdir:
+        tmp = Path(_tmpdir)
+        for p in gen_paths_sorted:
+            (tmp / p.name).symlink_to(p.resolve())
+
+        # FID / IS / KID / sFID
+        if not skip_fidelity and ref_dir is not None:
+            raw = compute_fidelity_metrics(tmp, ref_dir)
+            if raw:
+                result.update(raw)
+            sfid_val = compute_sfid(str(tmp), str(ref_dir))
+            if sfid_val is not None:
+                result["sfid"] = sfid_val
+
+        # PSNR / LPIPS
+        if not skip_paired and baseline_dir is not None:
+            psnr = compute_psnr_paired(str(tmp), str(baseline_dir))
+            lpips = compute_lpips_paired(str(tmp), str(baseline_dir))
+            if psnr:
+                result.update(psnr)
+            if lpips:
+                result["lpips_mean"] = lpips["lpips_mean"]
+                result["lpips_std"] = lpips["lpips_std"]
+
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Main CLI
@@ -1080,28 +1383,37 @@ def main() -> None:
     # Config
     parser.add_argument(
         "--config", type=str, default="fp16",
-        choices=["fp16", "naive_int8", "adaround_w4", "adaround_w4a8", "adaround_w4a8_poly", "taqdit_w4a8", "mlx_int4"],
-        help="Quantization config to benchmark",
+        help="Quantization config label (e.g. fp16, w4a8_rtn, adaround_w4a8_poly). "
+             "Use 'fp16' or 'naive_int8' for built-in configs; any other string is a "
+             "descriptive label and the actual quantization is determined by "
+             "--adaround-output, --poly-schedule, etc.",
     )
+    parser.add_argument("--gptq-dir", type=Path, default=None,
+                        help="GPTQ output dir (from src.gptq.optimize). "
+                        "Use with --config gptq and --poly-schedule.")
     parser.add_argument("--adaround-output", type=Path, default=None,
                         help="AdaRound weights dir (from adaround_optimize.py)")
     parser.add_argument("--adaround-act-config", type=Path, default=None,
                         help="Activation quant config JSON (from analyze_activations.py)")
+    parser.add_argument("--poly-schedule", type=Path, default=None,
+                        help="Polynomial clipping schedule JSON (from generate_poly_schedule.py)")
+    parser.add_argument("--lut-schedule", type=Path, default=None,
+                        help="LUT clipping schedule JSON (from generate_lut_schedule.py)")
+    parser.add_argument("--poly-margin", type=float, default=1.0,
+                        help="Multiplier applied to poly/LUT clipping bounds (default: 1.0)")
     parser.add_argument("--taqdit-output", type=Path, default=None,
                         help="TaQ-DiT weights dir (reserved for future use)")
     parser.add_argument("--taqdit-act-config", type=Path, default=None,
                         help="TaQ-DiT act config JSON (reserved for future use)")
-    parser.add_argument("--poly-schedule", type=Path, default=None,
-                        help="Polynomial clipping schedule JSON (from generate_poly_schedule.py)")
 
     # Generation
     parser.add_argument("--prompt-csv", type=Path, default=None,
                         help="CSV file with 'prompt' column (default: all_prompts.csv)")
     parser.add_argument("--num-images", type=int, default=150,
                         help="Number of images to generate (default: 150)")
-    parser.add_argument("--num-steps", type=int, default=28,
+    parser.add_argument("--num-steps", type=int, default=30,
                         help="Denoising steps per image (default: 28)")
-    parser.add_argument("--cfg-scale", type=float, default=1.5,
+    parser.add_argument("--cfg-scale", type=float, default=4.0,
                         help="CFG guidance weight (default: 1.5)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Base seed; image i uses seed+i (default: 42)")
@@ -1117,8 +1429,12 @@ def main() -> None:
                         help="Reference image dir for FID/IS/KID (omit to skip metrics)")
     parser.add_argument("--generated-dir", type=Path, default=None,
                         help="Override generated image dir for metrics phase")
+    parser.add_argument("--baseline-dir", type=Path, default=None,
+                        help="FP16 baseline image dir for paired metrics (PSNR + LPIPS)")
     parser.add_argument("--skip-clip-metrics", action="store_true",
                         help="Skip CLIP-based metrics (PRDC + CMMD)")
+    parser.add_argument("--skip-paired-metrics", action="store_true",
+                        help="Skip paired metrics (PSNR + LPIPS) even if --baseline-dir is set")
 
     # Phase control
     parser.add_argument("--skip-generation", action="store_true",
@@ -1129,30 +1445,58 @@ def main() -> None:
                         help="Warmup images excluded from latency stats (default: 2)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip images whose PNG already exists in output_dir/images/")
+    parser.add_argument("--reload-n", type=int, default=None,
+                        help="Reload the pipeline for the first N images (for memory "
+                        "profiling), then persist it for the remainder. "
+                        "Default: reload every image.")
+    parser.add_argument("--eval-interval", type=int, default=0,
+                        help="Compute cumulative metrics every N images and save to "
+                             "benchmark_checkpoints.json (0 = disabled)")
 
     args = parser.parse_args()
 
-    if args.config == "adaround_w4a8_poly" and args.poly_schedule is None:
-        parser.error("--poly-schedule is required for adaround_w4a8_poly config")
+    if args.gptq_dir is not None and args.adaround_output is not None:
+        parser.error("--gptq-dir and --adaround-output are mutually exclusive")
 
     prompt_csv = args.prompt_csv or (_REPO / "all_prompts.csv")
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load poly/LUT schedules once (shared across all images)
+    poly_schedule: Optional[Dict] = None
+    lut_schedule: Optional[Dict] = None
+    if args.poly_schedule is not None:
+        with open(args.poly_schedule) as f:
+            poly_schedule = json.load(f)
+        print(f"  Poly schedule: {args.poly_schedule} "
+              f"(percentile={poly_schedule.get('percentile', 'unknown')})")
+    if args.lut_schedule is not None:
+        with open(args.lut_schedule) as f:
+            lut_schedule = json.load(f)
+        print(f"  LUT schedule:  {args.lut_schedule} "
+              f"(percentile={lut_schedule.get('percentile', 'unknown')})")
+    if args.poly_margin != 1.0:
+        print(f"  Poly margin:   {args.poly_margin}×")
 
     generated_dir = args.generated_dir or (output_dir / "images")
 
     timings: List[float] = []
     memory_stats: Dict = {"peak_metal_mb": 0.0, "peak_rss_mb": 0.0}
     fidelity_result: Optional[Dict] = None
+    _clip_gen_emb: Optional[np.ndarray] = None  # kept for checkpoint loop
+    _clip_ref_emb: Optional[np.ndarray] = None
+    paired_result: Optional[Dict] = None
     model_stats: Optional[Dict] = None
 
     # ------------------------------------------------------------------
     # Phase 1 — Image generation
     # ------------------------------------------------------------------
     if not args.skip_generation:
-        prompts = load_prompts(prompt_csv, args.num_images)
+        prompts, prompt_seeds = load_prompts(prompt_csv, args.num_images)
         print(f"=== Generating {len(prompts)} images (config={args.config}) ===")
         print(f"  Output: {output_dir / 'images'}")
+        if prompt_seeds is not None:
+            print("  Seeds: per-image seeds loaded from prompt file")
         if args.resume:
             print("  Resume mode: existing PNGs will be skipped")
 
@@ -1169,7 +1513,12 @@ def main() -> None:
             adaround_act_config=args.adaround_act_config,
             mlx_int4=args.mlx_int4,
             group_size=args.group_size,
-            poly_schedule_path=args.poly_schedule,
+            poly_schedule=poly_schedule,
+            lut_schedule=lut_schedule,
+            poly_margin=args.poly_margin,
+            seeds=prompt_seeds,
+            gptq_dir=args.gptq_dir,
+            reload_n=args.reload_n,
         )
 
         # Compute model size once after generation (pipeline discarded per-image;
@@ -1179,12 +1528,21 @@ def main() -> None:
             pipeline_sz, _ = _load_pipeline(
                 args.config, args.adaround_output, args.adaround_act_config,
                 args.mlx_int4, args.group_size,
-                poly_schedule_path=args.poly_schedule,
+                poly_schedule=poly_schedule, lut_schedule=lut_schedule,
+                poly_margin=args.poly_margin, gptq_dir=args.gptq_dir,
             )
             model_stats = compute_model_size(pipeline_sz)
             del pipeline_sz
             print(f"  size_gb={model_stats['size_gb']:.3f}  "
                   f"params={model_stats['total_params_M']:.0f}M")
+            if args.gptq_dir is not None:
+                from src.gptq.inference import load_gptq_weights as _lgw
+                gptq_cfg, _ = _lgw(args.gptq_dir)
+                bits_w = gptq_cfg.get("bits_w", 4)
+                compressed_gb = model_stats["size_gb"] * bits_w / 16
+                model_stats["compressed_size_gb"] = compressed_gb
+                model_stats["bits_w"] = bits_w
+                print(f"  compressed_size_gb (W{bits_w})={compressed_gb:.3f}")
         except Exception as e:
             print(f"WARNING: model size computation failed: {e}")
 
@@ -1229,17 +1587,85 @@ def main() -> None:
                 if clip_cache is not None:
                     gen_emb = clip_cache["generated_embeddings"]
                     ref_emb = clip_cache["reference_embeddings"]
+                    _clip_gen_emb = gen_emb
+                    _clip_ref_emb = ref_emb
                     prdc = compute_prdc_metrics(gen_emb, ref_emb, k=5)
                     cmmd_val = compute_cmmd_from_embeddings(gen_emb, ref_emb)
+                    cos_sim = compute_clip_cosine_similarity(gen_emb, ref_emb)
                     if fidelity_result is None:
                         fidelity_result = {}
                     if prdc is not None:
                         fidelity_result.update(prdc)
                     if cmmd_val is not None:
                         fidelity_result["cmmd"] = cmmd_val
+                    if cos_sim is not None:
+                        fidelity_result["clip_cosine_sim"] = cos_sim
                     fidelity_result["clip_model"] = clip_cache.get("clip_model_id")
                 else:
                     print("WARNING: CLIP metrics unavailable — skipping PRDC/CMMD.")
+
+    # ------------------------------------------------------------------
+    # Phase 3 — Paired metrics (PSNR + LPIPS vs FP16 baseline)
+    # ------------------------------------------------------------------
+    if not args.skip_paired_metrics and args.baseline_dir is not None:
+        base_dir = args.baseline_dir
+        if not base_dir.exists():
+            print(f"WARNING: baseline_dir {base_dir} does not exist — skipping paired metrics")
+        else:
+            n_gen = len(list(generated_dir.glob("*.png")))
+            n_base = len(list(base_dir.glob("*.png")))
+            print(f"\n=== Computing paired metrics "
+                  f"({n_gen} generated vs {n_base} baseline) ===")
+            psnr_result = compute_psnr_paired(str(generated_dir), str(base_dir))
+            lpips_result = compute_lpips_paired(str(generated_dir), str(base_dir))
+            paired_result = {}
+            if psnr_result is not None:
+                paired_result.update(psnr_result)
+            if lpips_result is not None:
+                paired_result["lpips_mean"] = lpips_result["lpips_mean"]
+                paired_result["lpips_std"] = lpips_result["lpips_std"]
+            paired_result["baseline_dir"] = str(base_dir)
+
+    # ------------------------------------------------------------------
+    # Phase 4 — Cumulative checkpoint metrics (every --eval-interval images)
+    # ------------------------------------------------------------------
+    checkpoints: Optional[Dict] = None
+    if args.eval_interval > 0:
+        n_total = len(list(generated_dir.glob("*.png")))
+        ns = list(range(args.eval_interval, n_total, args.eval_interval))
+        # Always include the full set as the final checkpoint
+        if not ns or ns[-1] != n_total:
+            ns.append(n_total)
+
+        print(f"\n=== Computing checkpoint metrics at {ns} images ===")
+        checkpoints = {}
+        ref_dir_ck = args.reference_dir if (
+            not args.skip_metrics and args.reference_dir is not None
+            and args.reference_dir.exists()
+        ) else None
+        base_dir_ck = args.baseline_dir if (
+            not args.skip_paired_metrics and args.baseline_dir is not None
+            and args.baseline_dir.exists()
+        ) else None
+
+        for n in ns:
+            print(f"  checkpoint n={n} …")
+            checkpoints[str(n)] = _compute_checkpoint_metrics(
+                gen_dir=generated_dir,
+                n=n,
+                ref_dir=ref_dir_ck,
+                baseline_dir=base_dir_ck,
+                gen_emb_full=_clip_gen_emb,
+                ref_emb=_clip_ref_emb,
+                skip_fidelity=args.skip_metrics,
+                skip_clip=args.skip_clip_metrics,
+                skip_paired=args.skip_paired_metrics,
+            )
+
+        ck_path = output_dir / "benchmark_checkpoints.json"
+        with open(ck_path, "w") as f:
+            json.dump(checkpoints, f, indent=2)
+        print(f"✓ benchmark_checkpoints.json → {ck_path}")
 
     # ------------------------------------------------------------------
     # Latency stats
@@ -1257,10 +1683,17 @@ def main() -> None:
         "num_steps": args.num_steps,
         "cfg_scale": args.cfg_scale,
         "seed": args.seed,
+        "adaround_output": str(args.adaround_output) if args.adaround_output else None,
+        "poly_schedule": str(args.poly_schedule) if args.poly_schedule else None,
+        "poly_schedule_percentile": poly_schedule.get("percentile") if poly_schedule else None,
+        "lut_schedule": str(args.lut_schedule) if args.lut_schedule else None,
+        "lut_schedule_percentile": lut_schedule.get("percentile") if lut_schedule else None,
+        "poly_margin": args.poly_margin if args.poly_margin != 1.0 else None,
         "latency": lat_stats,
         "memory": memory_stats,
         "model": model_stats,
         "fidelity": fidelity_result,
+        "paired": paired_result,
     }
 
     json_path = output_dir / "benchmark.json"
@@ -1271,7 +1704,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Console summary
     # ------------------------------------------------------------------
-    _print_results(args.config, lat_stats, memory_stats, fidelity_result)
+    _print_results(args.config, lat_stats, memory_stats, fidelity_result, paired=paired_result)
     print("\n✓ Complete")
 
 
