@@ -2236,6 +2236,8 @@ def main() -> None:
         "sigma_weighted": args.sigma_weighted,
         "sigma_weight_offset": args.sigma_weight_offset,
         "derivative_weighted": args.derivative_weighted,
+        "group_size": args.group_size,
+        "deriv_agg": args.deriv_agg,
         "exclude_layers": sorted(exclude_set) if exclude_set else [],
         "asymmetric_act": args.asymmetric_act,
         "n_blocks_quantised": len(all_metrics),
