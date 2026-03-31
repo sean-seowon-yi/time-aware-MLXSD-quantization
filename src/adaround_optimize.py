@@ -938,11 +938,18 @@ def _compute_derivative_weights(
     is_mm: bool,
     linear_paths: List[str],
     sample_sigmas: np.ndarray,
+    deriv_agg: str = "mean",
 ) -> np.ndarray:
-    """Compute per-sample |dα/dσ| weights averaged across linear layers in a block.
+    """Compute per-sample |dα/dσ| weights aggregated across linear layers in a block.
 
     For each sample i, evaluates |dα/dσ|(σ_i) for every linear layer in the block
-    using the polynomial derivative, then averages across layers.
+    using the polynomial derivative, then aggregates across layers.
+
+    deriv_agg : str
+        "mean" — average across all layers (default). Stable layers dilute the
+                 signal from high-derivative layers.
+        "max"  — take the per-sample maximum across layers. Lets the most
+                 temporally-sensitive layer in a block drive the weighting.
 
     Degree-0 (static) layers contribute zero derivative — blocks where all layers
     are static return uniform weights (no amplification, no suppression).
@@ -981,8 +988,12 @@ def _compute_derivative_weights(
     if not layer_derivs:
         return np.ones_like(sample_sigmas, dtype=np.float64)
 
-    # Average |dα/dσ| across layers
-    mean_deriv = np.mean(np.stack(layer_derivs, axis=0), axis=0)
+    # Aggregate |dα/dσ| across layers
+    stacked = np.stack(layer_derivs, axis=0)
+    if deriv_agg == "max":
+        mean_deriv = np.max(stacked, axis=0)
+    else:
+        mean_deriv = np.mean(stacked, axis=0)
 
     # If all layers are static, return uniform weights
     if mean_deriv.max() == 0.0:
@@ -1133,6 +1144,7 @@ def optimize_block(
     sigma_weighted: bool = False,
     sigma_weight_offset: float = 1.0,
     derivative_weighted: bool = False,
+    deriv_agg: str = "mean",
     exclude_keys: Optional[set] = None,
     asymmetric_act: bool = False,
 ) -> Tuple[AdaRoundParams, Dict]:
@@ -1224,7 +1236,7 @@ def optimize_block(
 
     if derivative_weighted and poly_schedule is not None and sample_sigmas is not None:
         deriv_w = _compute_derivative_weights(
-            poly_schedule, block_name, is_mm, linear_paths, sample_sigmas
+            poly_schedule, block_name, is_mm, linear_paths, sample_sigmas, deriv_agg
         )
         if sample_weights is not None:
             sample_weights = sample_weights * deriv_w
@@ -1232,7 +1244,7 @@ def optimize_block(
         else:
             sample_weights = deriv_w
         print(
-            f"  derivative-weighted loss enabled: "
+            f"  derivative-weighted loss enabled (agg={deriv_agg}): "
             f"|dα/dσ| weight range [{sample_weights.min():.3f}, {sample_weights.max():.3f}]",
             flush=True,
         )
@@ -1643,6 +1655,9 @@ def main() -> None:
     parser.add_argument("--derivative-weighted", action="store_true",
                         help="Also weight per-sample loss by |dα/dσ|, amplifying blocks where "
                              "clipping range is most sensitive to σ. Requires --poly-schedule.")
+    parser.add_argument("--deriv-agg", type=str, default="mean", choices=["mean", "max"],
+                        help="How to aggregate |dα/dσ| across layers in a block: "
+                             "'mean' averages (default), 'max' uses the most sensitive layer")
     parser.add_argument("--refine-skip-converged", type=float, default=None, metavar="PCT",
                         help="With --refine, skip blocks whose loss improved less than PCT%% "
                              "over the last 20%% of the prior run (e.g., 0.5 = skip if <0.5%% improvement)")
@@ -1951,6 +1966,7 @@ def main() -> None:
                     sigma_weighted=args.sigma_weighted,
                     sigma_weight_offset=args.sigma_weight_offset,
                     derivative_weighted=args.derivative_weighted,
+                    deriv_agg=args.deriv_agg,
                     exclude_keys=exclude_set if exclude_set else None,
                     asymmetric_act=args.asymmetric_act,
                 )
@@ -2139,6 +2155,7 @@ def main() -> None:
             sigma_weighted=args.sigma_weighted,
             sigma_weight_offset=args.sigma_weight_offset,
             derivative_weighted=args.derivative_weighted,
+            deriv_agg=args.deriv_agg,
             exclude_keys=exclude_set if exclude_set else None,
             asymmetric_act=args.asymmetric_act,
         )
@@ -2182,6 +2199,7 @@ def main() -> None:
             "sigma_weighted": args.sigma_weighted,
             "sigma_weight_offset": args.sigma_weight_offset,
             "derivative_weighted": args.derivative_weighted,
+            "deriv_agg": args.deriv_agg,
             "exclude_layers": sorted(exclude_set) if exclude_set else [],
             "asymmetric_act": args.asymmetric_act,
             "n_blocks_quantised": len(_checkpoint_metrics),
