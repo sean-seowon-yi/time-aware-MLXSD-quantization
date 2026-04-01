@@ -67,8 +67,23 @@ coverage.xml
 activation_plots/
 dry_run_activation_plots/
 
+
+quantized_weights_*/
+testimages/
+slides/
+plans/
+analysis_results/
+analysis_results 2_huggingface prompts/
+*.json
+*.png 
+*.zip
+calibration*/
+benchmark_results/
+docs/
+
 # Local logs / scratch
 logs/
 *.log
 tmp/
 temp/
+
