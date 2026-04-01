@@ -615,15 +615,49 @@ def load_adaround_weights(
 # Dequantize and inject into model
 # ---------------------------------------------------------------------------
 
+def expand_group_scale(scale_compact: np.ndarray, in_features: int) -> np.ndarray:
+    """
+    Expand grouped (compacted) quantization scales back to per-channel.
+
+    scale_compact : shape (out, n_groups)
+    in_features   : total input channels
+
+    Returns shape (out, in_features) by repeating each group's scale.
+    """
+    if scale_compact.ndim != 2:
+        return scale_compact
+
+    out_features, n_groups = scale_compact.shape
+    if n_groups == 1:
+        return scale_compact
+
+    # Determine group size
+    group_size = (in_features + n_groups - 1) // n_groups
+
+    # Expand: repeat each scale value group_size times
+    scale_expanded = np.zeros((out_features, in_features), dtype=scale_compact.dtype)
+    for g in range(n_groups):
+        c0 = g * group_size
+        c1 = min(c0 + group_size, in_features)
+        scale_expanded[:, c0:c1] = scale_compact[:, g:g+1]
+
+    return scale_expanded
+
+
 def dequantize(weight_int: np.ndarray, scale: np.ndarray) -> np.ndarray:
     """
     Dequantize int8 AdaRound weight to float16.
 
     weight_int : int8, shape (out, in)   values in [-8, 7] for 4-bit
-    scale      : float32, shape (out, 1) per-output-channel scale
+    scale      : float32, shape (out, in) per-channel OR (out, n_groups) compacted
+                 If compacted, expands to per-channel before dequantizing.
 
     Returns float16 array of the same shape.
     """
+    # Handle grouped (compacted) scales
+    if scale.ndim == 2 and scale.shape[1] < weight_int.shape[1]:
+        scale = expand_group_scale(scale, weight_int.shape[1])
+
     return (weight_int.astype(np.float32) * scale).astype(np.float16)
 
 

@@ -735,3 +735,5 @@ How much does polynomial clipping improve FID and PSNR vs. standard AdaRound and
 
 **The central claim:**
 > Polynomial clipping removes activation clipping error from AdaRound's reconstruction loss, allowing rounding decisions to be optimized against the right signal. σ-weighted loss then directs that optimization toward perceptually important timesteps. Together these address the core limitation of applying AdaRound to iterative generative models.
+$$L = \underbrace{\frac{1}{B} \sum_{b} \sum_{c} |B(W̃, x_b) - B(W_{fp}, x_b)|^2}{\text{reconstruction loss}} + \lambda \underbrace{\sum{i} \left(1 - |2 \cdot
+  \tilde{h}(\alpha_i) - 0.5|^{\beta}\right)}_{\text{round regularization}}$$
