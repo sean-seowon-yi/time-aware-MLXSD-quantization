@@ -34,6 +34,10 @@ def main():
         "--num-prompts", type=int, default=None,
         help="Limit number of prompts (default: all 100)",
     )
+    parser.add_argument(
+        "--weights-path", type=str, default=None,
+        help="Path to pre-modified weights (e.g. CSB-balanced mmdit_quantized.safetensors)",
+    )
     args = parser.parse_args()
 
     from .config import CALIBRATION_PAIRS, DIAG_CONFIG
@@ -70,6 +74,11 @@ def main():
         model_version=DIAG_CONFIG["model_version"],
         low_memory_mode=DIAG_CONFIG["low_memory_mode"],
     )
+    if args.weights_path:
+        import mlx.core as mx
+        logger.info("Loading custom weights from %s", args.weights_path)
+        weights = mx.load(args.weights_path)
+        pipeline.mmdit.load_weights(list(weights.items()), strict=False)
     logger.info("Pipeline loaded. Model dtype: %s", pipeline.dtype)
 
     # --- Build registry ---

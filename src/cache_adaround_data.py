@@ -352,6 +352,8 @@ def main():
                         help="Overwrite existing cache")
     parser.add_argument("--resume", action="store_true",
                         help="Skip (image, step) pairs whose .npz already exists in the cache")
+    parser.add_argument("--weights-path", type=str, default=None,
+                        help="Path to pre-modified weights (e.g. CSB-balanced mmdit_quantized.safetensors)")
     args = parser.parse_args()
 
     output_dir = args.output_dir or (args.calib_dir / "adaround_cache")
@@ -421,6 +423,11 @@ def main():
         w16=True,
     )
     pipeline.check_and_load_models()
+    if args.weights_path:
+        import mlx.core as mx
+        print(f"Loading custom weights from {args.weights_path}")
+        weights = mx.load(args.weights_path)
+        pipeline.mmdit.load_weights(list(weights.items()), strict=False)
     print("✓ Pipeline loaded")
 
     # ------------------------------------------------------------------

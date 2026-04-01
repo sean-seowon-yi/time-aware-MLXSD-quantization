@@ -1795,6 +1795,8 @@ def main() -> None:
                              "32/64/128 = per-group. Group quantization improves W4 "
                              "utilization by preventing one large column from dominating "
                              "the entire row's scale.")
+    parser.add_argument("--weights-path", type=str, default=None,
+                        help="Path to pre-modified weights (e.g. CSB-balanced mmdit_quantized.safetensors)")
     args = parser.parse_args()
 
     if args.sigma_weighted and args.poly_schedule is None:
@@ -1920,6 +1922,11 @@ def main() -> None:
         w16=True,
     )
     pipeline.check_and_load_models()
+    if args.weights_path:
+        import mlx.core as mx
+        print(f"Loading custom weights from {args.weights_path}")
+        weights = mx.load(args.weights_path)
+        pipeline.mmdit.load_weights(list(weights.items()), strict=False)
     print("✓ Pipeline loaded\n")
 
     mmdit = pipeline.mmdit
