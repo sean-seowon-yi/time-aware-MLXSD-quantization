@@ -38,6 +38,13 @@ Usage
         --generated-dir benchmark_results/adaround_w4/images \\
         --reference-dir calibration_data_100/images \\
         --output-dir benchmark_results/adaround_w4
+
+example:
+  conda run --no-capture-output -n diffusionkit python -m src.benchmark_model --config                             
+  adaround_w4a8_poly_p100_group64 --adaround-output quantized_weights_w4a8_adaround_poly_p100_group64 --prompt-csv 
+  evaluation_set_withseeds.txt --num-images 256 --num-steps 30 --output-dir                                        
+  benchmark_results/w4a8_adaround_poly_p100_group64 --resume --reference-dir benchmark_results/fp16/images --eval-interval 64
+
 """
 
 import argparse
@@ -47,6 +54,19 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy scalars and arrays."""
+    def default(self, obj):
+        import numpy as np
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        return super().default(obj)
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -1588,7 +1608,7 @@ def main() -> None:
 
         ck_path = output_dir / "benchmark_checkpoints.json"
         with open(ck_path, "w") as f:
-            json.dump(checkpoints, f, indent=2)
+            json.dump(checkpoints, f, indent=2, cls=_NumpyEncoder)
         print(f"✓ benchmark_checkpoints.json → {ck_path}")
 
     # ------------------------------------------------------------------
@@ -1622,7 +1642,7 @@ def main() -> None:
 
     json_path = output_dir / "benchmark.json"
     with open(json_path, "w") as f:
-        json.dump(benchmark, f, indent=2)
+        json.dump(benchmark, f, indent=2, cls=_NumpyEncoder)
     print(f"\n✓ benchmark.json → {json_path}")
 
     # ------------------------------------------------------------------

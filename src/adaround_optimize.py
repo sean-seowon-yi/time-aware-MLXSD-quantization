@@ -364,11 +364,60 @@ def rectified_sigmoid(alpha: mx.array) -> mx.array:
     return mx.clip((ZETA - GAMMA) * mx.sigmoid(alpha) + GAMMA, 0.0, 1.0)
 
 
-def compute_per_channel_scale(W_np: np.ndarray, bits: int = 4) -> np.ndarray:
-    """Per-output-channel absmax scale, shape (out_features, 1)."""
+def compute_per_channel_scale(
+    W_np: np.ndarray, bits: int = 4, group_size: int = 0,
+) -> np.ndarray:
+    """Per-output-channel (or per-group) absmax scale.
+
+    Parameters
+    ----------
+    group_size : int
+        0 → per-row scale, returns shape ``(out, 1)``  (original behaviour).
+        >0 → per-group-of-columns scale, returns ``(out, in)`` with each group
+        of ``group_size`` consecutive columns sharing the same scale value.
+        Group quantization dramatically improves W4 utilization by preventing
+        one large column from dominating the entire row's scale.
+    """
     qmax = 2 ** (bits - 1) - 1
-    absmax = np.abs(W_np).max(axis=1, keepdims=True)  # (out, 1)
-    return np.maximum(absmax / qmax, 1e-8)
+    out, in_ = W_np.shape
+
+    if group_size <= 0 or group_size >= in_:
+        # Original per-row behaviour
+        absmax = np.abs(W_np).max(axis=1, keepdims=True)  # (out, 1)
+        return np.maximum(absmax / qmax, 1e-8)
+
+    # Per-group: one scale per group_size consecutive columns, expanded to (out, in)
+    n_groups = (in_ + group_size - 1) // group_size
+    scale = np.empty((out, in_), dtype=np.float32)
+    for g in range(n_groups):
+        c0 = g * group_size
+        c1 = min(c0 + group_size, in_)
+        grp_max = np.abs(W_np[:, c0:c1]).max(axis=1, keepdims=True)  # (out, 1)
+        scale[:, c0:c1] = np.maximum(grp_max / qmax, 1e-8)
+    return scale
+
+
+def compact_group_scale(scale: np.ndarray, group_size: int) -> np.ndarray:
+    """Compact expanded ``(out, in)`` group scale to ``(out, n_groups)`` for NPZ storage."""
+    if group_size <= 0 or scale.ndim != 2 or scale.shape[1] == 1:
+        return scale  # already compact (out, 1)
+    out, in_ = scale.shape
+    n_groups = (in_ + group_size - 1) // group_size
+    # Sample first column of each group (all columns in a group share the same value)
+    indices = [g * group_size for g in range(n_groups)]
+    return scale[:, indices]  # (out, n_groups)
+
+
+def expand_group_scale(scale_compact: np.ndarray, in_features: int) -> np.ndarray:
+    """Expand ``(out, n_groups)`` or ``(out, 1)`` compact scale to ``(out, in)``."""
+    if scale_compact.shape[1] == 1:
+        return scale_compact  # (out, 1) — broadcasts naturally, no expansion needed
+    out, n_groups = scale_compact.shape
+    if n_groups >= in_features:
+        return scale_compact[:, :in_features]  # already full width
+    group_size = (in_features + n_groups - 1) // n_groups
+    scale = np.repeat(scale_compact, group_size, axis=1)
+    return scale[:, :in_features]  # trim if padded
 
 
 def init_alpha(W_np: np.ndarray, scale_np: np.ndarray) -> np.ndarray:
@@ -435,6 +484,10 @@ def load_prior_block(
             # Fallback: reconstruct alpha from hard-rounded weights
             weight_int = npz[wi_key]
             scale = npz[sc_key]
+            # Expand compact group scale (out, n_groups) → (out, in) if needed
+            in_features = W_fps_np[i].shape[1]
+            if scale.ndim == 2 and 1 < scale.shape[1] < in_features:
+                scale = expand_group_scale(scale, in_features)
             alpha = reconstruct_alpha(W_fps_np[i], scale, weight_int)
             prior_alphas.append(alpha)
             a_scale = float(npz[as_key][0]) if as_key in npz.files else 1.0
@@ -569,6 +622,7 @@ class _QuantProxy:
         qmax_a: int,
         poly_alpha: Optional[float] = None,  # if set, overrides a_scale
         poly_shift: Optional[float] = None,  # if set, uses asymmetric quant
+        sq_scale: Optional[mx.array] = None,  # SmoothQuant per-channel scale s[c]
     ):
         self._orig = orig_layer
         self._soft_weight = soft_weight
@@ -577,8 +631,15 @@ class _QuantProxy:
         self._qmax_a = qmax_a
         self._poly_alpha = poly_alpha
         self._poly_shift = poly_shift
+        self._sq_scale = sq_scale
 
     def __call__(self, x: mx.array) -> mx.array:
+        # SmoothQuant: divide activations by per-channel scale before fake-quant
+        sq_vec = None
+        if self._sq_scale is not None:
+            sq_vec = self._sq_scale
+            x = x / sq_vec
+
         if self._poly_alpha is not None and self._poly_shift is not None:
             # Asymmetric path: center ± range → [min_val, max_val]
             center = self._poly_shift
@@ -592,6 +653,9 @@ class _QuantProxy:
             x_q = fake_quant_per_tensor(x, scale, self._qmin_a, self._qmax_a)
         else:
             x_q = fake_quant_per_tensor(x, self._a_scale, self._qmin_a, self._qmax_a)
+
+        # No SQ restore needed: soft_weight already contains W' = W*diag(s),
+        # so W' @ fake_quant(x/s) ≈ W @ x (the s factors cancel).
         y = x_q @ self._soft_weight.T
         if hasattr(self._orig, "bias") and self._orig.bias is not None:
             y = y + self._orig.bias
@@ -684,6 +748,7 @@ def block_loss_fn(
     b_val: float,
     poly_alphas: Optional[List[Optional[float]]] = None,  # per-linear poly α for this sample's σ
     poly_shifts: Optional[List[Optional[float]]] = None,  # per-linear poly shift for asymmetric quant
+    sq_scales_list: Optional[List[Optional[np.ndarray]]] = None,  # SmoothQuant per-channel scales
 ) -> mx.array:
     """
     Compute block-level reconstruction + round loss for one mini-batch sample.
@@ -723,6 +788,8 @@ def block_loss_fn(
         orig_layers.append(_get_nested(block, path))
         pa = poly_alphas[i] if poly_alphas else None
         ps = poly_shifts[i] if poly_shifts else None
+        sq_arr = sq_scales_list[i] if sq_scales_list else None
+        sq_mx = mx.array(sq_arr, dtype=mx.float32) if sq_arr is not None else None
         proxy = _QuantProxy(
             linear_layers[i],
             soft_weights[i],
@@ -731,6 +798,7 @@ def block_loss_fn(
             params.qmax_a,
             poly_alpha=pa,
             poly_shift=ps,
+            sq_scale=sq_mx,
         )
         _set_nested(block, path, proxy)
 
@@ -775,6 +843,7 @@ def batched_block_reconstruction_loss_fn(
     sample_weights_batch: Optional[mx.array],  # [B] weights or None
     bits_w: int = 4,
     bits_a: int = 8,
+    sq_scales_list: Optional[List[Optional[np.ndarray]]] = None,  # SmoothQuant per-channel scales
 ) -> Tuple[mx.array, mx.array]:  # (weighted_loss, unweighted_loss)
     """
     Single batched forward pass for B samples stacked along the batch axis.
@@ -822,6 +891,8 @@ def batched_block_reconstruction_loss_fn(
         original_layers.append((path, _get_nested(block, path)))
         pa = poly_alphas[i] if poly_alphas is not None else None
         ps = poly_shifts[i] if poly_shifts is not None else None
+        sq_arr = sq_scales_list[i] if sq_scales_list else None
+        sq_mx = mx.array(sq_arr, dtype=mx.float32) if sq_arr is not None else None
         proxy = _QuantProxy(
             linear_layers[i],
             soft_weights[i],
@@ -830,6 +901,7 @@ def batched_block_reconstruction_loss_fn(
             p_qmax_a,
             poly_alpha=pa,
             poly_shift=ps,
+            sq_scale=sq_mx,
         )
         _set_nested(block, path, proxy)
 
@@ -946,10 +1018,12 @@ def _compute_derivative_weights(
     using the polynomial derivative, then aggregates across layers.
 
     deriv_agg : str
+        How to aggregate |dα/dσ| across layers:
         "mean" — average across all layers (default). Stable layers dilute the
-                 signal from high-derivative layers.
+                 signal from high-derivative layers (e.g. fc1/fc2 in mm20-22).
         "max"  — take the per-sample maximum across layers. Lets the most
-                 temporally-sensitive layer in a block drive the weighting.
+                 temporally-sensitive layer in a block (typically fc1/fc2) drive
+                 the weighting without dilution from stable attention layers.
 
     Degree-0 (static) layers contribute zero derivative — blocks where all layers
     are static return uniform weights (no amplification, no suppression).
@@ -1147,6 +1221,8 @@ def optimize_block(
     deriv_agg: str = "mean",
     exclude_keys: Optional[set] = None,
     asymmetric_act: bool = False,
+    sq_scales: Optional[Dict] = None,
+    group_size: int = 0,
 ) -> Tuple[AdaRoundParams, Dict]:
     """
     Run AdaRound optimisation for a single transformer block.
@@ -1158,6 +1234,8 @@ def optimize_block(
         When provided, A8 fake quant uses poly-derived α(σ) per sample.
     sample_sigmas : optional array of shape (n_samples,)
         Sigma value for each calibration sample. Required if poly_schedule is set.
+    group_size : int
+        Weight quantization group size. 0 = per-row (default), >0 = per-group.
 
     Returns
     -------
@@ -1179,7 +1257,31 @@ def optimize_block(
     linear_paths = [p for i, (p, _, _) in enumerate(linears) if i not in excluded_indices]
     linear_layers = [l for i, (_, l, _) in enumerate(linears) if i not in excluded_indices]
     W_fps_np = [np.array(l.weight) for l in linear_layers]
-    w_scales_np = [compute_per_channel_scale(W, bits_w) for W in W_fps_np]
+
+    # SmoothQuant Path B: pre-scale FP16 weights by s[c] before AdaRound optimization.
+    # W' = W * diag(s)  — the optimizer learns rounding on the smoothed distribution.
+    sq_scales_list: Optional[List[Optional[np.ndarray]]] = None
+    if sq_scales is not None:
+        sq_layer_scales = sq_scales.get("layers", {})
+        sq_scales_list = []
+        smoothed_count = 0
+        for W, path in zip(W_fps_np, linear_paths):
+            key = _path_to_poly_key(block_name, is_mm, path)
+            if key in sq_layer_scales:
+                sq_scales_list.append(np.array(sq_layer_scales[key], dtype=np.float32))
+                smoothed_count += 1
+            else:
+                sq_scales_list.append(None)
+        W_fps_np = [
+            W * sq_scales_list[i][np.newaxis, :] if sq_scales_list[i] is not None else W
+            for i, W in enumerate(W_fps_np)
+        ]
+        if smoothed_count:
+            print(f"  SmoothQuant: pre-scaled {smoothed_count}/{len(linear_paths)} layers", flush=True)
+
+    w_scales_np = [compute_per_channel_scale(W, bits_w, group_size) for W in W_fps_np]
+    if group_size > 0:
+        print(f"  Group quantization: group_size={group_size}", flush=True)
 
     # Initialize a_scale from poly schedule when no prior is provided.
     # Using 1.0 for activations in ±hundreds causes catastrophic clipping → NaN.
@@ -1236,7 +1338,8 @@ def optimize_block(
 
     if derivative_weighted and poly_schedule is not None and sample_sigmas is not None:
         deriv_w = _compute_derivative_weights(
-            poly_schedule, block_name, is_mm, linear_paths, sample_sigmas, deriv_agg
+            poly_schedule, block_name, is_mm, linear_paths, sample_sigmas,
+            deriv_agg=deriv_agg,
         )
         if sample_weights is not None:
             sample_weights = sample_weights * deriv_w
@@ -1348,6 +1451,7 @@ def optimize_block(
                         s_inputs_b, s_kwargs_b, s_outputs_b,
                         b_val, poly_alphas_b, poly_shifts_b, B, w_batch,
                         params.bits_w, params.bits_a,
+                        sq_scales_list,
                     )
                 finally:
                     clear_batched_mod_params(block, is_mm)
@@ -1434,6 +1538,7 @@ def optimize_block(
                         W_fps_np, w_scales_np,
                         s_inputs, s_kwargs, s_outputs,
                         b_val, poly_alphas, poly_shifts,
+                        sq_scales_list,
                     )
                     # NO mx.eval here — keep everything lazy within the chunk.
                     # Accumulate loss and grads in the computation graph so MLX can
@@ -1573,6 +1678,7 @@ def finalize_block(
     W_fps_np: List[np.ndarray],
     w_scales_np: List[np.ndarray],
     linear_paths: List[str],
+    group_size: int = 0,
 ) -> Dict[str, Dict[str, np.ndarray]]:
     """
     Commit hard rounding decisions (alpha >= 0) and return quantised weights.
@@ -1580,7 +1686,10 @@ def finalize_block(
     Returns
     -------
     dict mapping linear_path -> {'weight_int': np.ndarray, 'scale': np.ndarray,
-                                  'a_scale': float}
+                                  'a_scale': float, 'group_size': int}
+
+    When ``group_size > 0``, scale is stored in compact form ``(out, n_groups)``
+    instead of ``(out, 1)``.
     """
     result: Dict[str, Dict[str, np.ndarray]] = {}
     for i, path in enumerate(linear_paths):
@@ -1593,12 +1702,18 @@ def finalize_block(
         W_q_float = mx.clip(W_floor + hard_delta, params.qmin_w, params.qmax_w)
         mx.eval(W_q_float)
 
+        # Compact group scale for storage: (out, in) → (out, n_groups)
+        scale_np = np.array(s_mx)
+        if group_size > 0 and scale_np.ndim == 2 and scale_np.shape[1] > 1:
+            scale_np = compact_group_scale(scale_np, group_size)
+
         result[path] = {
             "weight_int": np.array(W_q_float).astype(np.int8),
-            "scale": np.array(s_mx),         # (out, 1)
+            "scale": scale_np,
             "a_scale": float(np.array(mx.abs(params.a_scales[i]))[0]),
             "bits_w": params.bits_w,
             "bits_a": params.bits_a,
+            "group_size": group_size,
         }
     return result
 
@@ -1645,6 +1760,10 @@ def main() -> None:
                         help="bb_config.json from src.bayesianbits_optimize; uses per-layer bit widths")
     parser.add_argument("--poly-schedule", type=Path, default=None,
                         help="polynomial_clipping_schedule.json; enables σ-aware A8 fake quant")
+    parser.add_argument("--smoothquant-scales", type=Path, default=None,
+                        help="smoothquant_scales.json from src.compute_smoothquant_scales; "
+                             "pre-scales FP16 weights by s[c] and divides activations by s[c] "
+                             "before fake-quant (Path B: AdaRound on SQ-smoothed distribution)")
     parser.add_argument("--sigma-map", type=Path, default=None,
                         help="Path to layer_statistics.json containing sigma_map "
                              "(default: auto-detect from activations dir)")
@@ -1655,9 +1774,11 @@ def main() -> None:
     parser.add_argument("--derivative-weighted", action="store_true",
                         help="Also weight per-sample loss by |dα/dσ|, amplifying blocks where "
                              "clipping range is most sensitive to σ. Requires --poly-schedule.")
-    parser.add_argument("--deriv-agg", type=str, default="mean", choices=["mean", "max"],
-                        help="How to aggregate |dα/dσ| across layers in a block: "
-                             "'mean' averages (default), 'max' uses the most sensitive layer")
+    parser.add_argument("--deriv-agg", default="mean", choices=["mean", "max"],
+                        help="How to aggregate |dα/dσ| across layers within a block. "
+                             "'mean' (default) averages all layers; 'max' takes the most "
+                             "sensitive layer, preventing stable attention layers from diluting "
+                             "the signal from high-derivative fc1/fc2 layers. (requires --derivative-weighted)")
     parser.add_argument("--refine-skip-converged", type=float, default=None, metavar="PCT",
                         help="With --refine, skip blocks whose loss improved less than PCT%% "
                              "over the last 20%% of the prior run (e.g., 0.5 = skip if <0.5%% improvement)")
@@ -1669,6 +1790,11 @@ def main() -> None:
                              "mm14 was previously included in error — per-channel max shift is only 4 units)")
     parser.add_argument("--asymmetric-act", action="store_true",
                         help="Use asymmetric activation quantization with σ-dependent shift from poly schedule")
+    parser.add_argument("--group-size", type=int, default=0,
+                        help="Weight quantization group size. 0 = per-row (default), "
+                             "32/64/128 = per-group. Group quantization improves W4 "
+                             "utilization by preventing one large column from dominating "
+                             "the entire row's scale.")
     args = parser.parse_args()
 
     if args.sigma_weighted and args.poly_schedule is None:
@@ -1749,6 +1875,13 @@ def main() -> None:
         print(f"  Poly schedule: {args.poly_schedule} ({len(poly_schedule.get('layers', {}))} layers)")
         if sigma_map:
             print(f"  Sigma range: [{sample_sigmas.min():.3f}, {sample_sigmas.max():.3f}]")
+
+    # Load optional SmoothQuant scales
+    sq_scales: Optional[Dict] = None
+    if args.smoothquant_scales is not None:
+        with open(args.smoothquant_scales) as f:
+            sq_scales = json.load(f)
+        print(f"  SmoothQuant scales: {args.smoothquant_scales} ({len(sq_scales.get('layers', {}))} layers)")
 
     # Load optional HTG groups and BB config
     htg_groups: Optional[Dict] = None
@@ -1860,6 +1993,8 @@ def main() -> None:
         params: "AdaRoundParams",
         bits_w: int,
         block_exclude_keys: Optional[set] = None,
+        group_size: int = 0,
+        sq_scales: Optional[Dict] = None,
     ) -> List[str]:
         linears = get_block_linears(block, is_mm)
         # Filter out excluded layers (same logic as optimize_block)
@@ -1871,8 +2006,18 @@ def main() -> None:
         linear_paths = [p for p, _, _ in linears]
         linear_layers = [l for _, l, _ in linears]
         W_fps_np = [np.array(l.weight) for l in linear_layers]
-        w_scales_np = [compute_per_channel_scale(W, bits_w) for W in W_fps_np]
-        quant_weights = finalize_block(params, W_fps_np, w_scales_np, linear_paths)
+
+        # Apply SQ pre-scaling (must match optimize_block so alpha/scale are consistent)
+        if sq_scales is not None:
+            sq_layer_scales = sq_scales.get("layers", {})
+            for i, path in enumerate(linear_paths):
+                key = _path_to_poly_key(block_name, is_mm, path)
+                if key in sq_layer_scales:
+                    s = np.array(sq_layer_scales[key], dtype=np.float32)
+                    W_fps_np[i] = W_fps_np[i] * s[np.newaxis, :]
+
+        w_scales_np = [compute_per_channel_scale(W, bits_w, group_size) for W in W_fps_np]
+        quant_weights = finalize_block(params, W_fps_np, w_scales_np, linear_paths, group_size)
         out_npz = weights_dir / f"{block_name}.npz"
         save_dict: Dict[str, np.ndarray] = {}
         for i, (path, data) in enumerate(quant_weights.items()):
@@ -1969,6 +2114,8 @@ def main() -> None:
                     deriv_agg=args.deriv_agg,
                     exclude_keys=exclude_set if exclude_set else None,
                     asymmetric_act=args.asymmetric_act,
+                    sq_scales=sq_scales,
+                    group_size=args.group_size,
                 )
                 tqdm.write(f"  {block_name} (group {group_id}) done — "
                            f"final_loss={metrics['final_loss']:.4f}")
@@ -1976,6 +2123,8 @@ def main() -> None:
                 linear_paths = _save_block_weights(
                     group_weights_dir, block_name, block, is_mm, params, effective_bits_w,
                     block_exclude_keys=exclude_set if exclude_set else None,
+                    group_size=args.group_size,
+                    sq_scales=sq_scales,
                 )
                 metrics["quant_paths"] = linear_paths
                 metrics["group_id"] = group_id
@@ -2158,6 +2307,8 @@ def main() -> None:
             deriv_agg=args.deriv_agg,
             exclude_keys=exclude_set if exclude_set else None,
             asymmetric_act=args.asymmetric_act,
+            sq_scales=sq_scales,
+            group_size=args.group_size,
         )
         if metrics.get("refined") and metrics["initial_loss"] is not None:
             improvement = metrics["initial_loss"] - metrics["final_loss"]
@@ -2173,6 +2324,8 @@ def main() -> None:
         linear_paths = _save_block_weights(
             weights_dir, block_name, block, is_mm, params, args.bits_w,
             block_exclude_keys=exclude_set if exclude_set else None,
+            group_size=args.group_size,
+            sq_scales=sq_scales,
         )
         metrics["quant_paths"] = linear_paths
         all_metrics_by_name[block_name] = metrics
@@ -2202,6 +2355,7 @@ def main() -> None:
             "deriv_agg": args.deriv_agg,
             "exclude_layers": sorted(exclude_set) if exclude_set else [],
             "asymmetric_act": args.asymmetric_act,
+            "group_size": args.group_size,
             "n_blocks_quantised": len(_checkpoint_metrics),
             "block_metrics": _checkpoint_metrics,
         }

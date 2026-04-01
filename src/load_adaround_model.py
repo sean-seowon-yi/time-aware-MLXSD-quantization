@@ -18,11 +18,13 @@ Strategy (V2 — fake-quantized activations)
 When --quant-config is provided, wraps each nn.Linear with _ActQuantLayer which
 applies per-(layer, timestep) fake activation quantization:
 
-  1. Shift  (post-GELU fc2 inputs only): x = x - shift
-  2. Outlier scaling (two-scale TaQ-DiT): x = x / multiplier_vector
-  3. Fake-quantize: round → clip → dequant (stays float)
-  4. Restore: x = x * multiplier_vector, x = x + shift
-  5. Forward through the original nn.Linear
+  1. SmoothQuant (optional): x = x / sq_scale[c]   (per-channel, if --smoothquant-scales)
+  2. Shift  (post-GELU fc2 inputs only): x = x - shift
+  3. Outlier scaling (two-scale TaQ-DiT): x = x / multiplier_vector
+  4. Fake-quantize: round → clip → dequant (stays float)
+  5. Restore: x = x * multiplier_vector, x = x + shift
+  6. Un-SmoothQuant: x = x * sq_scale[c]
+  7. Forward through the original nn.Linear
 
 Uses a custom Euler inference loop so step_key can be threaded into proxies
 before each denoising step.
@@ -73,6 +75,15 @@ Usage
         --mlx-int4 --quant-config calibration_data/activations/quant_config.json \\
         --prompt "a tabby cat sitting on a sofa" \\
         --output-image quant_v3a8.png --compare
+
+    # V2 + SmoothQuant: per-channel activation scaling before fake-quant
+    conda run -n diffusionkit python -m src.load_adaround_model \\
+        --adaround-output quantized_weights_w4a8_smoothquant_absorbed \\
+        --quant-config calibration_data_512/activations/quant_config.json \\
+        --poly-schedule polynomial_clipping_schedule_smoothquant.json \\
+        --smoothquant-scales smoothquant_scales.json \\
+        --prompt "a tabby cat sitting on a sofa" \\
+        --output-image quant_smoothquant.png --compare
 
 Output layout of adaround_optimize.py (required input)
 -------------------------------------------------------
@@ -173,11 +184,16 @@ class _ActQuantLayer:
     quantization to its input before the linear transform.
 
     Two-scale TaQ-DiT approach for post-GELU layers with outlier channels:
+      0. SmoothQuant (optional): x = x / sq_scale[c]
       1. Shift (fc2 inputs only)
       2. Divide outlier channels by multiplier_vector
       3. Fake-quantize with scale_normal
       4. Restore outlier channels
       5. Un-shift
+
+    SmoothQuant is NOT un-done after fake-quant because the layer's weights
+    are already absorbed (W' = W * diag(s)).  The product W' @ x' where
+    x' = fake_quant(x / s) recovers the original W @ x (approximately).
     """
 
     def __init__(
@@ -188,6 +204,7 @@ class _ActQuantLayer:
         outlier_cfg: Dict,
         poly_cfg: Optional[Dict] = None,
         lut_cfg: Optional[Dict] = None,
+        sq_scale: Optional[np.ndarray] = None,
     ):
         self.layer = layer
         self.layer_name = layer_name
@@ -195,6 +212,7 @@ class _ActQuantLayer:
         self.outlier_cfg = outlier_cfg     # {multiplier_vector, ...} or {}
         self.poly_cfg = poly_cfg           # {degree, coeffs, r2, cv} or None
         self.lut_cfg = lut_cfg             # {alphas: [...], sigmas: [...]} or None
+        self.sq_scale = sq_scale           # np.ndarray (C,) or None — SmoothQuant 1/s
         self.poly_sigma_range = None       # set by apply_act_quant_hooks
         self.poly_margin: float = 1.0      # set by main(); multiplies alpha bounds
         self.current_step_key: Optional[int] = None
@@ -253,6 +271,12 @@ class _ActQuantLayer:
                 return self.layer(x)
             scale = cfg["scale"]
             bits = cfg["bits"]
+
+        # 0. SmoothQuant: divide activations by per-channel scale before quantization
+        sq_vec = None
+        if self.sq_scale is not None:
+            sq_vec = mx.array(self.sq_scale, dtype=x.dtype)
+            x = x / sq_vec
 
         # Check for asymmetric mode (Module C: poly shift)
         poly_shift = self._get_poly_shift()
@@ -316,6 +340,7 @@ def apply_act_quant_hooks(
     poly_schedule: Optional[Dict] = None,
     lut_schedule: Optional[Dict] = None,
     exclude_layers: Optional[set] = None,
+    smoothquant_scales: Optional[Dict] = None,
 ) -> Tuple[List, List]:
     """
     Walk the MMDiT block hierarchy and wrap each nn.Linear whose name appears
@@ -325,6 +350,11 @@ def apply_act_quant_hooks(
       mm{i}.img.{attn|mlp}.{q,k,v,o}_proj / fc1 / fc2
       mm{i}.txt.{attn|mlp}.{q,k,v,o}_proj / fc1 / fc2
       uni{i}.{attn|mlp}.{q,k,v,o}_proj / fc1 / fc2
+
+    smoothquant_scales : dict or None
+        If provided, a dict {"layers": {calib_name: [s0, s1, ...]}} loaded from
+        smoothquant_scales.json.  Each _ActQuantLayer receives sq_scale = s so that
+        activations are divided by s[c] before fake-quant and multiplied back after.
 
     Returns
     -------
@@ -336,6 +366,7 @@ def apply_act_quant_hooks(
     poly_layers = poly_schedule.get("layers", {}) if poly_schedule else {}
     lut_layers = lut_schedule.get("layers", {}) if lut_schedule else {}
     lut_sigmas = lut_schedule.get("sigmas", []) if lut_schedule else []
+    sq_layer_scales = smoothquant_scales.get("layers", {}) if smoothquant_scales else {}
 
     # Build set of all layer names that appear in at least one timestep or poly/lut schedule
     quant_layer_names: set = set()
@@ -373,7 +404,12 @@ def apply_act_quant_hooks(
         lut_cfg = None
         if has_lut:
             lut_cfg = {"alphas": lut_layers[us_key]["alphas"], "sigmas": lut_sigmas}
-        proxy = _ActQuantLayer(layer, full_name, per_ts, outlier_cfg, poly_cfg, lut_cfg)
+        # SmoothQuant per-channel scale (keyed by underscore name)
+        sq_scale_arr = None
+        if us_key in sq_layer_scales:
+            sq_scale_arr = np.array(sq_layer_scales[us_key], dtype=np.float32)
+        proxy = _ActQuantLayer(layer, full_name, per_ts, outlier_cfg, poly_cfg, lut_cfg,
+                               sq_scale=sq_scale_arr)
         proxy.poly_sigma_range = poly_schedule.get("sigma_range") if poly_schedule else None
         setattr(sub, attr, proxy)
         patches.append((sub, attr, layer))
@@ -615,49 +651,22 @@ def load_adaround_weights(
 # Dequantize and inject into model
 # ---------------------------------------------------------------------------
 
-def expand_group_scale(scale_compact: np.ndarray, in_features: int) -> np.ndarray:
-    """
-    Expand grouped (compacted) quantization scales back to per-channel.
-
-    scale_compact : shape (out, n_groups)
-    in_features   : total input channels
-
-    Returns shape (out, in_features) by repeating each group's scale.
-    """
-    if scale_compact.ndim != 2:
-        return scale_compact
-
-    out_features, n_groups = scale_compact.shape
-    if n_groups == 1:
-        return scale_compact
-
-    # Determine group size
-    group_size = (in_features + n_groups - 1) // n_groups
-
-    # Expand: repeat each scale value group_size times
-    scale_expanded = np.zeros((out_features, in_features), dtype=scale_compact.dtype)
-    for g in range(n_groups):
-        c0 = g * group_size
-        c1 = min(c0 + group_size, in_features)
-        scale_expanded[:, c0:c1] = scale_compact[:, g:g+1]
-
-    return scale_expanded
-
-
 def dequantize(weight_int: np.ndarray, scale: np.ndarray) -> np.ndarray:
     """
     Dequantize int8 AdaRound weight to float16.
 
     weight_int : int8, shape (out, in)   values in [-8, 7] for 4-bit
-    scale      : float32, shape (out, in) per-channel OR (out, n_groups) compacted
-                 If compacted, expands to per-channel before dequantizing.
+    scale      : float32, shape (out, 1) per-output-channel scale
+                 OR shape (out, n_groups) for group quantization
 
     Returns float16 array of the same shape.
     """
-    # Handle grouped (compacted) scales
-    if scale.ndim == 2 and scale.shape[1] < weight_int.shape[1]:
-        scale = expand_group_scale(scale, weight_int.shape[1])
-
+    # Expand compact group scale (out, n_groups) → (out, in) if needed
+    if scale.ndim == 2 and scale.shape[1] > 1 and scale.shape[1] < weight_int.shape[1]:
+        in_ = weight_int.shape[1]
+        n_groups = scale.shape[1]
+        group_size = (in_ + n_groups - 1) // n_groups
+        scale = np.repeat(scale, group_size, axis=1)[:, :in_]
     return (weight_int.astype(np.float32) * scale).astype(np.float16)
 
 
@@ -880,7 +889,7 @@ def weight_diff_stats(
 # RTN (round-to-nearest) W8 fake quantization
 # ---------------------------------------------------------------------------
 
-def fake_quant_weights_rtn_w8(pipeline) -> int:
+def fake_quant_weights_rtn_w8(pipeline, exclude_layers=None) -> int:
     """
     Apply round-to-nearest int8 fake quantization to all MMDiT linear weights.
 
@@ -912,25 +921,31 @@ def fake_quant_weights_rtn_w8(pipeline) -> int:
         pending.append(new_weight)
         n_quantized += 1
 
-    def _walk_block(tb):
+    def _walk_block(tb, prefix):
         for lin_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            us_key = f"{prefix}_attn_{lin_name}"
+            if exclude_layers and us_key in exclude_layers:
+                continue
             layer = getattr(tb.attn, lin_name, None)
             if layer is not None and isinstance(layer, nn.Linear):
                 _quant_linear(layer)
         if hasattr(tb, "mlp"):
             for lin_name in ("fc1", "fc2"):
+                us_key = f"{prefix}_mlp_{lin_name}"
+                if exclude_layers and us_key in exclude_layers:
+                    continue
                 layer = getattr(tb.mlp, lin_name, None)
                 if layer is not None and isinstance(layer, nn.Linear):
                     _quant_linear(layer)
 
     if hasattr(mmdit, "multimodal_transformer_blocks"):
-        for block in mmdit.multimodal_transformer_blocks:
-            _walk_block(block.image_transformer_block)
-            _walk_block(block.text_transformer_block)
+        for i, block in enumerate(mmdit.multimodal_transformer_blocks):
+            _walk_block(block.image_transformer_block, f"mm{i}_img")
+            _walk_block(block.text_transformer_block, f"mm{i}_txt")
 
     if hasattr(mmdit, "unified_transformer_blocks"):
-        for block in mmdit.unified_transformer_blocks:
-            _walk_block(block.transformer_block)
+        for i, block in enumerate(mmdit.unified_transformer_blocks):
+            _walk_block(block.transformer_block, f"uni{i}")
 
     if pending:
         mx.eval(*pending)
@@ -1002,6 +1017,15 @@ def main() -> None:
     parser.add_argument("--no-weight-quant", action="store_true",
                         help="Skip all weight quantization (keep FP16 weights). "
                              "Use with --poly-schedule for A8-only testing.")
+    parser.add_argument("--exclude-layers", type=str, default=None,
+                        help="Comma-separated layer keys to keep in FP16 "
+                             "(e.g. mm20_txt_mlp_fc2,mm21_txt_mlp_fc2,mm22_txt_mlp_fc2). "
+                             "Skips both weight injection and activation quantization.")
+    parser.add_argument("--smoothquant-scales", type=Path, default=None,
+                        help="smoothquant_scales.json from compute_smoothquant_scales.py; "
+                             "applies per-channel activation scaling (x / s[c]) before "
+                             "fake-quant in each _ActQuantLayer. Requires --quant-config "
+                             "or --poly-schedule.")
     args = parser.parse_args()
 
     if not args.rtn_w8 and not args.no_weight_quant and args.adaround_output is None:
@@ -1022,6 +1046,27 @@ def main() -> None:
         if args.blocks:
             selected = set(args.blocks.split(","))
             quant_weights = {k: v for k, v in quant_weights.items() if k in selected}
+
+        if args.exclude_layers:
+            cli_exclude = set(args.exclude_layers.split(","))
+            n_removed = 0
+            for us_key in cli_exclude:
+                parts = us_key.split("_", 2)  # e.g. ["mm20", "txt", "mlp_fc2"]
+                if len(parts) < 3:
+                    continue
+                block_name, stream, remainder = parts
+                # "mlp_fc2" → "mlp.fc2", "attn_q_proj" → "attn.q_proj"
+                remainder = remainder.replace("_", ".", 1)
+                if stream == "img":
+                    linear_path = f"image_transformer_block.{remainder}"
+                elif stream == "txt":
+                    linear_path = f"text_transformer_block.{remainder}"
+                else:
+                    linear_path = f"transformer_block.{remainder}"
+                if block_name in quant_weights and linear_path in quant_weights[block_name]:
+                    del quant_weights[block_name][linear_path]
+                    n_removed += 1
+            print(f"  Excluding {n_removed} layers from weight quantization (FP16)")
 
         n_blocks = len(quant_weights)
         n_layers = sum(len(v) for v in quant_weights.values())
@@ -1093,7 +1138,8 @@ def main() -> None:
         print("\n=== Skipping weight quantization (FP16 weights) ===")
     elif args.rtn_w8:
         print("\n=== Applying RTN W8 Fake Quantization ===")
-        n_injected = fake_quant_weights_rtn_w8(pipeline)
+        rtn_exclude = set(args.exclude_layers.split(",")) if args.exclude_layers else None
+        n_injected = fake_quant_weights_rtn_w8(pipeline, exclude_layers=rtn_exclude)
         print(f"  {n_injected} layers fake-quantized to W8 in {time.time() - t0:.1f}s")
     elif args.mlx_int4:
         print("\n=== Injecting AdaRound Weights (MLX int4) ===")
@@ -1140,6 +1186,15 @@ def main() -> None:
     if poly_schedule is not None and lut_schedule is not None:
         print("  WARNING: Both --poly-schedule and --lut-schedule provided; LUT takes priority")
 
+    # Load SmoothQuant scales if provided
+    smoothquant_scales = None
+    if args.smoothquant_scales is not None:
+        print(f"\n=== Loading SmoothQuant Scales: {args.smoothquant_scales} ===")
+        with open(args.smoothquant_scales) as f:
+            smoothquant_scales = json.load(f)
+        n_sq = len(smoothquant_scales.get("layers", {}))
+        print(f"  alpha={smoothquant_scales.get('alpha')}  layers={n_sq}")
+
     has_act_schedule = args.quant_config is not None or poly_schedule is not None or lut_schedule is not None
     if has_act_schedule:
         per_timestep = {}
@@ -1155,6 +1210,8 @@ def main() -> None:
 
         # Get exclude_layers from the AdaRound config (Module B)
         cfg_exclude = set(config.get("exclude_layers", []))
+        if args.exclude_layers:
+            cfg_exclude = cfg_exclude | set(args.exclude_layers.split(","))
 
         # Build the set of all schedule layers for exclude filtering
         all_schedule_layers = {}
@@ -1181,7 +1238,11 @@ def main() -> None:
             pipeline.mmdit, per_timestep, outlier_config, poly_schedule,
             lut_schedule=lut_schedule,
             exclude_layers=cfg_exclude if cfg_exclude else None,
+            smoothquant_scales=smoothquant_scales,
         )
+        if smoothquant_scales is not None:
+            n_sq_applied = sum(1 for p in proxies if p.sq_scale is not None)
+            print(f"  SmoothQuant: {n_sq_applied} / {len(proxies)} layers have per-channel scales")
 
         # Apply margin to all proxies
         if args.poly_margin != 1.0:
