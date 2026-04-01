@@ -1,0 +1,68 @@
+```
+IMG stream (B, S_img, 1, 1536)                TXT stream (B, S_txt, 1, 1536)
+          │                                               │
+          │     adaLN_modulation                          │     adaLN_modulation
+          │     SiLU → Linear(1536 → 6×1536)              │     SiLU → Linear(1536 → 6×1536)
+          │     splits into 6 params:                     │     splits into 6 params:
+          │       β₁, γ₁  (pre-attn shift/scale)         │       β₁, γ₁  (pre-attn shift/scale)
+          │       α₁       (post-attn gate)               │       α₁       (post-attn gate)
+          │       β₂, γ₂  (pre-FFN shift/scale)          │       β₂, γ₂  (pre-FFN shift/scale)
+          │       α₂       (post-FFN gate)                │       α₂       (post-FFN gate)
+          │                                               │
+          ▼                                               ▼
+   LayerNorm (norm1)                              LayerNorm (norm1)
+   affine_transform(x, shift=β₁, scale=γ₁)       affine_transform(x, shift=β₁, scale=γ₁)
+   → modulated_pre_attention                       → modulated_pre_attention
+          │                                               │
+          ├─► q_proj  Linear(1536 → 1536)           ├─► q_proj  Linear(1536 → 1536)
+          ├─► k_proj  Linear(1536 → 1536, no bias)  ├─► k_proj  Linear(1536 → 1536, no bias)
+          └─► v_proj  Linear(1536 → 1536)           └─► v_proj  Linear(1536 → 1536)
+                │                                               │
+                │         QKNorm (RMSNorm per head on Q and K)  │
+                │                                               │
+                └──────────────────── concat ──────────────────┘
+                                          │
+                              Q, K, V:  (B, 24 heads, S_img+S_txt, 64)
+                                          │
+                             PositionalEmbedding (learned, not RoPE)
+                             applied at input embedding stage only
+                                          │
+                                          ▼
+                           Joint SDPA  softmax(Q·Kᵀ / √64) · V
+                           [Flash attention when seq_len > 1024]
+                                          │
+                              (B, 24 heads, S_img+S_txt, 64)
+                              reshape → (B, S_img+S_txt, 1, 1536)
+                                          │
+                                       split
+                            ┌───────────┴───────────┐
+                     img slice                  txt slice
+                  (B, S_img, 1, 1536)       (B, S_txt, 1, 1536)
+                            │                        │
+                            ▼                        ▼
+                       o_proj                    o_proj
+                  Linear(1536 → 1536)        Linear(1536 → 1536)
+                            │                        │
+                       × α₁                     × α₁
+                            │                        │
+                       + residual               + residual          [post_sdpa_res]
+                            │                        │
+                     LayerNorm (norm2)         LayerNorm (norm2)
+                     affine_transform(          affine_transform(
+                       shift=β₂, scale=γ₂)      shift=β₂, scale=γ₂)
+                            │                        │
+                           fc1                      fc1
+                     Linear(1536 → 6144)      Linear(1536 → 6144)
+                            │                        │
+                           GELU                     GELU             [post_gelu]
+                            │                        │
+                           fc2                      fc2
+                     Linear(6144 → 1536)      Linear(6144 → 1536)
+                            │                        │
+                       × α₂                     × α₂
+                            │                        │
+                       + residual               + residual
+                            │                        │
+                            ▼                        ▼
+                 IMG out (B, S_img, 1, 1536)   TXT out (B, S_txt, 1, 1536)
+```

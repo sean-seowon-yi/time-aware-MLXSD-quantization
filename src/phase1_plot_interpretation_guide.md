@@ -1,0 +1,331 @@
+# Phase 1 Diagnostic Plots — Interpretation Guide
+
+This document explains the **purpose**, **axes**, and **how to read** each plot produced by the Phase 1 diagnostic pipeline. It is written from the code and the design in `phase1_diagnostic_implementation.md`; it does not refer to specific numeric results.
+
+**Conventions used in the code:**
+- **Salience** = per-channel max absolute value: \(s(X_j) = \max_t |X_j|\) (activation) or \(s(W_j) = \max_{\text{out}} |W_j|\) (weight).
+- **Channel** = one input-feature dimension (index \(j\) along the last axis of activations / columns of the weight matrix).
+- **σ (sigma)** = noise level in the Euler denoising trajectory; σ ≈ 1.0 is early (noisy), σ ≈ 0.0 is late (nearly clean).
+- **Top-k** = the k channels (default 32) with the largest salience.
+- **ρ (Spearman)** = rank correlation between activation salience and weight salience; low ρ suggests complementarity (good for CSB).
+
+---
+
+## 10.1 Per-channel magnitude + quantization error (PTQ4DiT Fig. 3)
+
+**Filename pattern:** `fig3_<layer_name>.png` / `.pdf`
+
+**Purpose:** Test whether **salient activation and weight channels exist** (H1) and whether they **drive disproportionate quantization error**. One figure per representative layer.
+
+**Layout:** Two panels side by side (Activation | Weight).
+
+| Panel   | X-axis        | Primary Y-axis (bars) | Secondary Y-axis (line) |
+|--------|----------------|------------------------|--------------------------|
+| Left   | Channel index  | max\|activation\|      | Quant. MSE (activation)  |
+| Right  | Channel index  | max\|weight\|          | Quant. MSE (weight)       |
+
+- **Bars:** One bar per channel \(j\); height = salience at a **single σ step** (typically mid-trajectory). Top-k channels are colored **red**; others blue (activation) or orange (weight).
+- **Line:** Per-channel MSE from naive 8-bit uniform quantization (green). For activation: tensor-wise quant then per-channel MSE; for weight: per-column quant then MSE.
+
+**How to read:**  
+If a few channels have much larger bars than the rest, salient channels exist. If the green MSE line is high where bars are high, those channels contribute most to quantization error. Compare image vs text layers to see if patterns differ by modality.
+
+---
+
+## 10.2 Temporal boxplot of activation salience (PTQ4DiT Fig. 4)
+
+**Filename pattern:** `fig4_<layer_name>.png` / `.pdf`
+
+**Purpose:** Show **how the distribution of per-channel salience changes across the σ trajectory** (H3 — temporal variation).
+
+**Axes:**
+- **X-axis:** σ step index, tick labels show σ value (e.g. 0.97, 0.81, …, 0.03).
+- **Y-axis:** max\|activation\| per channel (i.e. one value per channel at that step).
+
+**Content:** One box-and-whisker per σ step. Each box summarizes the distribution of the \(d_{\text{in}}\) channel saliences at that step (quartiles, median; fliers typically off). Red dots overlaid at each step are the **top-k** channel values at that step.
+
+**How to read:**  
+Boxes moving up/down → overall salience level shifts over time. Red dots moving or changing density → identity or concentration of salient channels changes. Monotonic drift vs jumps indicates smooth vs regime-like temporal behavior.
+
+---
+
+## 10.3 Complementarity across timesteps (PTQ4DiT Fig. 1-Left)
+
+**Filename pattern:** `fig1left_<layer_name>.png` / `.pdf`
+
+**Purpose:** Test **activation–weight complementarity** (H2): salient activation channels should not be the same as salient weight channels, and this can vary with σ.
+
+**Layout:** 3 rows × 2 columns. Rows = three σ steps (early, mid, late). Column 1 = Activation, Column 2 = Weight.
+
+| Column   | X-axis       | Y-axis      | Annotation        |
+|----------|--------------|-------------|-------------------|
+| Activation | Channel index | max\|act\|  | ρ and J (Jaccard) |
+| Weight     | Channel index | max\|weight\| | (same in all rows) |
+
+- **Bars:** Per-channel magnitude; top-k activation channels in red, top-k weight channels in orange. Weight panel is the same in all three rows.
+- **Annotation (per row):** Spearman ρ and Jaccard J between top-k activation and top-k weight sets.
+
+**How to read:**  
+Red bars (activation) changing position across rows → temporal variation of salient activations. If red (act) and orange (wt) highlights rarely overlap and ρ is low (< ~0.3) and J is low → complementarity holds; CSB is promising. High ρ or high J → act and weight salience align → less complementarity.
+
+---
+
+## 10.4 Per-layer salience histogram
+
+**Filename pattern:** `hist_<layer_name>.png` / `.pdf`
+
+**Purpose:** Show the **full distribution shape** of per-channel salience (H1), complementing the bar charts in 10.1.
+
+**Axes:**
+- **X-axis:** Channel salience (max\|·\|), same scale for activation and weight.
+- **Y-axis:** Count (number of channels in each bin).
+
+**Content:** Two overlaid histograms — activation salience (blue, semi-transparent) and weight salience (orange, semi-transparent). Vertical dashed (red) and dotted (dark red) lines mark a few of the top salience values for activation and weight.
+
+**How to read:**  
+Shape (e.g. long tail, bimodal) indicates concentration of salience. Overlap or separation of the two distributions and position of the vertical lines give a quick view of how extreme the top channels are and how activation vs weight salience compare.
+
+---
+
+## 10.5 Heatmap: channel salience × σ step
+
+**Filename pattern:** `heatmap_<layer_name>.png` / `.pdf` and `heatmap_grid_<side>_<family>.png` / `.pdf`
+
+**Purpose:** Dense view of **which channels are salient at which σ** (H3 — temporal and channel-wise structure).
+
+**Axes:**
+- **X-axis:** Channel index, **sorted by mean salience** over all σ steps (low → high mean salience left to right).
+- **Y-axis:** σ step (top = early / high σ, bottom = late / low σ). Tick labels show σ values.
+- **Color:** \(\log_{10}(\text{salience} + \epsilon)\); colormap e.g. inferno (darker = lower, brighter = higher).
+
+**How to read:**  
+Vertical bright stripes → same channels stay salient across σ. Diagonal or moving bright regions → salience migrates across channels over time. The grid version shows one small heatmap per block for a single family (e.g. image q_proj) to compare depth.
+
+---
+
+## 10.6 Layerwise Spearman ρ bar plot
+
+**Filename pattern:** `layerwise_rho.png` / `.pdf`
+
+**Purpose:** **Layer-by-layer view of activation–weight correlation** (H2) to see where complementarity is strong (low ρ) or weak (high ρ).
+
+**Layout:** Two horizontal subplots: (1) Image + Shared layers, (2) Text layers.
+
+**Axes:**
+- **X-axis:** Layer index (order follows registry: block, side, family).
+- **Y-axis:** Mean Spearman ρ (averaged over σ steps). Reference lines at 0 and 0.5.
+
+**Content:** One bar per layer; bar color = family (q_proj, k_proj, v_proj, o_proj, fc1, fc2, context, final).
+
+**How to read:**  
+Bars near 0 → good complementarity (CSB more likely to help). Bars above ~0.5 → act and weight salience align → higher quantization risk. Compare top vs bottom subplot for image vs text asymmetry.
+
+---
+
+## 10.7 Temporal ρ trajectory + SSC weight overlay
+
+**Filename pattern:** `rho_traj_<layer_name>.png` / `.pdf` and `rho_grid_<side>_<family>.png` / `.pdf`
+
+**Purpose:** Show **how ρ changes along the σ trajectory** (H3 + H2) and the implied **SSC (Spearman-guided salience calibration) weights** η_t.
+
+**Axes (single-layer):**
+- **X-axis:** σ step (labels = σ values).
+- **Left Y-axis:** Spearman ρ at each step (line, blue).
+- **Right Y-axis:** η = SSC weight (filled area, orange); η_t ∝ exp(−ρ_t), normalized so weights sum to 1.
+
+**Grid:** 6×4 small panels, one per block for a fixed family/side; each panel plots ρ vs σ step, y-axis clamped to [-1, 1].
+
+**How to read:**  
+ρ flat and low → complementarity stable over time; ρ varying or high at some steps → time-dependent or weak complementarity. Where η is large, that σ step gets more weight in a time-aware calibration.
+
+---
+
+## 10.8 Image vs text paired scatter
+
+**Filename pattern:** `modality_scatter_<metric>.png` / `.pdf` (one per metric)
+
+**Purpose:** **Modality asymmetry** (H5): compare image-side and text-side layers for the same (block, family).
+
+**Axes:**
+- **X-axis:** Metric value for the **image**-side layer (e.g. Mean ρ, Mean CoV, or Max salience).
+- **Y-axis:** Same metric for the **text**-side layer.
+- **Points:** One point per (block, family) pair that exists for both image and text. Color = block index (e.g. cool→warm).
+- **Diagonal:** y = x (dashed). Points on the line → symmetric; points off → one modality higher/lower.
+
+**How to read:**  
+Points along the diagonal → image and text behave similarly for that metric. Systematic offset or spread away from the diagonal → modality asymmetry (e.g. text more variable or higher ρ than image).
+
+---
+
+## 10.9 Submodule family violin plot
+
+**Filename pattern:** `family_violins.png` / `.pdf`
+
+**Purpose:** Compare **submodule families** (q_proj, k_proj, v_proj, o_proj, fc1, fc2) across blocks and sides (H4).
+
+**Layout:** One row of three panels. Each panel = one metric: Max activation salience, Spearman ρ, Temporal CoV.
+
+**Content (per panel):**
+- **X-axis:** Family name.
+- **Y-axis:** Metric value.
+- **Violins:** One per family; left half blue (image-side layers), right half orange (text-side layers). Violin width = distribution of that metric over all layers in that family.
+
+**How to read:**  
+Which families have the highest salience, highest ρ, or highest CoV → candidates for hardest quantization and for targeted treatment (e.g. CSB/SSC by family).
+
+---
+
+## 10.10 Block depth vs salience profile
+
+**Filename pattern:** `depth_profile_<family>.png` / `.pdf` (one per family, e.g. q_proj, fc1, o_proj)
+
+**Purpose:** **Depth-dependent behavior** (H4): how salience and ρ vary with block index (0–23).
+
+**Axes:**
+- **X-axis:** Block index (0 to 23).
+- **Left Y-axis:** Activation salience. Lines: image mean (solid blue), image max (dashed blue), text mean (solid orange), text max (dashed orange).
+- **Right Y-axis:** Mean Spearman ρ (dotted, same color scheme by side).
+
+**How to read:**  
+Rising or falling trends with depth → early vs late blocks behave differently. Peaks in salience or ρ at certain blocks → focus quantization efforts there.
+
+---
+
+## 10.11 Top-k overlap heatmap across σ steps
+
+**Filename pattern:** `topk_overlap_<layer_name>.png` / `.pdf`
+
+**Purpose:** **Stability of the set of top-k salient channels** across σ (H3). High overlap = same channels stay salient; low = identity shifts.
+
+**Axes:**
+- **X-axis and Y-axis:** σ step index (tick labels = σ values). Symmetric matrix.
+- **Cell (i, j):** Jaccard index between the top-k channel set at step i and the top-k set at step j. Colormap e.g. RdYlGn (green = high overlap, red = low).
+
+**How to read:**  
+Diagonal = 1 (same step). Green blocks (e.g. early–early, late–late) → stable phases. Red off-diagonal → different σ phases have different salient channels. Produced for a few representative layers (e.g. q_proj, fc1, final_layer) to compare families.
+
+---
+
+## 10.12 Activation vs weight salience scatter
+
+**Filename pattern:** `scatter_<layer_name>.png` / `.pdf`
+
+**Purpose:** **Per-channel view of complementarity** (H2): do high-activation channels have low weight salience and vice versa?
+
+**Axes:**
+- **X-axis:** Activation salience s(X_j) (log scale).
+- **Y-axis:** Weight salience s(W_j) (log scale).
+- **Points:** One per channel j; color = channel index (e.g. viridis). Red ring = top-k activation channels; orange ring = top-k weight channels.
+
+**Annotation:** Spearman ρ in a corner.
+
+**How to read:**  
+L-shaped or dispersed cloud → complementarity (high act often with low weight, or vice versa). Cloud along the diagonal → act and weight salience correlated → weaker complementarity. Low ρ supports the L-shaped view.
+
+---
+
+## 10.13 Salience rank stability ribbon
+
+**Filename pattern:** `rank_ribbon_<layer_name>.png` / `.pdf`
+
+**Purpose:** **Track how the ranks of a fixed set of channels evolve** over σ (H3). Channels are the top-k at the first σ step; then their ranks are plotted at every step.
+
+**Axes:**
+- **X-axis:** σ step (labels = σ values).
+- **Y-axis:** Rank (1 = most salient, larger = less salient); axis is **inverted** so rank 1 is at the top.
+- **Lines:** One line per tracked channel (e.g. 16), each with a distinct color.
+
+**How to read:**  
+Lines staying near the top → those channels remain among the most salient (stable). Lines crossing and dropping → rank changes; salient identity shifts over time. Finer-grained than the Jaccard heatmap (10.11).
+
+---
+
+## 10.14 Quantization sensitivity (risk) ranking
+
+**Filename pattern:** `risk_ranking.png` / `.pdf`
+
+**Purpose:** **Prioritize layers for quantization** (risk ranking). Composite score combines high activation salience, high weight salience, high mean ρ, and high temporal CoV.
+
+**Axes:**
+- **Y-axis:** Layer name (top = highest risk).
+- **X-axis:** Risk score (normalized combination of the four components above).
+
+**Content:** Horizontal bars, color by family. Typically top 40 layers shown.
+
+**How to read:**  
+Layers at the top are the highest-risk targets; they should get priority for CSB/SSC or careful calibration in Phase 2. Family colors show which submodule types dominate the risk list.
+
+---
+
+## 10.15 CFG conditioning comparison (optional)
+
+**Filename pattern:** `cfg_<layer_name>.png` / `.pdf` (only if CFG data is collected, i.e. cfg_weight > 0)
+
+**Purpose:** Compare **conditioned vs unconditioned** activation salience (e.g. for velocity prediction / CFG analysis).
+
+**Layout:** Two panels. (1) Boxplots of per-channel salience at several σ steps: conditioned (blue) vs unconditioned (orange). (2) Scatter of conditioned vs unconditioned salience at one σ (y = x diagonal). Points on diagonal → similar; off → conditioning changes the distribution.
+
+**How to read:**  
+Large differences between blue and orange boxes or systematic deviation from the diagonal → conditioning strongly affects activations; may need separate or time-aware calibration when using CFG.
+
+---
+
+## 10.16 Final layer analysis
+
+**Filename pattern:** `final_layer_analysis.png` / `.pdf`
+
+**Purpose:** **Velocity-prediction / output-layer focus** (H6): the final linear layer predicts velocity; its behavior may differ from mid-block layers.
+
+**Layout:** Three panels.
+
+| Panel | X-axis       | Y-axis / content |
+|-------|--------------|-------------------|
+| 1     | Channel index | max\|weight\| (bars) — weight channel profile |
+| 2     | σ step       | Boxplot of per-channel max\|activation\| over σ (like 10.2) |
+| 3     | Mean \|activation\| per channel | Histogram count; three σ steps overlaid (early, mid, late) |
+
+**How to read:**  
+Panel 1: whether the final layer has a few dominant weight channels. Panel 2: whether activation salience over σ is stable or shifting. Panel 3: whether the distribution of activation magnitudes shifts or becomes bimodal across σ (e.g. high σ noise-dominated vs low σ image-dominated).
+
+---
+
+## 10.17 Global summary dashboard
+
+**Filename pattern:** `summary_dashboard.png` / `.pdf`
+
+**Purpose:** **Single-page overview** of Phase 1: block-depth trends and family/risk distribution.
+
+**Layout:** 2×3 grid.
+
+| Position | Content |
+|----------|--------|
+| (0,0) | Block-depth profile: mean activation salience vs block (image vs text lines) |
+| (0,1) | Block-depth profile: mean Spearman ρ vs block (image vs text) |
+| (0,2) | Block-depth profile: mean temporal CoV vs block (image vs text) |
+| (1,0) | Violin: max activation salience by family |
+| (1,1) | Violin: Spearman ρ by family |
+| (1,2) | Histogram: risk score distribution over all layers |
+
+**How to read:**  
+Top row: how salience, ρ, and temporal variability evolve with depth and differ between image and text. Bottom row: which families are most extreme on salience and ρ, and how risk scores are distributed (e.g. few very high-risk vs many moderate-risk layers).
+
+---
+
+## 10.18 Summary diagnostic table (CSV)
+
+**Filename:** `summary_table.csv` (in the diagnostics output directory, not in `plots/`)
+
+**Purpose:** **Machine-readable summary** of all layers with the metrics used in the plots and the composite risk score. One row per layer; columns include layer_name, family, side, block, d_in, mean/max act and weight salience, concentration metrics (e.g. top1/median, Gini), Spearman stats (mean, std, min, max), Jaccard, temporal CoV, early–late Jaccard, and risk_score. Sorted by risk_score descending. Use for filtering, further analysis, or to reproduce the risk ranking and dashboard logic.
+
+---
+
+## Color and naming quick reference
+
+- **Blue (#3498db):** Image-side layers / activation.
+- **Orange (#e67e22):** Text-side layers / weight (in dual panels).
+- **Red (#e74c3c):** Top-k salient channels / highlights.
+- **Green (#2ecc71):** Quantization MSE (Fig 3), or shared/context.
+- **Grey (#7f8c8d):** o_proj family; **#95a5a6:** default/other.
+- **Dashboard/depth:** Block index or family; image vs text as above.
+
+Layer names follow the pattern `blocks.<block>.<side>.attn|mlp.<sub>` or `context_embedder` / `final_layer.linear`.

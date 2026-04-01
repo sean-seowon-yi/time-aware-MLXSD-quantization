@@ -1,0 +1,14 @@
+# DiffusionKit dependencies
+argmaxtools>=0.1.13
+torch
+safetensors
+mlx
+jaxtyping
+transformers
+pillow
+sentencepiece
+
+# Phase 1 diagnostics
+numpy
+scipy
+matplotlib

@@ -1,0 +1,4 @@
+100 ms-coco prompt-seed pairs (coco_100_calibration_prompts.txt)
+image size 512x512
+CFG 4
+steps 30
