@@ -75,7 +75,6 @@ def main():
         low_memory_mode=DIAG_CONFIG["low_memory_mode"],
     )
     if args.weights_path:
-        import mlx.core as mx
         logger.info("Loading custom weights from %s", args.weights_path)
         weights = mx.load(args.weights_path)
         pipeline.mmdit.load_weights(list(weights.items()), strict=False)
@@ -106,6 +105,13 @@ def main():
     elapsed = time.time() - t0
     logger.info("Collection finished in %.1f s", elapsed)
 
+    # --- Remove hooks ---
+    remove_hooks(hooks)
+
+    # --- Save activation & weight stats (before adaLN, so data is safe) ---
+    save_activation_stats(collector, registry)
+    save_config(pairs, registry)
+
     # --- Collect adaLN stats ---
     from mlx.utils import tree_flatten
     adaln_cache = [
@@ -127,15 +133,11 @@ def main():
     timesteps = pipeline.sampler.timestep(sigmas).astype(pipeline.activation_dtype)
     pipeline.mmdit.cache_modulation_params(pooled_conditioning, timesteps)
     adaln_stats = collect_adaln_stats(pipeline.mmdit)
-    pipeline.mmdit.clear_modulation_params_cache()
+    from .collect import _safe_clear_modulation_cache
+    _safe_clear_modulation_cache(pipeline.mmdit)
 
-    # --- Remove hooks ---
-    remove_hooks(hooks)
-
-    # --- Save ---
-    save_activation_stats(collector, registry)
+    # --- Save adaLN stats ---
     save_adaln_stats(adaln_stats)
-    save_config(pairs, registry)
 
     # --- Pilot validation ---
     if args.pilot:

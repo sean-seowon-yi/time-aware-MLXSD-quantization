@@ -19,6 +19,20 @@ from .hooks import ChannelStatsCollector
 logger = logging.getLogger(__name__)
 
 
+def _safe_clear_modulation_cache(mmdit):
+    """Clear _modulation_params from all submodules.
+
+    DiffusionKit's clear_modulation_params_cache() uses delattr, but MLX
+    nn.Module.__setattr__ stores dicts in the module tree (Module is a dict
+    subclass), not in __dict__, so delattr raises AttributeError.
+    Use Module.pop() to remove from the module tree instead.
+    """
+    for _name, module in mmdit.named_modules():
+        if hasattr(module, "_modulation_params"):
+            module.pop("_modulation_params", None)
+    logger.debug("Cleared modulation_params cache (safe)")
+
+
 # ---------------------------------------------------------------------------
 # Weight salience (time-independent, computed once)
 # ---------------------------------------------------------------------------
@@ -201,7 +215,7 @@ def run_diagnostic_collection(
             mx.eval(x)
 
         pipeline.mmdit.load_weights(_adaln_cache, strict=False)
-        pipeline.mmdit.clear_modulation_params_cache()
+        _safe_clear_modulation_cache(pipeline.mmdit)
 
         elapsed = time.time() - t0
         logger.info(
