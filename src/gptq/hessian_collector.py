@@ -6,8 +6,8 @@ Two-phase design:
             per layer. No I/O caching.
 
   Phase B — Install _AlphaAccumulator proxies on ALL linears. Run a small
-            subset of prompts. Each accumulator evaluates 19 alpha_scale
-            candidates (0.01–100.0) per forward call via vectorized NumPy
+            subset of prompts. Each accumulator evaluates 17 alpha_scale
+            candidates (0.25–10.0) per forward call via vectorized NumPy
             matmuls and accumulates per-candidate MSE sums.
 """
 
@@ -275,15 +275,15 @@ def collect_hessians_global(
 # ---------------------------------------------------------------------------
 
 # Alpha candidates: non-uniform grid covering [0.01, 100.0]
-_ALPHA_CANDIDATES = [0.01, 0.1, 0.3, 0.5, 0.6, 0.8, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6, 8, 10, 25, 50, 100]
+_ALPHA_CANDIDATES = [0.25, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0, 4.0, 5.0, 6, 8, 10]
 
 
 class _AlphaAccumulator:
     """Proxy that accumulates MSE for all alpha_scale candidates on-the-fly.
 
-    Instead of caching raw (input, output) pairs, this evaluates all 19
+    Instead of caching raw (input, output) pairs, this evaluates all 17
     alpha_scale candidates in a single vectorized matmul per forward call
-    and accumulates per-candidate MSE sums. Memory per layer: 19 floats
+    and accumulates per-candidate MSE sums. Memory per layer: 17 floats
     (negligible).
 
     After collection, call get_best_alpha() to retrieve the optimal scale.
@@ -440,7 +440,7 @@ def collect_alpha_mse_global(
 ) -> Dict[str, Tuple[float, float]]:
     """Phase B v2: install alpha accumulators on ALL blocks, run prompts once.
 
-    Evaluates all 19 alpha_scale candidates on-the-fly per layer per step.
+    Evaluates all 17 alpha_scale candidates on-the-fly per layer per step.
     No I/O caching needed — MSE is accumulated as running sums.
 
     Args:

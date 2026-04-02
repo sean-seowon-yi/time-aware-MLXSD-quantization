@@ -326,11 +326,10 @@ def _generate_with_sigma_hooks(
     timesteps = pipeline.sampler.timestep(sigmas).astype(pipeline.activation_dtype)
     denoiser.cache_modulation_params(pooled, timesteps)
 
-    mx.random.seed(seed)
-    latent_shape = (1, latent_size, latent_size, 16)
-    noise = mx.random.normal(latent_shape).astype(pipeline.activation_dtype)
+    x_T = pipeline.get_empty_latent(latent_size, latent_size)
+    noise = pipeline.get_noise(seed, x_T).astype(pipeline.activation_dtype)
     x = pipeline.sampler.noise_scaling(
-        sigmas[0], noise, mx.zeros(latent_shape), pipeline.max_denoise(sigmas)
+        sigmas[0], noise, x_T, pipeline.max_denoise(sigmas)
     )
     mx.eval(x)
 

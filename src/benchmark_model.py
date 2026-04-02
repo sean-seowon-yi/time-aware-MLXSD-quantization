@@ -171,8 +171,8 @@ def compute_fidelity_metrics(
               "Install with: pip install torch-fidelity")
         return None
 
-    n_gen = len(list(Path(generated_dir).glob("*.png")))
-    n_ref = len(list(Path(reference_dir).glob("*.png")))
+    n_gen = len(list(Path(generated_dir).glob("*.png"))) + len(list(Path(generated_dir).glob("*.jpg")))
+    n_ref = len(list(Path(reference_dir).glob("*.png"))) + len(list(Path(reference_dir).glob("*.jpg")))
     kid_subset_size = min(n_gen, n_ref, 1000)
 
     metrics = calculate_metrics(
@@ -229,7 +229,8 @@ def _load_clip_model():
 
 
 def _list_pngs(img_dir: str) -> List[Path]:
-    return sorted(Path(img_dir).glob("*.png"))
+    d = Path(img_dir)
+    return sorted(list(d.glob("*.png")) + list(d.glob("*.jpg")))
 
 
 def _compute_clip_embeddings(img_dir: str) -> Optional[Dict]:
@@ -611,7 +612,8 @@ def compute_sfid(
     ])
 
     def _extract(img_dir: str) -> np.ndarray:
-        paths = sorted(Path(img_dir).glob("*.png"))
+        d = Path(img_dir)
+        paths = sorted(list(d.glob("*.png")) + list(d.glob("*.jpg")))
         feats = []
         for p in paths:
             img = PILImage.open(p).convert("RGB")
@@ -913,6 +915,7 @@ def _load_pipeline(
     lut_schedule: Optional[Dict] = None,
     poly_margin: float = 1.0,
     gptq_dir: Optional[Path] = None,
+    dynamic_act_quant: bool = False,
 ):
     """
     Load DiffusionPipeline and apply quantization config.
@@ -950,6 +953,23 @@ def _load_pipeline(
         quant_ctx["remove_act_fn"] = remove_dynamic_int8_act_hooks
         return pipeline, quant_ctx
 
+    if config == "gptq_only":
+        if gptq_dir is None:
+            raise ValueError("--gptq-dir is required when --config gptq_only")
+        if poly_schedule is None:
+            raise ValueError("--poly-schedule is required when --config gptq_only")
+        from src.gptq.inference import (
+            load_gptq_weights, patch_model_weights,
+            install_static_act_quant_hooks,
+            remove_act_quant_hooks as _gptq_remove,
+        )
+        gptq_config, gptq_weights = load_gptq_weights(gptq_dir)
+        patch_model_weights(pipeline, gptq_weights)
+        hooks = install_static_act_quant_hooks(pipeline, gptq_config, poly_schedule)
+        quant_ctx["act_quant_patches"] = hooks
+        quant_ctx["remove_act_fn"] = lambda _: _gptq_remove(pipeline, hooks)
+        return pipeline, quant_ctx
+
     if config == "gptq":
         if gptq_dir is None:
             raise ValueError("--gptq-dir is required when --config gptq")
@@ -968,9 +988,12 @@ def _load_pipeline(
                 hooks = install_static_act_quant_hooks(pipeline, gptq_config, poly_schedule)
             else:
                 hooks = install_act_quant_hooks(pipeline, gptq_config, poly_schedule)
-
-        quant_ctx["gptq_hooks"] = hooks if hooks else None
-        quant_ctx["remove_act_fn"] = lambda _: _gptq_remove(pipeline, hooks)
+            quant_ctx["gptq_hooks"] = hooks if hooks else None
+            quant_ctx["remove_act_fn"] = lambda _: _gptq_remove(pipeline, hooks)
+        elif dynamic_act_quant:
+            _, patches = apply_dynamic_int8_act_hooks(pipeline.mmdit)
+            quant_ctx["act_quant_patches"] = patches
+            quant_ctx["remove_act_fn"] = remove_dynamic_int8_act_hooks
         return pipeline, quant_ctx
 
     # Weight injection (adaround_w4 / adaround_w4a8 / taqdit_w4a8 / mlx_int4)
@@ -1113,6 +1136,7 @@ def generate_images(
     seeds: Optional[List[int]] = None,
     gptq_dir: Optional[Path] = None,
     reload_n: Optional[int] = None,
+    dynamic_act_quant: bool = False,
 ) -> Tuple[List[float], Dict]:
     """
     Generate images for all prompts and return timing + memory stats.
@@ -1156,6 +1180,7 @@ def generate_images(
         lut_schedule=lut_schedule,
         poly_margin=poly_margin,
         gptq_dir=gptq_dir,
+        dynamic_act_quant=dynamic_act_quant,
     )
 
     pbar = tqdm(enumerate(prompts), total=len(prompts),
@@ -1391,6 +1416,10 @@ def main() -> None:
     parser.add_argument("--gptq-dir", type=Path, default=None,
                         help="GPTQ output dir (from src.gptq.optimize). "
                         "Use with --config gptq and --poly-schedule.")
+    parser.add_argument("--dynamic-act-quant", action="store_true",
+                        help="Apply per-layer dynamic INT8 activation quantization "
+                        "(scale = max(|x|)/127) after GPTQ weight patching. "
+                        "Mutually exclusive with --poly-schedule.")
     parser.add_argument("--adaround-output", type=Path, default=None,
                         help="AdaRound weights dir (from adaround_optimize.py)")
     parser.add_argument("--adaround-act-config", type=Path, default=None,
@@ -1457,6 +1486,8 @@ def main() -> None:
 
     if args.gptq_dir is not None and args.adaround_output is not None:
         parser.error("--gptq-dir and --adaround-output are mutually exclusive")
+    if args.dynamic_act_quant and args.poly_schedule is not None:
+        parser.error("--dynamic-act-quant and --poly-schedule are mutually exclusive")
 
     prompt_csv = args.prompt_csv or (_REPO / "all_prompts.csv")
     output_dir = args.output_dir
@@ -1519,6 +1550,7 @@ def main() -> None:
             seeds=prompt_seeds,
             gptq_dir=args.gptq_dir,
             reload_n=args.reload_n,
+            dynamic_act_quant=args.dynamic_act_quant,
         )
 
         # Compute model size once after generation (pipeline discarded per-image;
@@ -1530,6 +1562,7 @@ def main() -> None:
                 args.mlx_int4, args.group_size,
                 poly_schedule=poly_schedule, lut_schedule=lut_schedule,
                 poly_margin=args.poly_margin, gptq_dir=args.gptq_dir,
+                dynamic_act_quant=args.dynamic_act_quant,
             )
             model_stats = compute_model_size(pipeline_sz)
             del pipeline_sz
@@ -1558,8 +1591,8 @@ def main() -> None:
         elif not ref_dir.exists():
             print(f"WARNING: reference_dir {ref_dir} does not exist — skipping metrics")
         else:
-            n_gen = len(list(gen_dir.glob("*.png")))
-            n_ref = len(list(ref_dir.glob("*.png")))
+            n_gen = len(list(gen_dir.glob("*.png"))) + len(list(gen_dir.glob("*.jpg")))
+            n_ref = len(list(ref_dir.glob("*.png"))) + len(list(ref_dir.glob("*.jpg")))
             print(f"\n=== Computing FID/IS/KID/Precision "
                   f"({n_gen} generated vs {n_ref} reference) ===")
             raw = compute_fidelity_metrics(gen_dir, ref_dir)
