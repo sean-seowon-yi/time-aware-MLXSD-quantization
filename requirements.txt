@@ -12,3 +12,13 @@ sentencepiece
 numpy
 scipy
 matplotlib
+
+# Sweep metrics (Step 3)
+lpips
+torchvision
+
+# Benchmark metrics
+psutil
+torch-fidelity
+open-clip-torch
+scipy

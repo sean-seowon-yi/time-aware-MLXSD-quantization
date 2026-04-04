@@ -37,6 +37,21 @@ def fake_quantize_a8(x: mx.array) -> mx.array:
     return x_q * scale
 
 
+def fake_quantize_a8_per_token(x: mx.array) -> mx.array:
+    """Dynamic per-token symmetric 8-bit fake quantization.
+
+    One scale factor per sequence position (row), computed over the channel
+    dimension.  More expressive than per-tensor for layers where CSB
+    incompletely equalises cross-channel dynamic range (high-rho layers).
+
+    Input shape is typically (..., d_in).  The reduction is over the last axis.
+    """
+    scale = mx.max(mx.abs(x), axis=-1, keepdims=True) / 127.0
+    scale = mx.maximum(scale, mx.array(1e-8))
+    x_q = mx.clip(mx.round(x / scale), -128, 127)
+    return x_q * scale
+
+
 # ---------------------------------------------------------------------------
 # W4A8 quantized linear module
 # ---------------------------------------------------------------------------
@@ -48,15 +63,21 @@ class W4A8Linear(nn.Module):
     prepends dynamic 8-bit fake-quantization of activations.  For layers that
     require online CSB balancing (o_proj, fc2), a ``b_inv`` vector is stored
     and applied before quantization.
+
+    When ``per_token`` is True, activation quantization uses one scale per
+    sequence position rather than one scale for the entire tensor.  This is
+    used for high-rho layers where CSB incompletely equalises dynamic range.
     """
 
     def __init__(
         self,
         qlinear: nn.QuantizedLinear,
         b_inv: mx.array | None = None,
+        per_token: bool = False,
     ):
         super().__init__()
         self.qlinear = qlinear
+        self._per_token = per_token
         if b_inv is not None:
             self.b_inv = b_inv
 
@@ -64,7 +85,10 @@ class W4A8Linear(nn.Module):
         orig_dtype = x.dtype
         if hasattr(self, "b_inv"):
             x = (x * self.b_inv).astype(orig_dtype)
-        x = fake_quantize_a8(x)
+        if self._per_token:
+            x = fake_quantize_a8_per_token(x)
+        else:
+            x = fake_quantize_a8(x)
         return self.qlinear(x)
 
 
@@ -110,8 +134,12 @@ def quantize_model(
     registry: list[dict],
     b_inv_map: dict[str, np.ndarray],
     config: dict | None = None,
+    mean_rhos: dict[str, float] | None = None,
 ) -> dict[str, dict]:
     """Replace all target ``nn.Linear`` layers with ``W4A8Linear`` modules.
+
+    Layers whose mean Spearman rho exceeds ``per_token_rho_threshold`` use
+    per-token activation quantization instead of per-tensor.
 
     Returns per-layer metadata dict used for save/load.
     """
@@ -120,8 +148,11 @@ def quantize_model(
     group_size = cfg["group_size"]
     bits = cfg["bits"]
     final_bits = cfg["final_layer_bits"]
+    rho_threshold = cfg.get("per_token_rho_threshold", 0.5)
+    rhos = mean_rhos or {}
 
     layer_meta: dict[str, dict] = {}
+    n_per_token = 0
     count = 0
 
     for entry in registry:
@@ -143,7 +174,8 @@ def quantize_model(
         if name in b_inv_map:
             b_inv = mx.array(b_inv_map[name], dtype=mx.float32)
 
-        w4a8 = W4A8Linear(qlinear, b_inv)
+        per_token = rhos.get(name, 0.0) > rho_threshold
+        w4a8 = W4A8Linear(qlinear, b_inv, per_token=per_token)
 
         parent, attr_name = _navigate_to_parent(mmdit, name)
         setattr(parent, attr_name, w4a8)
@@ -154,10 +186,16 @@ def quantize_model(
             "has_bias": getattr(linear, "bias", None) is not None,
             "bits": layer_bits,
             "has_b_inv": name in b_inv_map,
+            "per_token": per_token,
         }
+        if per_token:
+            n_per_token += 1
         count += 1
 
-    logger.info("Quantized %d layers to W%dA8 (group_size=%d)", count, bits, group_size)
+    logger.info(
+        "Quantized %d layers to W%dA8 (group_size=%d, %d per-token A8)",
+        count, bits, group_size, n_per_token,
+    )
     return layer_meta
 
 
@@ -218,9 +256,12 @@ def save_quantized_model(
         "model_version": config.get("model_version", MODEL_VERSION),
         "group_size": config["group_size"],
         "bits": config["bits"],
+        "a_bits": config.get("a_bits", 8),
         "final_layer_bits": config["final_layer_bits"],
         "alpha": config["alpha"],
         "qkv_method": config["qkv_method"],
+        "ssc_tau": config.get("ssc_tau", 1.0),
+        "per_token_rho_threshold": config.get("per_token_rho_threshold", 0.5),
         "exclude_layers": config["exclude_layers"],
         "b_inv_layers": b_inv_layers,
         "quantized_layers": layer_meta,
@@ -253,6 +294,7 @@ def load_quantized_model(pipeline, output_dir: Path) -> dict:
         has_bias = info["has_bias"]
         layer_bits = info["bits"]
         has_b_inv = info["has_b_inv"]
+        per_token = info.get("per_token", False)
 
         qlinear = nn.QuantizedLinear(
             d_in, d_out,
@@ -262,7 +304,7 @@ def load_quantized_model(pipeline, output_dir: Path) -> dict:
         )
 
         b_inv = mx.zeros(d_in, dtype=mx.float32) if has_b_inv else None
-        w4a8 = W4A8Linear(qlinear, b_inv)
+        w4a8 = W4A8Linear(qlinear, b_inv, per_token=per_token)
 
         parent, attr_name = _navigate_to_parent(pipeline.mmdit, name)
         setattr(parent, attr_name, w4a8)

@@ -54,15 +54,17 @@ $$
 - Activation salience is **time-dependent**: it varies across the sigma (denoising) trajectory.
 - Weight salience is **time-independent**: weights are fixed.
 
-### 2.2 SSC: Time-Aware Calibration Weighting (PTQ4DiT Eq. 11)
+### 2.2 SSC: Time-Aware Calibration Weighting (PTQ4DiT Eq. 11, with temperature)
 
 At each sigma step $\sigma_t$, compute the Spearman rank correlation $\rho_t$ between the activation salience vector $s(X^{(\sigma_t)})$ and the weight salience vector $s(W)$. Then:
 
 $$
-\eta_t = \frac{\exp(-\rho_t)}{\sum_{\tau} \exp(-\rho_\tau)}
+\eta_t = \frac{\exp(-\rho_t / \tau)}{\sum_{\tau'} \exp(-\rho_{\tau'} / \tau)}
 $$
 
-Timesteps with **lower** $\rho$ (stronger complementarity) receive **higher** weight. This is a softmax over $-\rho$.
+where $\tau$ is the SSC temperature parameter. Setting $\tau = 1$ recovers the original PTQ4DiT Eq. 11. Values $\tau < 1$ sharpen the distribution, giving more weight to timesteps with strong complementarity (low $\rho$); $\tau > 1$ flattens it. Phase 1 findings (Section 8 of `phase1_findings.md`) show that with $\tau = 1$ the SSC weights are near-uniform for ~87% of layers because $\rho$ trajectories span a narrow range. Temperature scaling amplifies these small differences for the ~13% of layers where SSC does meaningful work.
+
+Timesteps with **lower** $\rho$ (stronger complementarity) receive **higher** weight. This is a temperature-scaled softmax over $-\rho$.
 
 The SSC-weighted representative activation salience for channel $j$:
 
@@ -164,9 +166,9 @@ Where `eps = 1e-12`, `alpha = 0.5`, `b_min = 1e-2`, `b_max = 1e2`.
 
 Q, K, and V projections within the same TransformerBlock share the same input tensor (`modulated_pre_attention`), which is the output of `affine_transform(x, shift=β₁, scale=γ₁, norm_module=norm1)`. Since the adaLN absorption modifies the shared input, only **one** balancing vector $b_{\text{qkv}}$ can be applied to it. However, each projection has its own weight matrix with potentially different weight salience profiles.
 
-Two methods are available for computing the shared balancing vector.
+Three methods are available for merging Q/K/V weight salience into a shared vector. The merged salience is used both for computing the SSC rho trajectory and for the balancing formula, ensuring consistency between the time-aware weighting and the balancing objective.
 
-### 4.1 Method 1 — Conservative (Max Weight Salience)
+### 4.1 Method 1 — Conservative (Max Weight Salience) [default]
 
 Merge the weight salience across Q, K, V by taking the per-channel maximum:
 
@@ -186,18 +188,6 @@ $$
 
 ### 4.2 Method 2 — Balanced (Geometric Mean Weight Salience)
 
-Compute each projection's ideal balancing factor, then take the geometric mean:
-
-$$
-b_{p,j} = \left(\frac{\bar{s}(X_j)}{s(W_{p,j})}\right)^{\alpha} \quad \text{for } p \in \{q, k, v\}
-$$
-
-$$
-b_{\text{qkv},j} = \left(b_{q,j} \cdot b_{k,j} \cdot b_{v,j}\right)^{1/3}
-$$
-
-Equivalently:
-
 $$
 s_{\text{geomean}}(W_j) = \left(s(W_{q,j}) \cdot s(W_{k,j}) \cdot s(W_{v,j})\right)^{1/3}
 $$
@@ -210,7 +200,21 @@ $$
 
 **When to prefer.** When Q, K, V weight salience profiles are relatively similar, so the geometric mean is a good central estimate.
 
-### 4.3 Weight-Side Balancing (Per-Projection)
+### 4.3 Method 3 — L2-norm (RMS Weight Salience)
+
+$$
+s_{\text{l2}}(W_j) = \sqrt{\frac{s(W_{q,j})^2 + s(W_{k,j})^2 + s(W_{v,j})^2}{3}}
+$$
+
+$$
+b_{\text{qkv},j} = \left(\frac{\bar{s}(X_j)}{s_{\text{l2}}(W_j)}\right)^{\alpha}
+$$
+
+**Rationale.** The root-mean-square provides a middle ground between max (which is dominated by the single highest projection) and geometric mean (which can be pulled down by a single low projection). By the power-mean inequality: geomean ≤ l2 ≤ max for all non-negative inputs.
+
+**When to prefer.** When one wants a compromise that penalises extreme outliers without being as aggressive as max.
+
+### 4.4 Weight-Side Balancing (Per-Projection)
 
 Regardless of which method is used for the shared input balancing vector, each projection's weight is balanced independently:
 
@@ -529,7 +533,19 @@ def fake_quantize_a8(x: mx.array) -> mx.array:
 
 This is a "fake quantization" — the output is a float tensor that has been quantized and dequantized. It accurately simulates the precision loss of 8-bit inference. The quantization is **per-tensor** (single scale factor for the entire activation tensor), which is the standard approach for activation quantization.
 
-**Why per-tensor and not per-channel for activations:** Per-channel activation quantization requires knowing the per-channel statistics at runtime, adding overhead. Per-tensor is simpler and, after CSB balancing, the cross-channel dynamic range is already equalized, making per-tensor sufficient.
+**Per-token variant for high-ρ layers:** For layers where CSB incompletely equalises cross-channel dynamic range (mean ρ > `per_token_rho_threshold`, default 0.5), a per-token quantization is used instead:
+
+```python
+def fake_quantize_a8_per_token(x: mx.array) -> mx.array:
+    scale = mx.max(mx.abs(x), axis=-1, keepdims=True) / 127.0
+    scale = mx.maximum(scale, mx.array(1e-8))
+    x_q = mx.clip(mx.round(x / scale), -128, 127)
+    return x_q * scale
+```
+
+This computes one scale per sequence position (row) rather than one for the whole tensor, providing finer-grained quantization for the ~17 layers with ρ > 0.5. These include early-block attention projections (blocks 0–3), late text-side MLPs (blocks 20–22), and `final_layer.linear`. The per-token mode is automatically selected during quantization based on the mean ρ computed during calibration.
+
+**Why not per-channel:** Per-channel activation quantization requires knowing the per-channel statistics at runtime, adding overhead. Per-tensor (or per-token) is simpler and, for the majority of layers where CSB is effective, per-tensor is sufficient.
 
 ### 7.3 W4A8Linear Class
 
@@ -543,9 +559,11 @@ class W4A8Linear(nn.Module):
         self,
         qlinear: nn.QuantizedLinear,
         b_inv: mx.array | None = None,
+        per_token: bool = False,
     ):
         super().__init__()
         self.qlinear = qlinear
+        self._per_token = per_token
         if b_inv is not None:
             self.b_inv = b_inv  # [d_in], stored as float32
 
@@ -556,8 +574,11 @@ class W4A8Linear(nn.Module):
         if hasattr(self, "b_inv"):
             x = (x * self.b_inv).astype(orig_dtype)
 
-        # 2. A8 fake quantization
-        x = fake_quantize_a8(x)
+        # 2. A8 fake quantization (per-token for high-rho layers)
+        if self._per_token:
+            x = fake_quantize_a8_per_token(x)
+        else:
+            x = fake_quantize_a8(x)
 
         # 3. W4 quantized matmul
         return self.qlinear(x)
@@ -591,9 +612,9 @@ For each block $i \in [0, 23]$ and each modality side:
 
 1. **Shared activation trajectory**: `q/k/v_proj` share the same input, so their activation trajectories are identical. Load the activation trajectory from any one of them (e.g., `q_proj`).
 
-2. **SSC weights**: Although the activation trajectory is shared across q/k/v, the Spearman ρ trajectory **differs** for each projection because ρ is computed between the activation salience vector and the weight salience vector, and each projection has a different weight matrix. Two options: (a) use `q_proj`'s ρ trajectory as the representative (simplest), or (b) compute ρ for each projection separately and average the resulting SSC weights to better account for the different weight salience profiles.
+2. **SSC weights**: The Spearman ρ trajectory is computed between the shared activation salience and the **merged** weight salience vector (the same merged vector used in the balancing formula — see Section 4). This ensures consistency: the time-aware weighting targets the same balancing objective as the final CSB formula. The merge method (max, geomean, or l2) determines how Q/K/V weight salience are combined before ρ computation.
 
-3. **QKV balancing vector**: Apply Method 1 (Max) or Method 2 (Geometric Mean) from Section 4.
+3. **QKV balancing vector**: Apply Method 1 (Max), Method 2 (Geometric Mean), or Method 3 (L2-norm) from Section 4.
 
 4. **fc1 balancing vector**: Compute independently using fc1's own activation trajectory and weight salience.
 
@@ -633,13 +654,13 @@ Since `final_layer.linear` has shape `[64, 1536]` (only 64 output channels), its
 
 ### 9.2 Early Image Blocks (blocks 0–3)
 
-Phase 1 findings: ρ ranges 0.4–0.7 (higher than mid/late blocks), indicating weaker complementarity. CSB effectiveness is reduced.
+Phase 1 findings: mean ρ = 0.334, with individual layers spanning 0.06–0.70. Several attention projections and fc1 in blocks 0–2 exceed ρ = 0.4 (up to 0.70 for `blocks.1.image.attn.q_proj`), while block 3 layers are mostly below 0.3. Overall, these blocks have higher ρ than mid/late blocks, indicating weaker complementarity and reduced CSB effectiveness.
 
 **Approach.** Apply CSB+SSC normally. The `alpha` parameter could be reduced for these blocks (e.g., α = 0.3 instead of 0.5) to avoid over-balancing when complementarity is weak. This is a tunable hyperparameter.
 
 ### 9.3 Late Text-Side Blocks (blocks 20–23)
 
-Phase 1 findings: extreme activation salience in fc1/fc2 (300–414), moderate-to-high ρ (0.6–0.8 for blocks 21–22). These are the highest-risk quantization targets.
+Phase 1 findings: extreme activation salience in fc1/fc2 (127–414), with most layers showing high ρ (0.6–0.8 for blocks 20–22 fc1, blocks 21–22 fc2). Notable exception: `blocks.20.text.mlp.fc2` has ρ = 0.13 despite high salience (179), making it a better CSB target than its neighbors. Block 23 text has no FFN (see Section 9.4). These are the highest-risk quantization targets.
 
 **Approach.** Apply CSB+SSC. The high activation salience means the balancing factors will be large, significantly compressing the activation dynamic range. Verify that the compressed range still has sufficient precision in 8-bit. If not:
 - **Fallback:** Per-token activation quantization (separate scale per sequence position) instead of per-tensor.
@@ -696,7 +717,9 @@ PHASE2_CONFIG = {
     "group_size": 64,            # W4 quantization group size
     "bits": 4,                   # Weight quantization bits
     "a_bits": 8,                 # Activation quantization bits
-    "qkv_method": "max",         # "max" or "geomean" (Section 4)
+    "qkv_method": "max",         # "max", "geomean", or "l2" (Section 4)
+    "ssc_tau": 1.0,              # SSC temperature (< 1 sharpens, Section 2.2)
+    "per_token_rho_threshold": 0.5,  # layers with ρ above this use per-token A8
     "final_layer_bits": 4,       # Can override to 8 or 16 for final layer
     "exclude_layers": [          # Layers to skip quantization
         "context_embedder",
@@ -722,7 +745,7 @@ def compute_balancing_vector(act_trajectory, wt_salience, alpha, b_min, b_max, w
     """Single-layer SSC+CSB: rho → ssc_weights → weighted_act → b_j = (s̄/sW)^α."""
 
 def compute_qkv_balancing(block_idx, side, diagnostics_dir, method, ...) -> ndarray:
-    """Shared QKV balancing: merge weight salience via 'max' or 'geomean'."""
+    """Shared QKV balancing: merge weight salience via 'max', 'geomean', or 'l2'."""
 
 def calibrate_all_layers(registry, diagnostics_dir, config) -> dict:
     """Calibrate all target layers.  Returns:
@@ -923,7 +946,7 @@ Phase 2a: Calibration  [pure numpy, float64]
 │   ├── compute_ssc_weights         →  η_t [30]  (softmax of -ρ, Eq. 11)
 │   ├── weighted_act = η @ act      →  s̄(X_j) [d_in]  (SSC-weighted salience)
 │   └── b = (s̄/sW)^α clamped       →  b_j [d_in]  (balancing vector)
-├── For QKV groups: merge weight salience (max or geomean), shared b_qkv
+├── For QKV groups: merge weight salience (max, geomean, or l2), compute ρ against merged wt → shared b_qkv
 ├── Mark o_proj and fc2 as b_inv_layers (need online balancing)
 └── save_calibration()  →  calibration.npz + calibration_meta.json
 │
@@ -948,11 +971,13 @@ Phase 2c: W4A8 Quantization
 ├── For each of 286 target layers:
 │   ├── nn.QuantizedLinear.from_linear(linear, group_size=64, bits=4)
 │   │   └── mx.quantize: per-group affine 4-bit (Round-to-Nearest)
-│   ├── W4A8Linear(qlinear, b_inv)  (b_inv=None for absorbed layers)
+│   ├── W4A8Linear or W4A8StaticLinear(qlinear, b_inv, static_scale, ...)
+│   │   (dynamic per-forward A8 vs fixed static scales; see --act-quant in run_e2e)
 │   └── setattr(parent, attr, w4a8_module)  →  replace in model tree
-└── save_quantized_model()
+└── save_quantized_model() / save_quantized_model_static()
     ├── mmdit_quantized.safetensors  (filters to_offload.* keys)
-    └── quantize_config.json         (layer metadata, b_inv_layers, hyperparams)
+    ├── quantize_config.json         (layer metadata, b_inv_layers, hyperparams, act_quant)
+    └── [static only] static_scales.npz
 │
 ▼
 Inference  [fp16 model, fp32 b_inv multiply]
@@ -972,6 +997,8 @@ Inference  [fp16 model, fp32 b_inv multiply]
 
 ## 15. CLI Reference
 
+**Where `--quantized-dir` points.** `run_e2e` saves checkpoints under `--output-dir/<config_tag>/` (for example `quantized/w4a8_max_a0.50_gs64/`). That inner folder — the one that contains `quantize_config.json` — is what you pass as `--quantized-dir` to `run_inference`, `run_diagnose`, and `benchmark_model`. The standalone `run_quantize` script writes files directly into `--output-dir` (no automatic `<config_tag>` subdirectory), so in that workflow `--quantized-dir` is whatever directory you passed to `run_quantize`.
+
 ### 15.1 End-to-End Pipeline (recommended)
 
 ```bash
@@ -986,6 +1013,12 @@ python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection
 
 # Override hyperparameters
 python -m src.phase2.run_e2e --output-dir quantized/ --alpha 0.3 --qkv-method geomean
+
+# L2-norm QKV merge
+python -m src.phase2.run_e2e --output-dir quantized/ --qkv-method l2 --skip-collection
+
+# Static A8 (see §15.5)
+python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection --act-quant static
 ```
 
 ### 15.2 Standalone Quantization (requires prior Phase 1 data)
@@ -997,8 +1030,8 @@ python -m src.phase2.run_quantize --output-dir quantized/
 # Calibrate only (no model load)
 python -m src.phase2.run_quantize --calibrate-only --output-dir quantized/
 
-# Use saved calibration, skip recalculation
-python -m src.phase2.run_quantize --from-calibration quantized/ --output-dir quantized/
+# Use saved calibration, skip recalculation (same folder as calibrate-only output)
+python -m src.phase2.run_quantize --from-calibration quantized/<tag>/ --output-dir quantized/<tag>/
 ```
 
 ### 15.3 Image Generation
@@ -1007,12 +1040,12 @@ python -m src.phase2.run_quantize --from-calibration quantized/ --output-dir qua
 # FP16 baseline — single prompt
 python -m src.phase2.run_inference --mode fp16 --prompt "a cat on a couch" --output-dir results/
 
-# W4A8 quantized — single prompt
-python -m src.phase2.run_inference --mode w4a8 --quantized-dir quantized/ \
+# W4A8 quantized — single prompt (<tag> = directory from run_e2e, or run_quantize --output-dir)
+python -m src.phase2.run_inference --mode w4a8 --quantized-dir quantized/<tag>/ \
     --prompt "a cat on a couch" --output-dir results/
 
 # Batch evaluation (seed-prompt pairs from file)
-python -m src.phase2.run_inference --mode w4a8 --quantized-dir quantized/ \
+python -m src.phase2.run_inference --mode w4a8 --quantized-dir quantized/<tag>/ \
     --prompts-file src/settings/evaluation_set.txt --output-dir results/
 
 # Limit to first 5 pairs for quick test
@@ -1020,23 +1053,58 @@ python -m src.phase2.run_inference --mode fp16 \
     --prompts-file src/settings/evaluation_set.txt --num-prompts 5 --output-dir results/
 ```
 
-Output layout: `results/fp16/000.png, 001.png, ...` and `results/w4a8/000.png, 001.png, ...`
+Output layout: `results/fp16/000.png, 001.png, ...` (fp16 mode). For **`--mode w4a8`**, images go under **`results/<config_tag>/`** (from `quantize_config.json`, same tag as `config_tag_from_meta`), not a fixed `w4a8/` folder.
 
 ### 15.4 Post-Quantization Diagnostics
 
 ```bash
 # Full diagnostics: collect W4A8 stats + compare vs FP16 + generate plots
-python -m src.phase2.run_diagnose --quantized-dir quantized/ --output-dir post_quant_diagnostics/
+python -m src.phase2.run_diagnose --quantized-dir quantized/<tag>/ --output-dir post_quant_diagnostics/
 
 # Quick test with 2 prompts
-python -m src.phase2.run_diagnose --quantized-dir quantized/ --num-prompts 2
+python -m src.phase2.run_diagnose --quantized-dir quantized/<tag>/ --num-prompts 2
 
 # Skip collection (reuse existing W4A8 stats)
-python -m src.phase2.run_diagnose --quantized-dir quantized/ --skip-collection
+python -m src.phase2.run_diagnose --quantized-dir quantized/<tag>/ --skip-collection
 
-# Analysis + plots only (no model loading)
+# Analysis + plots only (no model loading; requires prior Phase A data under
+# post_quant_diagnostics/activation_stats/ from an earlier full or skip-collection run)
 python -m src.phase2.run_diagnose --analysis-only --output-dir post_quant_diagnostics/
 ```
+
+### 15.5 Static activation quantization (W4A8)
+
+Static scales are computed from Phase 1 diagnostics + full calibration (including balancing vectors) and saved with the checkpoint. **Only** `run_e2e.py` implements this path (`quantize_static.py`). The standalone `run_quantize.py` script performs **dynamic** A8 only.
+
+```bash
+python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection \
+  --act-quant static --static-mode ssc_weighted --static-granularity per_tensor
+
+# Optional: global-max aggregation, or per-channel static scales
+python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection \
+  --act-quant static --static-mode global_max
+python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection \
+  --act-quant static --static-granularity per_channel
+```
+
+Saved `quantize_config.json` includes `"act_quant": "static"`, `"static_mode"`, `"static_granularity"`, and `static_scales.npz` alongside `mmdit_quantized.safetensors`.
+
+### 15.6 Benchmark (`src/benchmark/benchmark_model.py`)
+
+Generates images from the prompt file (default `src/settings/evaluation_set.txt`), optional FID/IS/KID vs `--reference-dir`, CLIP metrics, and paired **PSNR/LPIPS** vs `--baseline-dir` (matched by **filename**, e.g. `041.png` to `041.png`). Tab-separated `seed<TAB>prompt` files supply **per-image seeds**; otherwise **`--seed` + `img_idx`** is used.
+
+Use **`--config w4a8`** with **`--quantized-dir`**; the loader reads `quantize_config.json` and instantiates dynamic or static W4A8 (`act_quant`). The alias **`w4a8_static`** exists but is optional. For filename alignment with `run_inference` (3-digit names), use **`--config w4a8`** (or `fp16_p2`) with the same `--prompt-csv` and `--num-images` as the FP16 baseline. See the module docstring for `--reload-n` (memory) and `fp16_p2` baseline settings.
+
+### 15.7 Standalone visualization pipelines
+
+These read `diagnostics/` and/or `quantized/` and do not modify the model. **`plot_post_csb` and `plot_weight_profile` require `--calibration-dir`** (a quantized run containing `calibration.npz`). **`plot_quantized_weight` and `plot_mse_vs_block` require `--quantized-dir`** and MLX.
+
+| Module | Purpose |
+|--------|---------|
+| `src.phase2.plot_post_csb` | Activation absmax vs σ (pre-CSB vs post-CSB `/ b`; optional static clip if `static_scales.npz` is present under `--calibration-dir`). |
+| `src.phase2.plot_weight_profile` | Per-channel weight absmax before/after CSB (`w` vs `w * b`). |
+| `src.phase2.plot_quantized_weight` | Per-group absmax: post-CSB FP vs W4-dequantized (needs `mlx`). |
+| `src.phase2.plot_mse_vs_block` | Analytical W4 / dynamic-A8 MSE vs block index (needs `mlx`). |
 
 ---
 
@@ -1060,7 +1128,9 @@ Non-quantized components (adaLN, embedders, norms, SDPA, text encoders, VAE) rem
 
 - **α (CSB exponent):** α = 0.5 is the SmoothQuant default and a good starting point. Lower α (0.3) applies less balancing, preserving the original weight distribution at the cost of less activation compression. Higher α (0.7) compresses activations more aggressively. Tune based on output quality.
 - **group_size (W4):** Smaller groups (32) provide finer-grained quantization but increase scale/bias overhead. Larger groups (128) are more memory-efficient but may lose precision on layers with heterogeneous weight distributions. Default 64 is a standard balance.
-- **QKV method:** Test both Method 1 (max) and Method 2 (geomean) on a small validation set and compare output MSE.
+- **QKV method:** Test all three methods (max, geomean, l2) on a small validation set and compare output MSE. By the power-mean inequality, geomean ≤ l2 ≤ max, so they produce progressively more conservative (larger) merged weight salience. The sweep pipeline (`src/sweep/`) automates this comparison.
+- **ssc_tau (SSC temperature):** τ = 1.0 is the PTQ4DiT default. Lower values (e.g., 0.5, 0.3) sharpen the time-aware weighting, giving more influence to timesteps with strong complementarity. Phase 1 findings show SSC is near-uniform for ~87% of layers with τ = 1.0; temperature scaling primarily affects the ~13% of layers (image-side MLPs, mid-block q_proj) where ρ trajectories span > 0.3. Risk: τ too low may over-concentrate weight on a few timesteps.
+- **per_token_rho_threshold:** Layers with mean ρ above this threshold use per-token (one scale per sequence position) rather than per-tensor activation quantization. Default 0.5. Lowering the threshold applies per-token A8 to more layers (higher overhead, potentially better quality); raising it restricts per-token to only the most challenging layers.
 
 ### 16.3 Validation Strategy
 
@@ -1082,9 +1152,10 @@ For each comparison, compute:
 | File | Contents |
 |---|---|
 | `mmdit_quantized.safetensors` | All MMDiT parameters (quantized + non-quantized). `to_offload.*` keys filtered out. |
-| `quantize_config.json` | Hyperparameters, per-layer metadata (`d_in`, `d_out`, `has_bias`, `bits`, `has_b_inv`), `b_inv_layers` list. |
+| `quantize_config.json` | Hyperparameters, per-layer metadata (`d_in`, `d_out`, `has_bias`, `bits`, `has_b_inv`), `b_inv_layers` list, and `act_quant` (`dynamic` / `static`) plus static mode/granularity when applicable. |
 | `calibration.npz` | Per-layer balancing vectors `b` (float64). |
 | `calibration_meta.json` | Layer names and `b_inv_layers` list. |
+| `static_scales.npz` | (Static A8 only) Per-layer scalar or per-channel scales. |
 
 **Loading sequence** (`load_quantized_model`):
 

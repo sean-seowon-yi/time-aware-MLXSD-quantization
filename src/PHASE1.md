@@ -1,5 +1,7 @@
 ## Phase 1: Diagnostic Analysis of Activation and Weight Salience for PTQ on Stable Diffusion 3 Medium
 
+**Implementation (this repo):** `src/phase1/` — collection (`run_collection.py`, `collect.py`, `hooks.py`, `registry.py`), analysis (`analyze.py`, `run_analysis.py`), visualization (`visualize.py`). Prompts and defaults live in `src/phase1/config.py` (e.g. `coco_100_calibration_prompts.txt` → 100 seed/prompt pairs). Outputs are written under `diagnostics/` by default (`activation_stats/`, `weight_stats.npz`, `config.json`).
+
 ### Goal of Phase 1
 
 Phase 1 is a pure diagnosis and measurement stage. The objective is not to quantize Stable Diffusion 3 Medium yet, but to determine whether the main assumptions behind PTQ4DiT also hold for SD3 Medium, and if they do, where they hold most strongly.

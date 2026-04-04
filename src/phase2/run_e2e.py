@@ -7,17 +7,22 @@ CSB absorption, W4A8 quantization) and saves the quantized model.
 
 Usage
 -----
-# Full run with defaults (100 prompt-seed pairs, 30 steps, CFG 4.0)
+# Full run with defaults (dynamic A8) → quantized/w4a8_max_a0.50_gs64/
 python -m src.phase2.run_e2e --output-dir quantized/
 
-# Quick test with 2 prompts
-python -m src.phase2.run_e2e --output-dir quantized/ --num-prompts 2
+# Static A8 per-tensor → quantized/w4a8_max_a0.50_gs64_static/
+python -m src.phase2.run_e2e --output-dir quantized/ --act-quant static --skip-collection
 
-# Override Phase 2 hyperparameters
-python -m src.phase2.run_e2e --output-dir quantized/ --alpha 0.3 --qkv-method geomean
+# Static A8 per-channel → quantized/w4a8_max_a0.50_gs64_staticpc/
+python -m src.phase2.run_e2e --output-dir quantized/ --act-quant static \
+    --static-granularity per_channel --skip-collection
 
-# Override generation settings
-python -m src.phase2.run_e2e --output-dir quantized/ --num-steps 20 --cfg-weight 5.0
+# Static A8 with global-max scale mode
+python -m src.phase2.run_e2e --output-dir quantized/ --act-quant static \
+    --static-mode global_max --skip-collection
+
+# Override alpha → quantized/w4a8_max_a0.30_gs64/
+python -m src.phase2.run_e2e --output-dir quantized/ --alpha 0.3
 
 # Skip Phase 1 collection (use existing diagnostics)
 python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection
@@ -28,7 +33,7 @@ Steps
 2. Phase 1: run prompts through denoiser with hooks → activation trajectories + weight salience
 3. Phase 2a: SSC-weighted calibration → balancing vectors
 4. Phase 2b: CSB absorption into adaLN + weight balancing
-5. Phase 2c: W4A8 quantization (4-bit weights, 8-bit activations)
+5. Phase 2c: W4A8 quantization (4-bit weights, dynamic or static 8-bit activations)
 6. Save quantized model + metadata
 """
 
@@ -78,10 +83,30 @@ def main():
     # --- Phase 2: quantization settings ---
     p2 = parser.add_argument_group("Phase 2 — quantization")
     p2.add_argument("--alpha", type=float, default=None, help="CSB exponent (default: 0.5)")
-    p2.add_argument("--qkv-method", type=str, default=None, choices=["max", "geomean"])
+    p2.add_argument("--qkv-method", type=str, default=None, choices=["max", "geomean", "l2"])
     p2.add_argument("--group-size", type=int, default=None, help="W4 group size (default: 64)")
     p2.add_argument("--bits", type=int, default=None, help="Weight bits (default: 4)")
     p2.add_argument("--final-layer-bits", type=int, default=None, help="Final layer bits (default: 4)")
+    p2.add_argument("--ssc-tau", type=float, default=None,
+                     help="SSC temperature (default: 1.0). Values < 1 sharpen time-weighting.")
+    p2.add_argument("--per-token-rho-threshold", type=float, default=None,
+                     help="Layers with mean rho above this use per-token A8 (default: 0.5)")
+
+    # --- Activation quantization mode ---
+    p3 = parser.add_argument_group("Activation quantization mode")
+    p3.add_argument("--act-quant", type=str, default="dynamic",
+                     choices=["dynamic", "static"],
+                     help="Activation quantization mode: 'dynamic' (default) computes "
+                          "scale per-forward; 'static' uses pre-computed scales from "
+                          "Phase 1 calibration.")
+    p3.add_argument("--static-mode", type=str, default="ssc_weighted",
+                     choices=["ssc_weighted", "global_max"],
+                     help="How to aggregate calibration data across timesteps for "
+                          "static scales (default: ssc_weighted).")
+    p3.add_argument("--static-granularity", type=str, default="per_tensor",
+                     choices=["per_tensor", "per_channel"],
+                     help="Static scale granularity: one scale per layer (per_tensor) "
+                          "or one per input channel (per_channel). Default: per_tensor.")
 
     args = parser.parse_args()
 
@@ -93,9 +118,10 @@ def main():
         MODEL_VERSION,
         PHASE2_CONFIG,
         PIPELINE_KWARGS,
+        config_tag,
     )
 
-    output_dir = Path(args.output_dir)
+    output_root = Path(args.output_dir)
     diagnostics_dir = Path(args.diagnostics_dir)
 
     # --- Build Phase 2 config ---
@@ -110,7 +136,17 @@ def main():
         p2_cfg["bits"] = args.bits
     if args.final_layer_bits is not None:
         p2_cfg["final_layer_bits"] = args.final_layer_bits
+    if args.ssc_tau is not None:
+        p2_cfg["ssc_tau"] = args.ssc_tau
+    if args.per_token_rho_threshold is not None:
+        p2_cfg["per_token_rho_threshold"] = args.per_token_rho_threshold
     p2_cfg["model_version"] = MODEL_VERSION
+    if args.act_quant == "static":
+        p2_cfg["static_granularity"] = args.static_granularity
+
+    tag = config_tag(p2_cfg, act_quant=args.act_quant)
+    output_dir = output_root / tag
+    logger.info("Config tag: %s  →  output: %s", tag, output_dir)
 
     t_total = time.time()
 
@@ -269,13 +305,37 @@ def main():
     # Step 5: Phase 2c — W4A8 quantization
     # ==================================================================
     logger.info("=" * 60)
-    logger.info("STEP 5/6 — Phase 2c: W4A8 quantization")
+    logger.info("STEP 5/6 — Phase 2c: W4A8 quantization (act_quant=%s)", args.act_quant)
     logger.info("=" * 60)
 
-    from .quantize import quantize_model
-
     t_quant = time.time()
-    layer_meta = quantize_model(pipeline.mmdit, registry, b_inv_map, p2_cfg)
+
+    if args.act_quant == "static":
+        from .quantize_static import (
+            compute_static_scales,
+            quantize_model_static,
+            save_quantized_model_static,
+        )
+
+        static_scales = compute_static_scales(
+            light_registry,
+            diagnostics_dir,
+            calibration,
+            config=p2_cfg,
+            mode=args.static_mode,
+            granularity=args.static_granularity,
+        )
+        layer_meta = quantize_model_static(
+            pipeline.mmdit, registry, b_inv_map, static_scales, config=p2_cfg,
+        )
+    else:
+        from .quantize import quantize_model
+
+        layer_meta = quantize_model(
+            pipeline.mmdit, registry, b_inv_map, p2_cfg,
+            mean_rhos=calibration.get("mean_rhos"),
+        )
+
     logger.info("Quantization finished in %.1f s", time.time() - t_quant)
 
     # ==================================================================
@@ -285,35 +345,80 @@ def main():
     logger.info("STEP 6/6 — Saving quantized model")
     logger.info("=" * 60)
 
-    from .quantize import save_quantized_model
+    if args.act_quant == "static":
+        save_quantized_model_static(
+            pipeline.mmdit, output_dir, p2_cfg, layer_meta,
+            calibration["b_inv_layers"], static_scales,
+            granularity=args.static_granularity,
+            mode=args.static_mode,
+        )
+    else:
+        from .quantize import save_quantized_model
 
-    save_quantized_model(
-        pipeline.mmdit, output_dir, p2_cfg, layer_meta, calibration["b_inv_layers"],
-    )
+        save_quantized_model(
+            pipeline.mmdit, output_dir, p2_cfg, layer_meta,
+            calibration["b_inv_layers"],
+        )
 
     total_elapsed = time.time() - t_total
     n_quantized = len(layer_meta)
     n_online = len(b_inv_map)
 
-    logger.info(
-        "\n" + "=" * 60 + "\n"
-        "  END-TO-END COMPLETE\n"
-        "=" * 60 + "\n"
-        "  Total time:        %.1f s (%.1f min)\n"
-        "  Quantized layers:  %d\n"
-        "  Online b_inv:      %d\n"
-        "  Group size:        %d\n"
-        "  Weight bits:       %d\n"
-        "  Alpha:             %.2f\n"
-        "  QKV method:        %s\n"
-        "  Diagnostics:       %s\n"
-        "  Quantized model:   %s",
-        total_elapsed, total_elapsed / 60,
-        n_quantized, n_online,
-        p2_cfg["group_size"], p2_cfg["bits"],
-        p2_cfg["alpha"], p2_cfg["qkv_method"],
-        diagnostics_dir, output_dir,
-    )
+    if args.act_quant == "static":
+        n_per_channel = sum(
+            1 for m in layer_meta.values() if m.get("per_channel", False)
+        )
+        logger.info(
+            "\n" + "=" * 60 + "\n"
+            "  END-TO-END COMPLETE (static A8)\n"
+            "=" * 60 + "\n"
+            "  Total time:        %.1f s (%.1f min)\n"
+            "  Quantized layers:  %d\n"
+            "  Online b_inv:      %d\n"
+            "  Static mode:       %s\n"
+            "  Granularity:       %s\n"
+            "  Per-channel layers:%d\n"
+            "  Group size:        %d\n"
+            "  Weight bits:       %d\n"
+            "  Alpha:             %.2f\n"
+            "  QKV method:        %s\n"
+            "  SSC tau:           %.2f\n"
+            "  Diagnostics:       %s\n"
+            "  Quantized model:   %s",
+            total_elapsed, total_elapsed / 60,
+            n_quantized, n_online,
+            args.static_mode, args.static_granularity, n_per_channel,
+            p2_cfg["group_size"], p2_cfg["bits"],
+            p2_cfg["alpha"], p2_cfg["qkv_method"],
+            p2_cfg.get("ssc_tau", 1.0),
+            diagnostics_dir, output_dir,
+        )
+    else:
+        n_per_token = sum(
+            1 for m in layer_meta.values() if m.get("per_token", False)
+        )
+        logger.info(
+            "\n" + "=" * 60 + "\n"
+            "  END-TO-END COMPLETE\n"
+            "=" * 60 + "\n"
+            "  Total time:        %.1f s (%.1f min)\n"
+            "  Quantized layers:  %d\n"
+            "  Online b_inv:      %d\n"
+            "  Per-token A8:      %d\n"
+            "  Group size:        %d\n"
+            "  Weight bits:       %d\n"
+            "  Alpha:             %.2f\n"
+            "  QKV method:        %s\n"
+            "  SSC tau:           %.2f\n"
+            "  Diagnostics:       %s\n"
+            "  Quantized model:   %s",
+            total_elapsed, total_elapsed / 60,
+            n_quantized, n_online, n_per_token,
+            p2_cfg["group_size"], p2_cfg["bits"],
+            p2_cfg["alpha"], p2_cfg["qkv_method"],
+            p2_cfg.get("ssc_tau", 1.0),
+            diagnostics_dir, output_dir,
+        )
 
 
 if __name__ == "__main__":

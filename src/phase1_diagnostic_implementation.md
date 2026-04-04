@@ -1,5 +1,7 @@
 # Phase 1 Diagnostic Implementation Guide
 
+**Code layout:** The running implementation is under `src/phase1/` (`collect.py`, `hooks.py`, `run_collection.py`, `registry.py`, `analyze.py`, `visualize.py`). Outputs default to `diagnostics/`. This guide describes design and behavior; where naming differs from early drafts, trust the `src/phase1/` sources.
+
 ## 1. Objectives
 
 Instrument the SD3 Medium MMDiT denoiser and collect per-channel activation and weight statistics across the full Euler sampling trajectory. No quantization is performed. The deliverables are data and visualizations that answer:

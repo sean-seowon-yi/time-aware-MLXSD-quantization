@@ -140,9 +140,17 @@ def compute_jaccard_topk(a: np.ndarray, b: np.ndarray, k: int = K) -> float:
     return len(top_a & top_b) / len(union)
 
 
-def compute_ssc_weights(rho_trajectory: np.ndarray) -> np.ndarray:
-    """SSC weights η_t = exp(-ρ_t) / Σ exp(-ρ_τ), PTQ4DiT Eq. 11."""
-    neg_rho = -rho_trajectory
+def compute_ssc_weights(
+    rho_trajectory: np.ndarray,
+    tau: float = 1.0,
+) -> np.ndarray:
+    """SSC weights η_t = exp(-ρ_t / τ) / Σ exp(-ρ_τ / τ).
+
+    Generalises PTQ4DiT Eq. 11 with a temperature parameter *tau*.
+    τ = 1.0 recovers the original formula.  τ < 1 sharpens the weighting
+    (more weight on low-ρ timesteps), τ > 1 flattens it.
+    """
+    neg_rho = -rho_trajectory / tau
     neg_rho -= neg_rho.max()  # numerical stability
     exp_vals = np.exp(neg_rho)
     return exp_vals / (exp_vals.sum() + 1e-12)

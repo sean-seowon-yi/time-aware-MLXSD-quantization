@@ -23,7 +23,7 @@ def _load_seed_prompt_pairs(path: Path) -> list[tuple[int, str]]:
 DIAG_CONFIG = {
     "model_version": "argmaxinc/mlx-stable-diffusion-3-medium",
     "w16": True,
-    "shift": 1.0,
+    "shift": 3.0,
     "use_t5": True,
     "low_memory_mode": False,
     "num_steps": 30,

@@ -58,18 +58,19 @@ def compute_balancing_vector(
     b_min: float = 1e-2,
     b_max: float = 1e2,
     w_eps: float = 1e-12,
-) -> np.ndarray:
+    ssc_tau: float = 1.0,
+) -> tuple[np.ndarray, float]:
     """Compute the SSC-weighted balancing vector for a single layer.
 
     Steps:
-      1. Spearman rho trajectory → SSC weights eta_t.
+      1. Spearman rho trajectory → SSC weights eta_t (with temperature tau).
       2. Weighted activation salience s_bar(X_j) = sum_t eta_t * s(X_j^t).
       3. b_j = (s_bar(X_j) / s(W_j))^alpha, clamped.
 
-    Returns: b_vector of shape [d_in].
+    Returns: (b_vector [d_in], mean_rho).
     """
     rho_traj = compute_spearman_trajectory(act_trajectory, wt_salience)
-    ssc_weights = compute_ssc_weights(rho_traj)
+    ssc_weights = compute_ssc_weights(rho_traj, tau=ssc_tau)
     weighted_act = ssc_weights @ act_trajectory  # [d_in]
 
     b = (weighted_act / (wt_salience + w_eps)) ** alpha
@@ -78,7 +79,30 @@ def compute_balancing_vector(
     dead_mask = wt_salience < w_eps
     b[dead_mask] = 1.0
 
-    return b
+    return b, float(rho_traj.mean())
+
+
+def _merge_wt_salience(
+    wt: dict[str, np.ndarray],
+    method: str,
+) -> np.ndarray:
+    """Merge Q/K/V weight salience vectors into a single shared vector.
+
+    Supported methods:
+      - "max":     element-wise maximum (conservative, protects any projection).
+      - "geomean": geometric mean (balanced, respects all projections equally).
+      - "l2":      RMS / L2-norm mean (middle ground between max and geomean).
+    """
+    if method == "max":
+        return np.maximum(np.maximum(wt["q_proj"], wt["k_proj"]), wt["v_proj"])
+    elif method == "geomean":
+        return (wt["q_proj"] * wt["k_proj"] * wt["v_proj"]) ** (1.0 / 3.0)
+    elif method == "l2":
+        return np.sqrt(
+            (wt["q_proj"] ** 2 + wt["k_proj"] ** 2 + wt["v_proj"] ** 2) / 3.0
+        )
+    else:
+        raise ValueError(f"Unknown QKV merge method: {method!r}")
 
 
 def compute_qkv_balancing(
@@ -90,14 +114,17 @@ def compute_qkv_balancing(
     b_min: float = 1e-2,
     b_max: float = 1e2,
     w_eps: float = 1e-12,
-) -> np.ndarray:
+    ssc_tau: float = 1.0,
+) -> tuple[np.ndarray, float]:
     """Compute the shared balancing vector for Q/K/V projections.
 
     Q, K, V share the same input (modulated pre-attention), so a single
     balancing vector is computed.  Weight salience is merged across projections
-    using the specified *method* ("max" or "geomean").
+    using the specified *method* ("max", "geomean", or "l2"), and the same
+    merged salience is used for the SSC rho trajectory so that the time-aware
+    weighting is consistent with the balancing objective.
 
-    Returns: b_qkv of shape [hidden_size].
+    Returns: (b_qkv [hidden_size], mean_rho of the merged trajectory).
     """
     q_name = f"blocks.{block_idx}.{side}.attn.q_proj"
     q_data = load_phase1_data(q_name, diagnostics_dir)
@@ -108,17 +135,11 @@ def compute_qkv_balancing(
         name = f"blocks.{block_idx}.{side}.attn.{proj}"
         wt[proj] = load_phase1_data(name, diagnostics_dir)["wt_salience"]
 
-    # SSC weights from q_proj's rho trajectory (shared input → representative)
-    rho_traj = compute_spearman_trajectory(act_trajectory, wt["q_proj"])
-    ssc_weights = compute_ssc_weights(rho_traj)
-    weighted_act = ssc_weights @ act_trajectory
+    merged_wt = _merge_wt_salience(wt, method)
 
-    if method == "max":
-        merged_wt = np.maximum(np.maximum(wt["q_proj"], wt["k_proj"]), wt["v_proj"])
-    elif method == "geomean":
-        merged_wt = (wt["q_proj"] * wt["k_proj"] * wt["v_proj"]) ** (1.0 / 3.0)
-    else:
-        raise ValueError(f"Unknown QKV merge method: {method!r}")
+    rho_traj = compute_spearman_trajectory(act_trajectory, merged_wt)
+    ssc_weights = compute_ssc_weights(rho_traj, tau=ssc_tau)
+    weighted_act = ssc_weights @ act_trajectory
 
     b = (weighted_act / (merged_wt + w_eps)) ** alpha
     b = np.clip(b, b_min, b_max)
@@ -126,7 +147,7 @@ def compute_qkv_balancing(
     for proj in ("q_proj", "k_proj", "v_proj"):
         b[wt[proj] < w_eps] = 1.0
 
-    return b
+    return b, float(rho_traj.mean())
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +181,12 @@ def calibrate_all_layers(
     b_min, b_max = cfg["b_min"], cfg["b_max"]
     w_eps = cfg["w_eps"]
     qkv_method = cfg["qkv_method"]
+    ssc_tau = cfg.get("ssc_tau", 1.0)
     exclude = set(cfg["exclude_layers"])
 
     balancing_vectors: dict[str, np.ndarray] = {}
     b_inv_layers: list[str] = []
+    mean_rhos: dict[str, float] = {}
     processed_qkv: set[tuple[int, str]] = set()
 
     for entry in registry:
@@ -179,37 +202,46 @@ def calibrate_all_layers(
             qkv_key = (block, side)
             if qkv_key not in processed_qkv:
                 processed_qkv.add(qkv_key)
-                b_qkv = compute_qkv_balancing(
+                b_qkv, qkv_rho = compute_qkv_balancing(
                     block, side, diagnostics_dir,
                     method=qkv_method, alpha=alpha,
                     b_min=b_min, b_max=b_max, w_eps=w_eps,
+                    ssc_tau=ssc_tau,
                 )
                 for proj in ("q_proj", "k_proj", "v_proj"):
                     proj_name = f"blocks.{block}.{side}.attn.{proj}"
                     balancing_vectors[proj_name] = b_qkv
+                    mean_rhos[proj_name] = qkv_rho
                 logger.info(
-                    "Block %d %s QKV (%s): b in [%.4f, %.4f]",
-                    block, side, qkv_method, b_qkv.min(), b_qkv.max(),
+                    "Block %d %s QKV (%s): b in [%.4f, %.4f], ρ=%.3f",
+                    block, side, qkv_method, b_qkv.min(), b_qkv.max(), qkv_rho,
                 )
 
         elif family in ("o_proj", "fc1", "fc2", "final_linear"):
             data = load_phase1_data(name, diagnostics_dir)
-            b = compute_balancing_vector(
+            b, layer_rho = compute_balancing_vector(
                 data["act_trajectory"], data["wt_salience"],
                 alpha=alpha, b_min=b_min, b_max=b_max, w_eps=w_eps,
+                ssc_tau=ssc_tau,
             )
             balancing_vectors[name] = b
+            mean_rhos[name] = layer_rho
             if family in ("o_proj", "fc2"):
                 b_inv_layers.append(name)
             logger.info(
-                "Layer %-45s  b in [%.4f, %.4f]", name, b.min(), b.max(),
+                "Layer %-45s  b in [%.4f, %.4f], ρ=%.3f",
+                name, b.min(), b.max(), layer_rho,
             )
 
     logger.info(
-        "Calibrated %d layers (%d need online b_inv)",
-        len(balancing_vectors), len(b_inv_layers),
+        "Calibrated %d layers (%d need online b_inv), ssc_tau=%.2f",
+        len(balancing_vectors), len(b_inv_layers), ssc_tau,
     )
-    return {"balancing_vectors": balancing_vectors, "b_inv_layers": b_inv_layers}
+    return {
+        "balancing_vectors": balancing_vectors,
+        "b_inv_layers": b_inv_layers,
+        "mean_rhos": mean_rhos,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +290,7 @@ def save_calibration(calibration: dict, output_dir: Path) -> None:
     meta = {
         "b_inv_layers": calibration["b_inv_layers"],
         "layer_names": list(bv.keys()),
+        "mean_rhos": calibration.get("mean_rhos", {}),
     }
     (output_dir / "calibration_meta.json").write_text(json.dumps(meta, indent=2))
     logger.info("Saved calibration to %s (%d layers)", output_dir, len(bv))
@@ -272,4 +305,5 @@ def load_calibration(output_dir: Path) -> dict:
     return {
         "balancing_vectors": balancing_vectors,
         "b_inv_layers": meta["b_inv_layers"],
+        "mean_rhos": meta.get("mean_rhos", {}),
     }

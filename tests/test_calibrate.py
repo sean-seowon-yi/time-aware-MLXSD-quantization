@@ -77,7 +77,7 @@ class TestComputeBalancingVector:
 
 class TestComputeQkvBalancing:
 
-    @pytest.mark.parametrize("method", ["max", "geomean"])
+    @pytest.mark.parametrize("method", ["max", "geomean", "l2"])
     def test_produces_valid_vector(self, mock_diagnostics, method):
         b = compute_qkv_balancing(
             0, "image", mock_diagnostics, method=method,
@@ -87,10 +87,13 @@ class TestComputeQkvBalancing:
         assert np.all(b <= 1e5)
         assert np.all(np.isfinite(b))
 
-    def test_max_and_geomean_differ(self, mock_diagnostics):
+    def test_methods_differ(self, mock_diagnostics):
         b_max = compute_qkv_balancing(0, "image", mock_diagnostics, method="max")
         b_geo = compute_qkv_balancing(0, "image", mock_diagnostics, method="geomean")
+        b_l2 = compute_qkv_balancing(0, "image", mock_diagnostics, method="l2")
         assert not np.allclose(b_max, b_geo)
+        assert not np.allclose(b_max, b_l2)
+        assert not np.allclose(b_geo, b_l2)
 
     def test_invalid_method_raises(self, mock_diagnostics):
         with pytest.raises(ValueError, match="Unknown QKV merge method"):
@@ -130,7 +133,7 @@ class TestCalibrateAllLayers:
         np.testing.assert_array_equal(q, k)
         np.testing.assert_array_equal(q, v)
 
-    @pytest.mark.parametrize("method", ["max", "geomean"])
+    @pytest.mark.parametrize("method", ["max", "geomean", "l2"])
     def test_qkv_method_override(self, registry, mock_diagnostics, test_config, method):
         cfg = {**test_config, "qkv_method": method}
         cal = calibrate_all_layers(registry, mock_diagnostics, cfg)

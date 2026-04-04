@@ -46,6 +46,10 @@ def _build_config(args) -> dict:
         cfg["bits"] = args.bits
     if args.final_layer_bits is not None:
         cfg["final_layer_bits"] = args.final_layer_bits
+    if args.ssc_tau is not None:
+        cfg["ssc_tau"] = args.ssc_tau
+    if args.per_token_rho_threshold is not None:
+        cfg["per_token_rho_threshold"] = args.per_token_rho_threshold
     cfg["model_version"] = MODEL_VERSION
     return cfg
 
@@ -76,10 +80,14 @@ def main():
 
     # --- Config overrides ---
     parser.add_argument("--alpha", type=float, default=None, help="CSB exponent (default: 0.5)")
-    parser.add_argument("--qkv-method", type=str, default=None, choices=["max", "geomean"])
+    parser.add_argument("--qkv-method", type=str, default=None, choices=["max", "geomean", "l2"])
     parser.add_argument("--group-size", type=int, default=None, help="W4 group size (default: 64)")
     parser.add_argument("--bits", type=int, default=None, help="Weight bits (default: 4)")
     parser.add_argument("--final-layer-bits", type=int, default=None, help="Final layer bits (default: 4)")
+    parser.add_argument("--ssc-tau", type=float, default=None,
+                         help="SSC temperature (default: 1.0). Values < 1 sharpen time-weighting.")
+    parser.add_argument("--per-token-rho-threshold", type=float, default=None,
+                         help="Layers with mean rho above this use per-token A8 (default: 0.5)")
 
     args = parser.parse_args()
 
@@ -174,7 +182,10 @@ def main():
     # ===================================================================
     logger.info("=== QUANTIZING ===")
     t0 = time.time()
-    layer_meta = quantize_model(pipeline.mmdit, registry, b_inv_map, cfg)
+    layer_meta = quantize_model(
+        pipeline.mmdit, registry, b_inv_map, cfg,
+        mean_rhos=calibration.get("mean_rhos"),
+    )
     logger.info("Quantization finished in %.1f s", time.time() - t0)
 
     # ===================================================================
@@ -193,17 +204,23 @@ def main():
     # --- Summary ---
     n_quantized = len(layer_meta)
     n_online = len(b_inv_map)
+    n_per_token = sum(1 for m in layer_meta.values() if m.get("per_token", False))
     logger.info(
         "\n=== SUMMARY ===\n"
         "  Quantized layers:  %d\n"
         "  Online b_inv:      %d\n"
+        "  Per-token A8:      %d\n"
         "  Group size:        %d\n"
         "  Weight bits:       %d\n"
         "  QKV method:        %s\n"
         "  Alpha:             %.2f\n"
+        "  SSC tau:           %.2f\n"
         "  Output:            %s",
-        n_quantized, n_online, cfg["group_size"], cfg["bits"],
-        cfg["qkv_method"], cfg["alpha"], output_dir,
+        n_quantized, n_online, n_per_token,
+        cfg["group_size"], cfg["bits"],
+        cfg["qkv_method"], cfg["alpha"],
+        cfg.get("ssc_tau", 1.0),
+        output_dir,
     )
 
 

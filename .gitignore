@@ -1,4 +1,8 @@
+# Virtualenvs
 .venv/
+.env/
+env/
+venv/
 
 # ----------------------------------------------------------------------
 # Python
@@ -9,12 +13,6 @@ __pycache__/
 *.pyd
 *.so
 *.dll
-
-# Virtualenvs
-.env/
-env/
-venv/
-.venv/
 
 # Packaging / build
 build/
@@ -28,6 +26,7 @@ dist/
 .ruff_cache/
 .coverage
 coverage.xml
+htmlcov/
 .cache/
 
 # Notebooks
@@ -61,20 +60,37 @@ coverage.xml
 **/artifacts/
 
 # ----------------------------------------------------------------------
-# Project-specific large / generated files
+# Project outputs (regenerable; large)
 # ----------------------------------------------------------------------
+# Phase 1 diagnostics, plots, NPZ/NPY under diagnostics/
+diagnostics/
 
-# Calibration and diagnostics data
-*.npz
-*.npy
+# Quantized checkpoints (mmdit_quantized.safetensors, configs, calibration)
+quantized/
 
-# Plots and diagnostics output
+# Inference images + run_meta.json
+results/
+
+# Benchmark images, JSON, embeddings cache
+benchmark_results/
+
+# Sweep per-config metrics (aggregate.json, per_image.json)
+metrics/
+
+# run_diagnose, plot scripts, ad-hoc figures
+post_quant_diagnostics/
+plots/
+
+# Legacy / scratch plot dirs (kept for compatibility)
 activation_plots/
 dry_run_activation_plots/
+
+# Common tensor dumps outside the dirs above
+*.npz
+*.npy
 
 # Local logs / scratch
 logs/
 *.log
 tmp/
 temp/
-results/

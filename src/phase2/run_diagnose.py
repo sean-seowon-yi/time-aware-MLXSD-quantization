@@ -4,14 +4,17 @@ weight/activation distributions against FP16 baselines, and generate plots.
 
 Usage
 -----
+# ``--quantized-dir`` must be the folder containing ``quantize_config.json``
+# (e.g. ``quantized/w4a8_max_a0.50_gs64/`` from ``run_e2e``).
+
 # Full diagnostics (collect + analyze + plot)
-python -m src.phase2.run_diagnose --quantized-dir quantized/ --output-dir post_quant_diagnostics/
+python -m src.phase2.run_diagnose --quantized-dir quantized/<tag>/ --output-dir post_quant_diagnostics/
 
 # Quick test with 2 prompts
-python -m src.phase2.run_diagnose --quantized-dir quantized/ --num-prompts 2 --output-dir post_quant_diagnostics/
+python -m src.phase2.run_diagnose --quantized-dir quantized/<tag>/ --num-prompts 2 --output-dir post_quant_diagnostics/
 
 # Skip collection (reuse previously collected W4A8 stats)
-python -m src.phase2.run_diagnose --quantized-dir quantized/ --skip-collection --output-dir post_quant_diagnostics/
+python -m src.phase2.run_diagnose --quantized-dir quantized/<tag>/ --skip-collection --output-dir post_quant_diagnostics/
 
 # Analysis + plots only (no model loading; requires prior collection)
 python -m src.phase2.run_diagnose --analysis-only --output-dir post_quant_diagnostics/

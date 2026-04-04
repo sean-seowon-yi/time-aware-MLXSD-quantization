@@ -1,168 +1,133 @@
 # time-aware-MLXSD-quantization
 
-Time-aware quantization experiments on **Stable Diffusion 3 Medium (MMDiT)** using **DiffusionKit (MLX)**, inspired by the TaQ-DiT paper (*Time-aware Quantization for Diffusion Transformers*, arXiv:2411.14172).
-
-This repo focuses on:
-
-- **Phase 1 – Calibration data generation** for SD3/MMDiT.
-- **Phase 2 – Diagnostic profiling of post-GELU FFN activations**, including TaQ-DiT-style visualizations.
-
-Later phases (actual quantization schemes and ablations) can build directly on these components.
+Time-aware post-training quantization for **Stable Diffusion 3 Medium (MMDiT)** on **Apple Silicon**, using **DiffusionKit (MLX)**. The implementation follows **PTQ4DiT**-style **Channel-wise Salience Balancing (CSB)** and **Spearman-based Sigma Calibration (SSC)** for **W4A8** (4-bit weights, 8-bit activations), with optional **static** activation scales derived from Phase 1 calibration data.
 
 ---
 
-## Project structure (relevant parts)
+## What this repository contains
 
-- `src/calibration_sample_generation/`
-  - `calibration_config.py` – Paper-aligned constants (100 steps, 256 trajectories, 25 selected timesteps, CFG=1.5, SD3 model ID).
-  - `calibration_collector.py` – Euler sampler wrapper that collects `(x_t, t)` at each denoising step using `CFGDenoiser`.
-  - `sample_cali_data.py` – Main entrypoint for Phase 1 calibration dataset generation.
-  - `sample_prompts.txt` – 20 diverse text prompts used for calibration.
+| Area | Role |
+|------|------|
+| **`src/phase1/`** | Diagnostic collection: hooks on target `nn.Linear` layers, activation stats per σ-step, weight salience. Outputs under `diagnostics/`. |
+| **`src/phase2/`** | Calibration (`calibrate.py`), CSB (`balance.py`), dynamic W4A8 (`quantize.py`), **static** W4A8 (`quantize_static.py`), end-to-end CLI (`run_e2e.py`), inference (`run_inference.py`), optional post-quant diagnostics (`run_diagnose.py`), and **visualization scripts** (`plot_post_csb.py`, `plot_weight_profile.py`, `plot_quantized_weight.py`, `plot_mse_vs_block.py`). |
+| **`src/benchmark/`** | `benchmark_model.py` — image generation; FID/IS/KID vs `--reference-dir`; optional paired PSNR/LPIPS vs **`--baseline-dir`** (same filenames as generated images). |
+| **`src/sweep/`** | Hyperparameter sweep (quantize → inference → metrics → summarize). See `src/sweep/SWEEP.md`. |
+| **`src/settings/`** | `coco_100_calibration_prompts.txt` (100 tab-separated seed/prompt pairs for Phase 1) and `evaluation_set.txt` (larger set for benchmarks/sweeps). |
+| **`DiffusionKit/`** | Vendored DiffusionKit Python sources (see `DiffusionKit/README.md`). |
 
-- `src/activation_diagnostics/`
-  - `activation_tracer.py` – Monkey-patches SD3’s MMDiT to trace **post-GELU FFN** activations per layer and timestep.
-  - `profile_postgelu.py` – Main entrypoint for Phase 2 diagnostic profiling (reads Phase 1 `.npz`, records stats/histograms).
-  - `visualize_postgelu.py` – Generates TaQ-DiT-style plots and a summary table from the profiling output.
+**Documentation** (in `src/`):
 
-- `src/PHASE1.md` – Detailed Phase 1 design doc: how it maps the TaQ-DiT spec to SD3, plus usage.
-- `src/PHASE2.md` – Detailed Phase 2 design doc: alignment/differences vs. TaQ-DiT, plus usage.
+- `PHASE1.md` — design and architecture notes for Phase 1 diagnostics.
+- `PHASE2.md` — CSB/SSC/W4A8 pipeline, data flow, CLI reference.
+- `phase1_findings.md` — summarized empirical findings from collected diagnostics.
+- `sweep/SWEEP.md` — sweep matrix, staged evaluation, CLI.
+
+There is **no** `src/calibration_sample_generation/` or `src/activation_diagnostics/` tree; those paths referred to an older scaffold and are **not** present in this codebase.
 
 ---
 
-## Environment & dependencies
+## Environment and dependencies
 
-High level:
+- **Platform:** macOS with Apple Silicon (MLX).
+- **Python:** 3.10+ (use a conda env with MLX + DiffusionKit stack, or a venv).
 
-- macOS with Apple Silicon (MLX target).
-- Python 3.10+ recommended.
-- [DiffusionKit](https://github.com/argmaxinc/DiffusionKit) checked out under `DiffusionKit/` (already part of this repo layout).
-
-Typical setup (from repo root):
+Install dependencies from the repo root:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
+pip install -r requirements.txt
+```
 
-# Install MLX + basics
-pip install mlx mlx-core matplotlib numpy tqdm
+Key packages include: `mlx`, `torch`, `safetensors`, `transformers`, `pillow`, `numpy`, `scipy`, `matplotlib`, and (for benchmarks) `torch-fidelity`, `open-clip-torch`, `lpips`, `psutil`.
 
-# Ensure DiffusionKit is importable (from this repo layout)
+Ensure DiffusionKit is importable (this repo expects `DiffusionKit/python/src` on `PYTHONPATH`, or the Phase 2 scripts add it when run as modules):
+
+```bash
 export PYTHONPATH="$PWD/DiffusionKit/python/src:$PYTHONPATH"
 ```
 
-> Note: the Phase 1 and Phase 2 scripts try to add `DiffusionKit/python/src` to `sys.path` automatically when needed, but setting `PYTHONPATH` explicitly is convenient when working in notebooks or ad-hoc scripts.
+---
+
+## Phase 1 — Diagnostic collection
+
+Collects per-layer activation trajectories (per-channel max over tokens at each denoising step) and weight salience, using **100** COCO-caption–style seed/prompt pairs by default (`src/settings/coco_100_calibration_prompts.txt`), **30** Euler steps, **CFG 4.0**, latent **64×64** (512×512 pixels).
+
+**Entry points**
+
+- **Collection** (writes `diagnostics/activation_stats/`, `weight_stats.npz`, `config.json`, adaLN stats; no plots):  
+  `python -m src.phase1.run_collection`  
+  Optional: `--pilot` (2 prompts), `--num-prompts N`.
+
+- **Analysis + plots** (requires existing `diagnostics/`):  
+  `python -m src.phase1.run_analysis`
+
+See `src/PHASE1.md` and `src/phase1_findings.md` for methodology and results.
 
 ---
 
-## Phase 1 – Calibration data generation (SD3 / MMDiT)
+## Phase 2 — W4A8 quantization (PTQ4DiT-style)
 
-Implements the TaQ-DiT calibration recipe for SD3, with SD3-specific adaptations:
-
-- **Paper alignment**
-  - 100 sampling steps per trajectory.
-  - 256 trajectories total.
-  - Uniform selection of 25 timesteps from the 100.
-  - CFG scale = 1.5.
-  - Result: **6,400** `(x_t, t)` calibration points.
-
-- **SD3-specific adaptations**
-  - Uses **Euler sampler** (ODE) instead of DDPM, which is more appropriate for SD3’s flow-matching formulation.
-  - Text conditioning instead of class labels, using 20 diverse prompts.
-  - Stores **token-level** and **pooled** text embeddings once per prompt, plus a `prompt_indices` array to keep `.npz` size reasonable.
-  - Enforces **batch=1** for calibration sampling to respect `CFGDenoiser`’s internal batch-doubling (CFG).
-
-### CLI – full calibration run
-
-From repo root:
+**End-to-end (collection → calibration → CSB → quantize → save):**
 
 ```bash
-python -m src.calibration_sample_generation.sample_cali_data \
-    --output DiT_cali_data.npz
+python -m src.phase2.run_e2e --output-dir quantized/
 ```
 
-This will:
-
-- Load SD3 Medium via DiffusionKit.
-- Run 256 Euler trajectories × 100 steps.
-- Uniformly pick 25 timesteps.
-- Flatten to 6,400 calibration points and shuffle.
-- Save everything to `DiT_cali_data.npz` (`xs`, `ts`, `prompt_indices`, `cs`, `cs_pooled`, `prompts`, `cfg_scale`).
-
-### CLI – quick dry run
+**Reuse existing diagnostics** (skip Phase 1 collection):
 
 ```bash
-python -m src.calibration_sample_generation.sample_cali_data \
-    --num-fid-samples 8 \
-    --num-sampling-steps 20 \
-    --num-selected-steps 5 \
-    --output dry_run_cali.npz
+python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection
 ```
 
-This produces a small calibration set suitable for functional testing.
-
-For detailed shapes, rationale, and exact mapping to the paper, see `src/PHASE1.md`.
-
----
-
-## Phase 2 – Activation diagnostics (post-GELU FFN)
-
-Phase 2 verifies whether SD3’s **post-GELU FFN activations** exhibit the same issues TaQ-DiT observed for DiT’s post-GELU activations (asymmetry, temporal drift, channel outliers).
-
-### Profiling (statistics + histograms)
+**Static activation quantization** (scales from calibration; separate from dynamic fake-quant per forward):
 
 ```bash
-python -m src.activation_diagnostics.profile_postgelu \
-    --calibration-file DiT_cali_data.npz \
-    --num-samples 512 \
-    --output activation_stats_postgelu.npz
+python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection \
+  --act-quant static --static-mode ssc_weighted --static-granularity per_tensor
 ```
 
-What this does:
+**Standalone quantize** (no static path; dynamic W4A8 only): `python -m src.phase2.run_quantize` — see `--calibrate-only` and `--from-calibration`.
 
-- Loads the Phase 1 `.npz` calibration dataset.
-- Samples a subset of calibration points (default: 512) uniformly without replacement.
-- Groups points by prompt, batches all timesteps per prompt into a single `cache_modulation_params` call (to avoid adaLN weight offloading issues).
-- Doubles `x_t` to batch size 2, matching CFG conditioning shape.
-- For each `(layer, timestep)` pair, accumulates:
-  - Per-channel: count, mean, std, min, max.
-  - Global: 512-bin histogram over a fixed range [-8, 8].
-
-The result is written to `activation_stats_postgelu.npz`.
-
-### Visualization (TaQ-DiT-style plots)
+**Inference**
 
 ```bash
-python -m src.activation_diagnostics.visualize_postgelu \
-    --stats-file activation_stats_postgelu.npz \
-    --output-dir activation_plots/
+python -m src.phase2.run_inference --mode fp16 --prompts-file src/settings/evaluation_set.txt --output-dir results/
+python -m src.phase2.run_inference --mode w4a8 --quantized-dir quantized/<tag>/ --prompts-file src/settings/evaluation_set.txt --output-dir results/
 ```
 
-This produces:
+Images are written under **`results/fp16/`** (fp16 mode) or **`results/<config_tag>/`** (w4a8 mode, where `<config_tag>` comes from `quantize_config.json` via `config_tag_from_meta`, e.g. `w4a8_l2_a0.50_gs32`). Filenames use **3-digit** indices (`000.png`, `001.png`, …) aligned with prompt order and per-line seeds in tab-separated prompt files.
 
-- `range_vs_timestep_all.png` (+ image/text-only variants) – activation range vs. timestep per layer.
-- `histogram_<layer_id>.png` – per-timestep histograms for selected layers.
-- `channel_ranges_<layer_id>.png` – per-channel dynamic ranges with top 2% outliers highlighted.
-- `heatmap_mean.png`, `heatmap_std.png` – temporal drift heatmaps.
-- `negative_fraction_heatmap.png` – fraction of activations < 0 per (layer, timestep).
-- A console summary table with aggregated stats per layer.
-
-You can also restrict visualizations to specific layers:
+**Benchmark**
 
 ```bash
-python -m src.activation_diagnostics.visualize_postgelu \
-    --stats-file activation_stats_postgelu.npz \
-    --output-dir activation_plots/ \
-    --layers mm_00_img mm_12_img mm_23_img
+python -m src.benchmark.benchmark_model --config w4a8 --quantized-dir quantized/<tag>/ \
+  --num-images 256 --reload-n 0 --output-dir benchmark_results/<tag> \
+  --reference-dir results/fp16
 ```
 
-For design details and how this maps to TaQ-DiT’s figures/tables, see `src/PHASE2.md`.
+Use `--config fp16_p2` for baseline FP16 with the same Phase 2 pipeline settings (`shift=3.0`, etc.). `--config w4a8` loads from `--quantized-dir` and uses `quantize_config.json` to instantiate dynamic vs static W4A8 (`act_quant`). For paired PSNR/LPIPS, use **`--baseline-dir`**; `--reference-dir` is for FID/IS/KID-style reference sets. See `benchmark_model.py` docstring.
+
+**Visualization helpers** (several require **`--calibration-dir`** on a quantized output tree with `calibration.npz`):
+
+- `python -m src.phase2.plot_post_csb --calibration-dir quantized/<tag>/ [--diagnostics-dir diagnostics]` — activation absmax vs σ (pre/post CSB).
+- `python -m src.phase2.plot_weight_profile --calibration-dir quantized/<tag>/` — per-channel weight absmax (pre/post CSB).
+- `python -m src.phase2.plot_quantized_weight --quantized-dir quantized/<tag>/` — per-group FP vs dequantized W4 (**requires MLX**).
+- `python -m src.phase2.plot_mse_vs_block --quantized-dir quantized/<tag>/` — analytical W4 / dynamic-A8 MSE vs block (**requires MLX**).
+
+**Sweep pipeline:** `python -m src.sweep.cli` — see `src/sweep/SWEEP.md`.
+
+Full detail, theory, and artifact tables: **`src/PHASE2.md`** (all-caps `PHASE2`; on case-sensitive systems this is the only path — not `Phase2.md`).
 
 ---
 
 ## Current status
 
-- ✅ **Phase 1** (Calibration data generation) implemented and tested with both full and dry runs.
-- ✅ **Phase 2** (Activation diagnostics + visualizations) implemented and tested on dry-run data.
-- 🔜 **Next phases** (joint reconstruction, momentum-based shifting, reconstruction-driven migration, and evaluation on SD3) are not yet implemented in this repo, but the calibration + diagnostic infrastructure is ready for them.
+- **Phase 1:** Implemented (`src/phase1/`); outputs in `diagnostics/` when collection is run.
+- **Phase 2:** W4A8 with CSB + SSC, dynamic and static activation quantization, inference, benchmark integration, sweep, and plotting utilities.
+- **Default Phase 2 hyperparameters** are in `src/phase2/config.py` (`PHASE2_CONFIG`: e.g. `alpha=0.5`, `group_size=64`, `qkv_method=max`, `ssc_tau=1.0`, `per_token_rho_threshold=0.5`).
 
+---
+
+## References
+
+- **PTQ4DiT** (methodology): *Post-training Quantization for Diffusion Transformers*.
+- **TaQ-DiT** / time-aware quantization: cited in early project docs; this repo’s implementation is **PTQ4DiT-aligned CSB/SSC** on SD3/MMDiT via DiffusionKit.

@@ -1,5 +1,7 @@
 # Polynomial Clipping for MM-DiT Quantization
 
+> **Scope:** Standalone notes on polynomial activation clipping for diffusion transformers. The **main quantization pipeline** in this repository is **PTQ4DiT-style CSB + SSC + W4A8** (`src/phase2/`). Polynomial clipping is not the implemented path here.
+
 Quantizing diffusion transformers is hard because the optimal clipping range for each layer changes at every denoising step — and in dual-stream architectures like SD3's MM-DiT, two streams drift in *opposite directions* simultaneously. We discovered that these activation trajectories aren't random: they follow smooth, low-degree polynomial curves dictated by rectified flow physics. By fitting per-layer polynomials to empirical trajectories, we get correct activation clipping at every noise level — and this unlocks everything downstream:
 
 - **Clean AdaRound optimization** — the reconstruction loss reflects only rounding error (not clipping error), so weight rounding decisions are optimized against the right signal

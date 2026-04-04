@@ -1,6 +1,6 @@
 # Phase 1 Diagnostic Findings — SD3 Medium MMDiT
 
-**Collection setup:** 10 prompts × 4 seeds = 40 runs, 28 Euler steps each, CFG disabled (cfg_weight=0.0), fp16 weights, fp32 activations. 287 linear layers + 49 adaLN layers instrumented.
+**Collection setup:** 100 COCO-style prompt–seed pairs (`src/settings/coco_100_calibration_prompts.txt`), 30 Euler steps, CFG 4.0, fp16 weights, fp32 activation statistics. 512×512 images (latent 64×64). **287** `nn.Linear` layers hooked for activation/weight stats; **adaLN** modulation statistics are collected separately (49 adaLN records: 24 image + 24 text blocks + final layer). Sigma schedule: 1.0 → 0.001 (monotonically decreasing, rectified flow). **Pipeline:** `python -m src.phase1.run_collection` → `diagnostics/`.
 
 ---
 
@@ -10,12 +10,12 @@
 
 **SD3 finding: Confirmed.** Salient channels are present in every layer family.
 
-- Across all layers, the mean top-1/median activation ratio is high, indicating that the most extreme channel is typically many times larger than the typical channel. For example, `blocks.22.text.mlp.fc1` shows a top-1/median ratio of ~90, and `final_layer.linear` shows ~77 (summary_table.csv).
-- The `context_embedder` has by far the highest max activation salience at **854.0** — about 2× the next-highest single layer (`blocks.22.text.mlp.fc2` at 414) and roughly 70× the average max activation salience across all block layers (~12). This extreme outlier is visible as the third-highest bar in `risk_ranking.png`.
-- In **fig3_\*.png** plots (e.g. `fig3_blocks.0.image.attn.q_proj.png`), each activation panel shows per-channel max|activation| as bars — blue for most channels, red (#e74c3c) for the top-32. A green line on the secondary axis traces the per-channel quantization MSE, which spikes at exactly the same channels that have high magnitude. The weight panel uses the same layout (orange bars, red for top-32, green MSE line). This directly confirms the PTQ4DiT observation that salient channels drive disproportionate quantization error.
-- The **family_violins.png** (left panel, "Max activation salience") shows that `fc2` text-side layers have extreme outliers reaching 400+, while attention projections (q/k/v/o_proj) are more moderate (mostly under 30).
+- The `context_embedder` has by far the highest max activation salience at **854.0** — about 2× the next-highest layer (`blocks.22.text.mlp.fc2` at 414) and roughly 40× the mean max activation salience across all layers (21.1). Its top-1/median ratio is 832 and its Gini coefficient is 0.62, confirming extreme concentration.
+- Text-side late-block MLP layers show the next tier of extreme salience: `blocks.22.text.mlp.fc1` (349), `blocks.14.text.mlp.fc2` (252), `blocks.21.text.mlp.fc1` (247), `blocks.21.text.mlp.fc2` (184), `blocks.20.text.mlp.fc2` (179). These are all 8–17× the mean.
+- In **fig3_\*.png** plots, per-channel max|activation| bars show blue for most channels and red for the top-32. A green MSE line on the secondary axis spikes at exactly the same salient channels, directly confirming that salient channels drive disproportionate quantization error.
+- The **family_violins.png** (left panel) shows that text `fc2` layers have extreme outliers reaching 400+, while attention projections (q/k/v/o_proj) are more moderate (mostly under 30). The median max salience across all layers is 10.6.
 
-**What differs from PTQ4DiT (DiT-XL):** SD3 has the `context_embedder` with an extraordinarily high activation salience (854.0) that has no analogue in DiT-XL. This layer projects 4096-dimensional T5-XXL text embeddings into the 1536-dimensional hidden space and contains a single extreme channel that dominates all others (Gini = 0.62).
+**What differs from PTQ4DiT (DiT-XL):** SD3 has the `context_embedder` (T5-XXL 4096→1536 projection) with an extraordinarily high activation salience that has no analogue in DiT-XL.
 
 ---
 
@@ -25,13 +25,40 @@
 
 **SD3 finding: Confirmed, and in many layers even stronger than in DiT-XL.**
 
-- **80.5% of layers** (231 of 287) have mean Spearman ρ < 0.3, indicating strong complementarity.
-- **30.3% of layers** (87 of 287) have mean ρ < 0.0, meaning activation and weight salience are **anti-correlated** — the ideal case for CSB.
-- Only **5.9% of layers** (17 of 287) have mean ρ > 0.5, where CSB may be less effective.
-- The **layerwise_rho.png** bar chart shows a clear trend: early blocks (0–3) have higher ρ (0.4–0.7), while mid-to-late blocks (8–20) have ρ near zero or negative. This "ρ decay with depth" pattern is visible in the image-side subplot.
-- The **scatter_\*.png** plots illustrate complementarity visually. For mid/late blocks with low ρ, such as `scatter_blocks.12.image.attn.o_proj.png` (ρ = −0.193), the plot shows a dispersed cloud where top-k activation channels (red circles) cluster at the right side (high activation, low-to-moderate weight) while top-k weight channels (orange circles) cluster at the top (high weight, low-to-moderate activation) — the classic L-shaped separation. In contrast, early blocks like `scatter_blocks.0.image.attn.q_proj.png` (ρ = 0.550) show much more overlap between top-k act and top-k wt circles in the upper-right region, confirming the depth-dependent ρ gradient.
+- **80.5% of layers** (231/287) have mean Spearman ρ < 0.3, indicating strong complementarity.
+- **30.3% of layers** (87/287) have mean ρ < 0.0, meaning activation and weight salience are anti-correlated — the ideal case for CSB.
+- Only **5.9% of layers** (17/287) have mean ρ > 0.5, where CSB may be less effective.
+- Mean ρ across all layers: **0.121** (std 0.214). Median: **0.098**.
 
-**What differs from PTQ4DiT:** The depth-dependent ρ profile is a new finding. PTQ4DiT reports generally low ρ across DiT-XL layers without highlighting this early-high/late-low gradient. In SD3, the first ~4 blocks have notably higher ρ (0.4–0.7 range), while blocks 8–20 often have negative ρ. This suggests CSB effectiveness will vary by block depth, which is not a concern flagged for DiT-XL.
+**Per-family ρ:**
+
+| Family | Layers | Mean ρ | Best for CSB? |
+|--------|--------|--------|---------------|
+| o_proj | 47 | 0.033 | Strongest complementarity |
+| fc2 | 47 | 0.081 | Strong |
+| q_proj | 48 | 0.112 | Strong |
+| k_proj | 48 | 0.148 | Strong |
+| fc1 | 47 | 0.160 | Moderate |
+| v_proj | 48 | 0.191 | Moderate |
+| final_linear | 1 | 0.673 | Weak — CSB less effective |
+| context_embedder | 1 | −0.342 | Ideal (anti-correlated) |
+
+**Depth-dependent ρ profile:**
+
+| Block range | Layers | Mean ρ |
+|-------------|--------|--------|
+| 0–3 | 48 | 0.334 |
+| 4–7 | 48 | 0.125 |
+| 8–11 | 48 | 0.041 |
+| 12–15 | 48 | 0.040 |
+| 16–19 | 48 | 0.100 |
+| 20–23 | 45 | 0.083 |
+
+The **layerwise_rho.png** bar chart shows this clearly: early blocks (0–3) have higher ρ (0.3–0.7), while mid blocks (8–15) hover near zero or go negative. Late blocks (20–23) are bimodal — text-side MLP layers have very high ρ (0.6–0.8) while image-side layers remain low.
+
+The **scatter_\*.png** plots illustrate complementarity visually. For mid/late blocks with low ρ, top-k activation channels cluster at the right (high activation, low weight) while top-k weight channels cluster at the top — the classic L-shaped separation. In contrast, early blocks like `blocks.0.image.attn.q_proj` (ρ = 0.53) show overlap.
+
+**What differs from PTQ4DiT:** The depth-dependent ρ profile is a new finding. PTQ4DiT reports generally low ρ across DiT-XL layers without highlighting this early-high/late-low gradient.
 
 ---
 
@@ -39,92 +66,122 @@
 
 **PTQ4DiT claim:** The distribution and identity of salient activation channels changes across timesteps, motivating time-aware calibration (SSC).
 
-**SD3 finding: Confirmed.** Temporal variation is present but moderate in most layers, with the notable exception of `final_layer.linear`.
+**SD3 finding: Confirmed.** Temporal variation is present but heterogeneous — moderate in most layers, extreme in a subset.
 
-- The mean temporal CoV across all layers is **0.171** (std 0.054). This indicates moderate but not extreme variation — most channels' salience values fluctuate by roughly 17% of their mean across the σ trajectory.
-- The mean early-late top-k Jaccard is **0.255** (std 0.184), meaning only about 25% of the top-32 salient channels at the first σ step are still in the top-32 at the last step. This confirms that channel identity does shift over time.
-- **fig4_\*.png** (temporal boxplots) show the boxes shifting vertically across σ steps. For most block layers, salience increases as σ decreases (noise is removed). The red top-k dots move between steps, confirming identity shifts.
-- The **heatmap_grid_image_q_proj.png** (4×6 grid of all 24 blocks' image q_proj heatmaps) is particularly revealing. Most blocks show vertical bright stripes (persistent salient channels) with some variation in intensity across σ rows. Blocks 0–3 show more pronounced stripe changes, while mid blocks (8–15) have more uniform heatmaps.
-- The **rho_grid_image_q_proj.png** (ρ trajectory across all 24 blocks) shows that most blocks have relatively flat ρ trajectories — ρ does not change dramatically over σ within a single layer. Blocks 0–3 show a slight downward drift from early to late σ, while blocks 8+ are nearly flat near zero.
+- The mean temporal CoV across all layers is **0.171** (std 0.054, median 0.149). Most channels' salience values fluctuate by roughly 17% of their mean across the σ trajectory.
+- The mean early-late top-32 Jaccard is **0.255** (std 0.184, median 0.231), meaning only about 25% of the top-32 salient channels at σ=1.0 are still in the top-32 at σ=0.001.
+- **11 layers have Jaccard = 0.0** (complete top-k turnover between early and late σ). These are predominantly image-side `fc2` and `o_proj` layers.
+- **fig4_\*.png** temporal boxplots show salience generally increasing as σ decreases (noise is removed).
+- The **heatmap_grid_image_q_proj.png** (4×6 grid) shows vertical bright stripes (persistent salient channels) with some intensity variation across σ rows. Blocks 0–3 show more pronounced changes.
 
 **The final_layer.linear is a critical outlier:**
+
 - CoV = **0.397** (highest of all 287 layers), more than 2× the mean.
-- Early-late Jaccard = **0.103** (one of the lowest), meaning the salient channels at σ ≈ 1.0 are almost entirely different from those at σ ≈ 0.0.
-- The **topk_overlap_final_layer.linear.png** Jaccard heatmap shows a striking block-diagonal pattern with two distinct "regimes": early σ steps (high noise) form one green cluster, late σ steps (low noise) form another, and the cross-regime cells are red/orange (Jaccard ≈ 0.0–0.2). This is the clearest evidence of a regime shift.
-- The **final_layer_analysis.png** shows: (1) the weight profile has a few dominant channels among 1536 channels, (2) the temporal boxplot shows a clear upward trend in activation salience as σ decreases (boxes grow taller toward late σ), and (3) the distribution shift panel shows the activation distribution broadening and shifting rightward at low σ.
+- Early-late Jaccard = **0.103** (one of the lowest) — near-complete turnover of salient channels.
+- ρ = **0.673** — high positive correlation means CSB is less effective here.
+- The **topk_overlap_final_layer.linear.png** Jaccard heatmap shows a striking block-diagonal pattern: early σ steps form one cluster, late σ steps form another, with cross-regime Jaccard near 0.
 
-**Contrast: regular blocks vs final layer (top-k overlap heatmaps):**
-- The **topk_overlap_blocks.12.image.attn.q_proj.png** shows a mostly green matrix (Jaccard ≈ 0.4–0.8 throughout), indicating that the top-32 salient channels at any σ step have substantial overlap with those at any other σ step. There is a slight fade toward the off-diagonal corners, but no sharp regime boundary.
-- The **topk_overlap_final_layer.linear.png** shows a starkly different pattern: two distinct green clusters (upper-left for early σ, lower-right for late σ) separated by a yellow-to-red transition band (Jaccard ≈ 0.0–0.2), indicating near-complete turnover of salient channels between early and late denoising.
+**Key layer temporal comparisons:**
 
-**What differs from PTQ4DiT:** The final layer's extreme temporal variation (CoV = 0.40, regime shift in top-k identity) is likely unique to SD3's velocity prediction (v = noise − image) rather than DiT-XL's noise prediction (ε). At high σ, the velocity target is noise-dominated; at low σ, it is image-dominated. This change in prediction target creates a fundamental shift in what the final layer must output, explaining the regime shift. PTQ4DiT does not report such extreme final-layer behavior for DiT-XL.
+| Layer | CoV | Early-late Jaccard | Pattern |
+|-------|-----|-------------------|---------|
+| `final_layer.linear` | 0.397 | 0.103 | Regime shift |
+| `blocks.2.image.mlp.fc1` | 0.303 | 0.049 | High turnover |
+| `blocks.0.text.attn.q_proj` | 0.286 | 0.280 | Moderate |
+| `blocks.12.image.attn.q_proj` | 0.127 | 0.641 | Mostly stable |
+| `context_embedder` | 0.000 | 1.000 | Perfectly stable |
+
+**What differs from PTQ4DiT:** The final layer's extreme temporal variation is likely unique to SD3's velocity prediction (v = noise − image) rather than DiT-XL's noise prediction (ε). At high σ, the velocity target is noise-dominated; at low σ, it is image-dominated. Additionally, 11 layers having Jaccard = 0.0 (complete turnover) suggests stronger regime shifts in SD3's MMDiT than DiT-XL's single-stream architecture.
 
 ---
 
 ## 4. Modality Asymmetry Is Significant (H5 — New Finding for SD3)
 
-**PTQ4DiT context:** DiT-XL has no modality split — it processes a single token stream. SD3's MMDiT processes image and text tokens through separate TransformerBlock pathways within each MultiModalTransformerBlock, which is architecturally novel.
+**PTQ4DiT context:** DiT-XL has no modality split. SD3's MMDiT processes image and text tokens through separate pathways.
 
 **SD3 finding: Image and text pathways behave differently.**
 
-- **Salience magnitude:** Text-side layers have higher mean max activation salience (24.4) than image-side layers (12.1). The extreme outliers (fc2 with 400+ salience) are exclusively on the text side (summary_table.csv).
-- **Complementarity:** Text-side layers have higher mean ρ (0.163) than image-side (0.084), meaning slightly weaker complementarity on the text pathway. The **modality_scatter_mean_spearman_rho.png** scatter plot shows many points above the diagonal (text ρ > image ρ), especially for late blocks (red-colored points in the upper-left region).
-- **Temporal variation:** Image and text CoV are comparable in aggregate (image 0.174 vs text 0.168), but the **modality_scatter_cov_temporal.png** shows substantial scatter away from the diagonal, with many points above it (text higher CoV) particularly at early blocks (dark blue points).
-- The **summary_dashboard.png** top-left panel ("Mean act. salience" vs block) shows text-side salience (orange line) spiking dramatically at late blocks (20–23) while image-side (blue) remains relatively flat. The top-center panel ("Mean ρ" vs block) shows image-side ρ decreasing with depth while text-side ρ is more erratic.
+| Metric | Image (145 layers) | Text (141 layers) |
+|--------|-------------------|-------------------|
+| Mean ρ | 0.084 | 0.163 |
+| Mean CoV | 0.174 | 0.168 |
+| Mean max salience | 12.1 | 24.4 |
+| Median max salience | 10.4 | 10.6 |
 
-**Implication:** Any CSB/SSC implementation for SD3 should potentially use **separate calibration parameters** (or at least separate calibration sets) for image and text pathways, since they exhibit different salience patterns, different complementarity levels, and different temporal profiles. This is a fundamental difference from DiT-XL where a single calibration regime suffices.
+- **Salience magnitude:** Text-side layers have 2× higher mean max activation salience, driven entirely by late-block MLP outliers. Median values are comparable (10.4 vs 10.6), showing the difference is concentrated in a few extreme layers.
+- **Complementarity:** Text-side has higher mean ρ (0.163 vs 0.084), meaning weaker complementarity. This is driven by text-side fc1 (ρ = 0.325) vs image-side fc1 (ρ = 0.002), the largest modality gap of any family.
+- **Temporal variation:** Image-side CoV (0.174) is slightly higher than text-side (0.168) — approximately comparable.
+- The **summary_dashboard.png** top-left panel shows text-side mean act salience spiking in blocks 20–23 while image-side remains flat.
+- The **family_violins.png** middle panel shows image-side attention projections (q/k/v) have higher spread in ρ (spanning −0.4 to +0.7) compared to text-side equivalents.
+
+**Per-family modality split:**
+
+| Family | Image mean ρ | Text mean ρ | Image mean sal | Text mean sal |
+|--------|-------------|------------|----------------|---------------|
+| q_proj | 0.116 | 0.107 | 16.4 | 9.4 |
+| k_proj | 0.181 | 0.115 | 16.4 | 9.4 |
+| v_proj | 0.157 | 0.224 | 16.4 | 9.4 |
+| o_proj | −0.028 | 0.096 | 9.4 | 9.3 |
+| fc1 | 0.002 | 0.325 | 7.3 | 48.9 |
+| fc2 | 0.050 | 0.113 | 6.3 | 62.2 |
+
+The most striking asymmetry is in MLP layers: text-side fc1 and fc2 have far higher salience (~7–10× image-side) and substantially higher ρ (especially fc1: 0.325 vs 0.002).
+
+**Implication:** CSB effectiveness varies by modality. Image-side layers are generally more amenable to CSB (lower ρ) than text-side layers.
 
 ---
 
 ## 5. Submodule Family Risk Ranking (H4)
 
-**SD3 finding:** Risk is concentrated in specific families and specific blocks.
+**SD3 finding:** Risk is concentrated in specific families and specific blocks. The composite risk score combines normalized max activation salience (40%), max weight salience (20%), mean Spearman ρ (20%), and temporal CoV (20%).
 
-From the **risk_ranking.png** and summary_table.csv, the top-10 highest-risk layers are:
+Top 10 highest-risk layers by composite risk score:
 
-| Rank | Layer | Family | Risk | Key issue |
-|------|-------|--------|------|-----------|
-| 1 | blocks.22.text.mlp.fc2 | fc2 | 0.535 | Extreme salience (414), high ρ (0.73) means CSB less effective |
-| 2 | blocks.22.text.mlp.fc1 | fc1 | 0.463 | Extreme salience (349), high ρ (0.79) means CSB less effective |
-| 3 | context_embedder | context | 0.453 | Extreme salience (854), but strong complementarity (ρ = −0.34) helps CSB |
-| 4 | blocks.1.image.attn.q_proj | q_proj | 0.412 | Moderate salience (13), high CoV (0.28), moderate ρ (0.70) |
-| 5 | final_layer.linear | final | 0.410 | Highest CoV (0.40), high ρ (0.67), regime shift in top-k identity |
-| 6 | blocks.21.text.mlp.fc2 | fc2 | 0.410 | High salience (184), high ρ (0.61) |
-| 7 | blocks.14.text.mlp.fc2 | fc2 | 0.407 | High salience (252), low ρ (0.11) — CSB effective here |
-| 8 | blocks.21.text.mlp.fc1 | fc1 | 0.387 | High salience (247), moderate ρ (0.64) |
-| 9 | blocks.1.image.attn.v_proj | v_proj | 0.386 | Same input as q_proj block 1, high CoV (0.28) |
-| 10 | blocks.14.image.attn.k_proj | k_proj | 0.386 | Moderate salience (22), moderate ρ (0.25) |
+| Rank | Layer | Risk | Max Sal. | ρ | CoV |
+|------|-------|------|----------|------|------|
+| 1 | `blocks.22.text.mlp.fc2` | 0.535 | 414.4 | 0.728 | 0.247 |
+| 2 | `blocks.22.text.mlp.fc1` | 0.463 | 349.0 | 0.791 | 0.098 |
+| 3 | `context_embedder` | 0.453 | 854.0 | −0.342 | 0.000 |
+| 4 | `blocks.1.image.attn.q_proj` | 0.412 | 12.7 | 0.704 | 0.282 |
+| 5 | `final_layer.linear` | 0.410 | 23.6 | 0.673 | 0.397 |
+| 6 | `blocks.21.text.mlp.fc2` | 0.410 | 183.7 | 0.611 | 0.274 |
+| 7 | `blocks.14.text.mlp.fc2` | 0.407 | 252.2 | 0.108 | 0.161 |
+| 8 | `blocks.21.text.mlp.fc1` | 0.387 | 246.9 | 0.645 | 0.113 |
+| 9 | `blocks.1.image.attn.v_proj` | 0.386 | 12.7 | 0.680 | 0.282 |
+| 10 | `blocks.14.image.attn.k_proj` | 0.386 | 21.5 | 0.253 | 0.133 |
 
-**Key patterns from the family_violins.png:**
-- **fc2** has the widest spread and highest outliers in activation salience. It also has the highest temporal CoV (mean 0.215).
-- **fc1** has extreme outliers in text-side salience (300+ range) but tighter distributions on the image side.
-- **o_proj** has the lowest mean ρ (0.033) of any family — strongest complementarity overall.
-- **Attention projections** (q/k/v_proj) share the same input within a block. Their activation salience is identical (same input tensor), but weight salience differs, so ρ differs across q/k/v.
+**Key patterns from family_violins.png:**
 
-**Depth effects (from depth_profile_\*.png):**
-- The **depth_profile_q_proj.png** shows image-side max salience varying between 5–25 across blocks with no strong trend, while text-side max salience shows a mild increase with depth (from ~8 at block 0 to ~17 at block 23). The Spearman ρ (dotted lines) decreases with depth for both sides.
-- The **depth_profile_fc1.png** reveals a different pattern: text-side max salience is extremely high at early blocks (250–300 at blocks 0–1), dips to ~150 in mid blocks, then rises again to ~350 at blocks 22–23 — a U-shaped profile. Image-side fc1 stays comparatively low (<100 throughout).
-- The **depth_profile_o_proj.png** shows o_proj salience is more uniform across depth (max ≈ 6–16 for both sides), but with ρ (dotted lines) fluctuating around zero across all blocks, confirming that o_proj consistently exhibits strong complementarity regardless of depth.
-- Overall, late text-side blocks (20–23) are consistently among the highest-risk targets, driven by extreme salience in fc1/fc2 combined with moderate-to-high ρ.
+- **fc2** has the widest spread and highest outliers in activation salience (text-side reaching 400+). It also has the highest mean temporal CoV.
+- **o_proj** has the lowest mean ρ (0.033) — strongest complementarity overall.
+- **Attention projections** (q/k/v) share the same input within a block — identical activation salience but different weight salience, so ρ differs. Note: `blocks.1.image.attn.{q,v}_proj` both appear in the top 10 because early blocks have high ρ combined with moderate salience.
+
+**Layers with strongest complementarity (best CSB targets):**
+
+| Layer | ρ | Max Sal. |
+|-------|------|----------|
+| `blocks.22.image.attn.o_proj` | −0.403 | 15.3 |
+| `context_embedder` | −0.342 | 854.0 |
+| `blocks.11.image.mlp.fc1` | −0.324 | 10.3 |
+| `blocks.22.text.attn.o_proj` | −0.306 | 9.7 |
+| `blocks.10.image.mlp.fc1` | −0.298 | 8.4 |
 
 ---
 
 ## 6. Velocity Prediction and the Final Layer (H6)
 
-**PTQ4DiT context:** DiT-XL predicts noise ε. SD3 predicts velocity v = noise − image. This changes the target distribution at the final layer.
+**PTQ4DiT context:** DiT-XL predicts noise ε. SD3 predicts velocity v = noise − image.
 
 **SD3 finding: The final layer is one of the highest-risk quantization targets.**
 
-- `final_layer.linear` has risk score 0.410 (rank 5 of 287).
-- Its ρ = 0.673 is one of the highest in the model, meaning activation and weight salience are **positively correlated** — CSB would be less effective here.
-- Its CoV = 0.397 is the highest — extreme temporal variation.
-- Its early-late Jaccard = 0.103 — almost complete turnover of salient channels.
-- The **final_layer_analysis.png** confirms:
-  - Panel 1 (weight profile): A few channels in the 1536-dim space have notably higher max|weight| than the rest.
-  - Panel 2 (temporal boxplot): Clear upward trend in activation salience from early to late σ. At σ ≈ 0.0, the boxes are approximately 10× taller than at σ ≈ 1.0.
-  - Panel 3 (distribution shift): The activation distribution shifts rightward and broadens dramatically from σ = 1.0 (narrow, near zero) to σ = 0.0 (broader, higher mean).
+- `final_layer.linear` maps 1536 dims → 64 (VAE latent channels).
+- ρ = 0.673 (one of the highest) — activation and weight salience are positively correlated, meaning CSB is less effective.
+- CoV = 0.397 (the highest) — extreme temporal variation.
+- Early-late Jaccard = 0.103 — near-complete turnover of salient channels.
+- Gini (activation) = 0.69, Gini (weight) = 0.57 — both highly concentrated.
+- ρ trajectory spans 0.58–0.81 (std 0.045) — consistently high across all σ steps.
 
-**Implication:** The final layer may require special treatment in Phase 2 — potentially a dedicated per-timestep quantization scheme or higher bit-width, since CSB is less effective (high ρ) and standard calibration will be undermined by the regime shift.
+**Implication:** The final layer may require special treatment — potentially higher bit-width or a dedicated per-timestep calibration scheme.
 
 ---
 
@@ -132,42 +189,115 @@ From the **risk_ranking.png** and summary_table.csv, the top-10 highest-risk lay
 
 The `context_embedder` (projecting 4096-dim T5-XXL embeddings to 1536-dim hidden) has unique properties:
 
-- **Max activation salience = 854.0** — by far the highest in the model (next highest is ~414 for text fc2).
-- **Spearman ρ = −0.342** — strong anti-correlation (activation and weight salience are anti-aligned). This is actually the ideal scenario for CSB.
-- **CoV = 0.000 and early-late Jaccard = 1.000** — the text embeddings are fixed per prompt (not time-dependent), so there is zero temporal variation. The same channels are salient at every σ step. This is directly visible in **heatmap_context_embedder.png**: every row (σ step) has identical coloring, producing perfectly horizontal color bands. The heatmap also shows a bimodal structure — roughly half the 4096 channels have very low salience (purple), and the other half have high salience (orange-yellow), with a sharp boundary near channel ~2000 (when sorted by mean salience).
-- **Gini = 0.624** — high concentration; salience is very uneven.
-- The **fig3_context_embedder.png** activation panel shows salience values reaching 800+, with a distinct spatial clustering: channels in the first ~2000 indices (sorted) have near-zero activation, while the remaining ~2000 channels show extremely high and variable magnitudes.
+- **Max activation salience = 854.0** — by far the highest (next is 414 for text fc2).
+- **ρ = −0.342** — strong anti-correlation. Ideal for CSB.
+- **CoV = 0.000 and early-late Jaccard = 1.000** — text embeddings are fixed per prompt, so there is zero temporal variation. The ρ trajectory has std = 0 (every σ step produces the same rank correlation). The **heatmap_context_embedder.png** shows perfectly horizontal color bands.
+- **Gini = 0.62** — high concentration of salience in few channels.
 
-**Implication:** The context embedder's extreme salience makes it a high-risk layer, but its perfect temporal stability and strong anti-correlation mean CSB should work well here. A single calibration point (no time-awareness needed) with aggressive channel balancing should suffice.
+**Implication:** A single calibration point (no time-awareness needed) with aggressive CSB should suffice. Currently excluded from quantization (`exclude_layers: ["context_embedder"]`).
 
 ---
 
-## 8. Summary: Similarities and Differences vs PTQ4DiT (DiT-XL)
+## 8. SSC Weight Non-Uniformity: Layer-Dependent, Not Universal
+
+**Critical finding:** The SSC (Spearman-based Sigma Calibration) time-aware weighting is **not uniformly near-flat** across all layers. Its effectiveness depends on the layer's ρ trajectory span — which varies by over an order of magnitude across the network.
+
+### The mechanism
+
+SSC weights are computed as η_t = exp(−ρ_t) / Σ exp(−ρ_τ). Timesteps where activation and weight salience are anti-correlated (low/negative ρ) receive higher weight, since those are the steps where the activation statistics are most informative for calibration.
+
+### The ρ trajectory spans
+
+| Metric | Value |
+|--------|-------|
+| Median ρ range (max−min) | 0.125 |
+| Mean ρ range | 0.150 |
+| 75th percentile range | 0.187 |
+| Max ρ range | 0.592 |
+| Layers with range > 0.3 | 24 / 287 (8.4%) |
+| Layers with range > 0.2 | 63 / 287 (22.0%) |
+| Layers with range < 0.1 | 102 / 287 (35.5%) |
+
+### What this means for SSC weights
+
+The softmax over small ρ differences produces mild rather than dramatic weighting. Even in the worst case, the effective number of timesteps remains close to 30:
+
+| Layer | ρ range | max η / min η | eff_T / 30 | Character |
+|-------|---------|---------------|-----------|-----------|
+| `blocks.12.image.mlp.fc1` | 0.586 | 1.80 | 29.2 / 30 | Strongest differentiation |
+| `blocks.8.image.attn.q_proj` | 0.539 | 1.71 | 29.4 / 30 | Significant |
+| `blocks.12.text.attn.q_proj` | 0.278 | 1.32 | 29.8 / 30 | Moderate |
+| `final_layer.linear` | 0.221 | 1.25 | 29.9 / 30 | Mild |
+| `blocks.0.image.attn.q_proj` | 0.104 | 1.11 | 30.0 / 30 | Near-uniform |
+| `context_embedder` | 0.000 | 1.00 | 30.0 / 30 | Perfectly uniform |
+
+### Distribution across the network
+
+- **30% of layers** (87/287): near-uniform, ratio < 1.1. SSC adds essentially nothing over simple averaging.
+- **57% of layers** (164/287): mild variation, ratio 1.1–1.3.
+- **9% of layers** (26/287): moderate, ratio 1.3–1.5.
+- **3.5% of layers** (10/287): significant, ratio ≥ 1.5. All are image-side MLPs and some image-side q_proj.
+
+### By layer family (mean max η / min η ratio)
+
+| Family | Mean ratio | Max ratio | Most affected |
+|--------|-----------|-----------|---------------|
+| fc1 | 1.22 | 1.80 | `blocks.12.image.mlp.fc1` |
+| fc2 | 1.18 | 1.59 | `blocks.3.image.mlp.fc2` |
+| final_linear | 1.25 | 1.25 | Only layer |
+| q_proj | 1.18 | 1.71 | `blocks.8.image.attn.q_proj` |
+| o_proj | 1.16 | 1.46 | `blocks.6.image.attn.o_proj` |
+| k_proj | 1.14 | 1.49 | `blocks.14.image.attn.k_proj` |
+| v_proj | 1.15 | 1.45 | `blocks.23.image.attn.v_proj` |
+| context_embedder | 1.00 | 1.00 | N/A |
+
+### Detailed example: blocks.12.image.mlp.fc1 (worst case)
+
+This layer has ρ going from −0.30 (at σ ≈ 0.8, high noise) to +0.29 (at σ ≈ 0.001, low noise). SSC upweights the high-noise steps by ~14% above uniform and downweights the low-noise steps by ~37% below uniform:
+
+- Heaviest 3 η values: 0.038, 0.038, 0.038 (σ ≈ 0.83, 0.86, 0.76) — 1.14× uniform
+- Lightest 3 η values: 0.021, 0.021, 0.022 (σ ≈ 0.001, 0.035, 0.070) — 0.64× uniform
+- 50% of total weight is carried by the top 14/30 timesteps (vs 15/30 for uniform)
+
+### Root cause
+
+Spearman ρ between activation and weight salience is bounded to [−1, +1] and in SD3 Medium rarely exceeds ±0.4 within any single layer's trajectory. The `exp(−ρ)` softmax with inputs in this narrow range cannot produce a peaked distribution. For SSC to create truly non-uniform weights, ρ would need to span several units — but rank correlations are inherently constrained.
+
+### Implications
+
+SSC does real work for **~13% of layers** (image-side MLPs and some q_proj in mid-blocks) where it meaningfully upweights high-noise timesteps with η ratios of 1.3–1.8×. For the majority of the network it produces near-uniform weights — but this is itself a principled conclusion: those layers have stable activation-weight relationships across σ, so uniform averaging is the correct calibration strategy.
+
+A sharper weighting function (e.g., temperature-scaled softmax `exp(−ρ/τ)` with τ < 1) could amplify the small ρ differences for the ~13% of layers where differentiation exists.
+
+---
+
+## 9. Summary: Similarities and Differences vs PTQ4DiT (DiT-XL)
 
 ### What is similar (PTQ4DiT observations that hold in SD3)
 
-1. **Salient channels exist** — confirmed across all families. A small number of channels carry disproportionately large magnitudes and drive most quantization error.
+1. **Salient channels exist** — confirmed across all families. A small number of channels carry disproportionately large magnitudes (Gini up to 0.71).
 2. **Complementarity holds** — 80.5% of layers have ρ < 0.3, supporting CSB applicability.
-3. **Temporal variation exists** — top-k channel identity shifts across σ steps (mean early-late Jaccard = 0.255), supporting SSC's time-aware approach.
-4. **MSE tracks salience** — quantization error per channel correlates with channel magnitude, just as in PTQ4DiT Figure 3.
+3. **Temporal variation exists** — top-k channel identity shifts across σ steps (mean early-late Jaccard = 0.255; 11 layers have complete turnover).
+4. **MSE tracks salience** — quantization error per channel correlates with channel magnitude (confirmed in fig3 plots).
 
 ### What differs (SD3-specific observations not present in DiT-XL)
 
-1. **Modality asymmetry** — SD3's dual image/text pathways behave differently in salience magnitude, complementarity, and temporal variation. DiT-XL has no modality split. This may require separate calibration for each pathway.
-2. **Depth-dependent ρ profile** — early blocks (0–3) have notably higher ρ than mid/late blocks. PTQ4DiT does not report a strong depth gradient in ρ for DiT-XL.
-3. **Final layer regime shift** — the velocity-prediction final layer shows a clear two-regime temporal pattern (early vs late σ) with near-complete turnover of salient channels. This is likely absent in DiT-XL's noise-prediction final layer.
-4. **Context embedder extreme outlier** — the T5-XXL projection layer has activation salience ~70× higher than the average block layer. DiT-XL has no analogous layer.
-5. **Text-side fc2 extreme salience** — late-block text fc2 layers reach 400+ max activation salience, far exceeding anything on the image side or in attention projections.
-6. **ρ varies by family within SD3** — o_proj has the lowest mean ρ (0.033), while fc1 has higher mean ρ (0.160). In DiT-XL, PTQ4DiT presents ρ as generally low across all layer types.
+1. **Modality asymmetry** — SD3's dual image/text pathways differ in salience (text MLP ~7–10× image MLP), complementarity (text fc1 ρ = 0.325 vs image fc1 ρ = 0.002), and risk profile.
+2. **Depth-dependent ρ profile** — early blocks (0–3): mean ρ = 0.334; mid blocks (8–15): mean ρ = 0.040. PTQ4DiT does not report a strong depth gradient.
+3. **Final layer regime shift** — velocity-prediction final layer shows near-complete top-k turnover (Jaccard = 0.103) with the highest CoV (0.397) and high ρ (0.673).
+4. **Context embedder extreme outlier** — T5-XXL projection has 854.0 max salience (~40× the layer average), with zero temporal variation and strong anti-correlation (ρ = −0.342).
+5. **Text-side MLP extreme salience** — late-block text fc1/fc2 layers reach 127–414 max salience. Most are paired with high ρ (0.6–0.8), making CSB less effective, though `blocks.20.text.mlp.fc2` is a notable exception (ρ = 0.13).
+6. **SSC non-uniformity is layer-dependent** — SSC provides meaningful (~1.3–1.8× ratio) differentiation for ~13% of layers (image-side MLPs, mid-block q_proj) but is near-uniform for the remaining ~87%.
+7. **Complete top-k turnover in 11 layers** — where Jaccard = 0.0, suggesting stronger regime shifts than DiT-XL's architecture.
 
 ### Implications for Phase 2
 
-- **CSB is broadly applicable** to SD3, but may need per-block or per-family tuning rather than a single global strategy.
-- **SSC (time-aware calibration) is essential** for the final layer and beneficial for most layers. The final layer may need a dedicated quantization strategy.
-- **Modality-specific calibration** should be explored — image and text pathways may benefit from separate balancing parameters.
-- **The context embedder** can use CSB with a single calibration point (no time-awareness needed).
-- **Late text-side blocks** (especially fc1/fc2 at blocks 20–23) and **early image-side blocks** (blocks 0–3) should be prioritized as high-risk targets.
+- **CSB is broadly applicable** but effectiveness varies by depth (early blocks weaker), family (o_proj strongest), and modality (image-side more amenable).
+- **SSC provides meaningful time-awareness for ~13% of layers** (image-side MLPs, some mid-block q_proj) where ρ trajectories span > 0.3. For the majority, it correctly produces near-uniform weights. A temperature parameter could amplify differentiation where it exists.
+- **The final layer** (ρ = 0.673, CoV = 0.397, regime shift) should use higher bit-width (8 or 16).
+- **Late text-side blocks** (20–23, fc1/fc2 with 127–414 salience, most with ρ > 0.6) are the highest-risk quantization targets where CSB may be insufficient.
+- **The context embedder** should remain excluded or use dedicated single-point calibration.
 
 ---
 
-*Data: `diagnostics/summary_table.csv` (287 layers). Plots: `diagnostics/plots/`. Collection config: `diagnostics/config.json`.*
+*Data: `diagnostics/activation_stats/` (287 layers × 30 σ steps, per-channel max and mean aggregated over 100 prompts), `diagnostics/weight_stats.npz` (287 layers, per-channel max), `diagnostics/adaln_stats.npz` (49 adaLN layers × 31 timesteps). Summary: `diagnostics/summary_table.csv` (287 rows × 21 diagnostic columns). Plots: `diagnostics/plots/` (128 files). Collection config: `diagnostics/config.json` (100 seed-prompt pairs, 30 steps, CFG 4.0).*
