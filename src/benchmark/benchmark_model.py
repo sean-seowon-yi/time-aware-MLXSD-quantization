@@ -32,12 +32,20 @@ Usage
         --baseline-dir benchmark_results/fp16_p2/images \\
         --output-dir benchmark_results/w4a8_l2_a0.50_gs32 --resume
 
-    # Or use existing sweep FP16 images as baseline (3-digit naming matches)
+    # Phase 2+3+4 (poly clipping + GPTQ) — generates with sigma-aware A8
     python -m src.benchmark.benchmark_model \\
-        --config w4a8 --quantized-dir quantized/w4a8_l2_a0.50_gs32 \\
+        --config w4a8_poly \\
+        --quantized-dir quantized/w4a8_l2_a0.50_gs32_static \\
         --num-images 150 --reload-n 1 \\
-        --baseline-dir results/fp16 \\
-        --output-dir benchmark_results/w4a8_l2_a0.50_gs32 --resume
+        --output-dir benchmark_results/w4a8_poly_gptq --resume
+
+    # Ground truth comparison (FID/IS for both W4A8 and FP16 vs GT)
+    python -m src.benchmark.benchmark_model \\
+        --skip-generation \\
+        --generated-dir benchmark_results/w4a8_poly_gptq/images \\
+        --ground-truth-dir /path/to/coco_gt_images \\
+        --fp16-dir benchmark_results/fp16_p2/images \\
+        --output-dir benchmark_results/w4a8_poly_gptq
 
     # Metrics only (images already generated)
     python -m src.benchmark.benchmark_model \\
@@ -178,8 +186,8 @@ def compute_fidelity_metrics(
               "Install with: pip install torch-fidelity")
         return None
 
-    n_gen = len(list(Path(generated_dir).glob("*.png")))
-    n_ref = len(list(Path(reference_dir).glob("*.png")))
+    n_gen = len(_list_images(generated_dir))
+    n_ref = len(_list_images(reference_dir))
     kid_subset_size = min(n_gen, n_ref, 1000)
 
     metrics = calculate_metrics(
@@ -237,6 +245,14 @@ def _load_clip_model():
 
 def _list_pngs(img_dir: str) -> List[Path]:
     return sorted(Path(img_dir).glob("*.png"))
+
+
+def _list_images(img_dir: str) -> List[Path]:
+    """List all PNG and JPEG images in a directory, sorted by name."""
+    d = Path(img_dir)
+    return sorted(
+        list(d.glob("*.png")) + list(d.glob("*.jpg")) + list(d.glob("*.jpeg"))
+    )
 
 
 def _compute_clip_embeddings(img_dir: str) -> Optional[Dict]:
@@ -618,7 +634,7 @@ def compute_sfid(
     ])
 
     def _extract(img_dir: str) -> np.ndarray:
-        paths = sorted(Path(img_dir).glob("*.png"))
+        paths = _list_images(img_dir)
         feats = []
         for p in paths:
             img = PILImage.open(p).convert("RGB")
@@ -936,26 +952,32 @@ def _load_pipeline(
         "remove_act_fn": None,
     }
 
-    if config in ("w4a8", "w4a8_static", "fp16_p2"):
+    if config in ("w4a8", "w4a8_static", "w4a8_poly", "fp16_p2"):
         from src.phase2.config import DIFFUSIONKIT_SRC, PIPELINE_KWARGS, MODEL_VERSION
         if DIFFUSIONKIT_SRC not in sys.path:
             sys.path.insert(0, DIFFUSIONKIT_SRC)
         from diffusionkit.mlx import DiffusionPipeline
         pipeline = DiffusionPipeline(**PIPELINE_KWARGS, model_version=MODEL_VERSION)
-        if config in ("w4a8", "w4a8_static"):
+        if config in ("w4a8", "w4a8_static", "w4a8_poly"):
             if quantized_dir is None:
-                raise ValueError("--quantized-dir is required when --config w4a8/w4a8_static")
-            qcfg_path = quantized_dir / "quantize_config.json"
-            is_static = False
-            if qcfg_path.exists():
-                with open(qcfg_path) as f:
-                    is_static = json.load(f).get("act_quant") == "static"
-            if config == "w4a8_static" or is_static:
-                from src.phase2.quantize_static import load_quantized_model_static
-                load_quantized_model_static(pipeline, quantized_dir)
+                raise ValueError(
+                    "--quantized-dir is required when --config w4a8/w4a8_static/w4a8_poly"
+                )
+            if config == "w4a8_poly":
+                from src.phase3.quantize_poly import load_quantized_model_poly
+                load_quantized_model_poly(pipeline, quantized_dir)
             else:
-                from src.phase2.quantize import load_quantized_model
-                load_quantized_model(pipeline, quantized_dir)
+                qcfg_path = quantized_dir / "quantize_config.json"
+                is_static = False
+                if qcfg_path.exists():
+                    with open(qcfg_path) as f:
+                        is_static = json.load(f).get("act_quant") == "static"
+                if config == "w4a8_static" or is_static:
+                    from src.phase2.quantize_static import load_quantized_model_static
+                    load_quantized_model_static(pipeline, quantized_dir)
+                else:
+                    from src.phase2.quantize import load_quantized_model
+                    load_quantized_model(pipeline, quantized_dir)
         return pipeline, quant_ctx
 
     from diffusionkit.mlx import DiffusionPipeline
@@ -1284,8 +1306,28 @@ def generate_images(
 # Section 5 — Console output helpers
 # ---------------------------------------------------------------------------
 
+def _print_fidelity_block(label: str, fid: Dict) -> None:
+    """Print a block of fidelity metrics with the given label prefix."""
+    if "fid" in fid:
+        print(f"  FID:           {fid['fid']:.4f}")
+    sfid = fid.get("sfid")
+    if sfid is not None:
+        print(f"  sFID:          {sfid:.4f}")
+    if "isc_mean" in fid:
+        print(f"  IS:            {fid['isc_mean']:.2f} +/- {fid['isc_std']:.2f}")
+    if "kid_mean" in fid:
+        print(f"  KID:           {fid['kid_mean']:.5f} +/- {fid['kid_std']:.5f}")
+    prec = fid.get("precision")
+    rec = fid.get("recall")
+    if prec is not None:
+        print(f"  Precision:     {prec:.4f}")
+    if rec is not None:
+        print(f"  Recall:        {rec:.4f}")
+
+
 def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict],
-                   paired: Optional[Dict] = None) -> None:
+                   paired: Optional[Dict] = None,
+                   gt: Optional[Dict] = None) -> None:
     print(f"\n{'='*50}")
     print(f"=== Benchmark Results: {config} ===")
     print(f"{'='*50}")
@@ -1301,38 +1343,42 @@ def _print_results(config: str, lat: Dict, mem: Dict, fidelity: Optional[Dict],
     print(f"Memory:        peak_metal={metal_gb:.1f} GB  peak_rss={rss_gb:.1f} GB")
 
     if fidelity is not None:
-        print(f"FID:           {fidelity['fid']:.4f}")
-        sfid = fidelity.get("sfid")
-        if sfid is not None:
-            print(f"sFID:          {sfid:.4f}")
-        print(f"IS:            {fidelity['isc_mean']:.2f} ± {fidelity['isc_std']:.2f}")
-        print(f"KID:           {fidelity['kid_mean']:.5f} ± {fidelity['kid_std']:.5f}")
-        prec = fidelity.get("precision")
-        rec = fidelity.get("recall")
-        if prec is not None:
-            print(f"Precision:     {prec:.4f}")
-        if rec is not None:
-            print(f"Recall:        {rec:.4f}")
+        print(f"\n--- Fidelity vs reference ---")
+        _print_fidelity_block("ref", fidelity)
         cmmd = fidelity.get("cmmd")
         if cmmd is not None:
-            print(f"CMMD:          {cmmd:.4f}")
+            print(f"  CMMD:          {cmmd:.4f}")
         cos_sim = fidelity.get("clip_cosine_sim")
         if cos_sim is not None:
-            print(f"CLIP cos sim:  {cos_sim:.4f}")
+            print(f"  CLIP cos sim:  {cos_sim:.4f}")
         prdc_p = fidelity.get("prdc_precision")
         prdc_r = fidelity.get("prdc_recall")
         prdc_d = fidelity.get("prdc_density")
         prdc_c = fidelity.get("prdc_coverage")
         if prdc_p is not None:
-            print(f"PRDC Precision:{prdc_p:>10.4f}")
+            print(f"  PRDC Precision:{prdc_p:>10.4f}")
         if prdc_r is not None:
-            print(f"PRDC Recall:   {prdc_r:>10.4f}")
+            print(f"  PRDC Recall:   {prdc_r:>10.4f}")
         if prdc_d is not None:
-            print(f"PRDC Density:  {prdc_d:>10.4f}")
+            print(f"  PRDC Density:  {prdc_d:>10.4f}")
         if prdc_c is not None:
-            print(f"PRDC Coverage: {prdc_c:>10.4f}")
+            print(f"  PRDC Coverage: {prdc_c:>10.4f}")
     else:
         print("FID/IS/KID:    skipped")
+
+    if gt is not None:
+        w4a8_gt = gt.get("w4a8_vs_gt")
+        fp16_gt = gt.get("fp16_vs_gt")
+        if w4a8_gt is not None:
+            print(f"\n--- W4A8 vs Ground Truth ---")
+            _print_fidelity_block("W4A8-GT", w4a8_gt)
+        if fp16_gt is not None:
+            print(f"\n--- FP16 vs Ground Truth ---")
+            _print_fidelity_block("FP16-GT", fp16_gt)
+        if (w4a8_gt is not None and fp16_gt is not None
+                and "fid" in w4a8_gt and "fid" in fp16_gt):
+            delta_fid = w4a8_gt["fid"] - fp16_gt["fid"]
+            print(f"\n  Delta FID (W4A8 - FP16): {delta_fid:+.4f}")
 
     if paired is not None:
         psnr = paired.get("psnr_mean")
@@ -1423,10 +1469,11 @@ def main() -> None:
     parser.add_argument(
         "--config", type=str, default="fp16",
         help="Quantization config label. Built-in configs: 'fp16', 'fp16_p2', "
-             "'naive_int8', 'gptq', 'w4a8', 'w4a8_static'. Use 'fp16_p2' for "
-             "FP16 baseline with Phase 2 pipeline settings (shift=3.0). "
-             "Use 'w4a8' / 'w4a8_static' with --quantized-dir for Phase 2 "
-             "quantized models (auto-detects static from quantize_config.json).",
+             "'naive_int8', 'gptq', 'w4a8', 'w4a8_static', 'w4a8_poly'. "
+             "Use 'fp16_p2' for FP16 baseline with Phase 2 pipeline settings. "
+             "Use 'w4a8_poly' with --quantized-dir for Phase 2+3(+4) models "
+             "with polynomial clipping (auto-detects static from config). "
+             "Use 'w4a8' / 'w4a8_static' for Phase 2-only models.",
     )
     parser.add_argument("--gptq-dir", type=Path, default=None,
                         help="GPTQ output dir (from src.gptq.optimize). "
@@ -1474,6 +1521,13 @@ def main() -> None:
                         help="Override generated image dir for metrics phase")
     parser.add_argument("--baseline-dir", type=Path, default=None,
                         help="FP16 baseline image dir for paired metrics (PSNR + LPIPS)")
+    parser.add_argument("--ground-truth-dir", type=Path, default=None,
+                        help="Ground truth image dir. When set, FID/IS are computed for "
+                             "both generated and --fp16-dir images against this directory.")
+    parser.add_argument("--fp16-dir", type=Path, default=None,
+                        help="FP16 image dir for ground-truth comparison. When combined "
+                             "with --ground-truth-dir, computes FID/IS for FP16 images "
+                             "against ground truth alongside the W4A8 comparison.")
     parser.add_argument("--skip-clip-metrics", action="store_true",
                         help="Skip CLIP-based metrics (PRDC + CMMD)")
     parser.add_argument("--skip-paired-metrics", action="store_true",
@@ -1500,10 +1554,11 @@ def main() -> None:
 
     if args.gptq_dir is not None and args.adaround_output is not None:
         parser.error("--gptq-dir and --adaround-output are mutually exclusive")
-    if args.config in ("w4a8", "w4a8_static") and args.quantized_dir is None:
-        parser.error("--quantized-dir is required when --config w4a8 or w4a8_static")
-    if args.quantized_dir is not None and args.config not in ("w4a8", "w4a8_static"):
-        parser.error("--quantized-dir requires --config w4a8 or w4a8_static")
+    _w4a8_configs = ("w4a8", "w4a8_static", "w4a8_poly")
+    if args.config in _w4a8_configs and args.quantized_dir is None:
+        parser.error(f"--quantized-dir is required when --config {args.config}")
+    if args.quantized_dir is not None and args.config not in _w4a8_configs:
+        parser.error(f"--quantized-dir requires --config in {_w4a8_configs}")
 
     prompt_csv = args.prompt_csv or (_REPO / "src" / "settings" / "evaluation_set.txt")
     output_dir = args.output_dir
@@ -1567,7 +1622,7 @@ def main() -> None:
             gptq_dir=args.gptq_dir,
             reload_n=args.reload_n,
             quantized_dir=args.quantized_dir,
-            img_digits=3 if args.config in ("w4a8", "w4a8_static", "fp16_p2") else 4,
+            img_digits=3 if args.config in ("w4a8", "w4a8_static", "w4a8_poly", "fp16_p2") else 4,
         )
 
         # Compute model size once after generation (pipeline discarded per-image;
@@ -1677,6 +1732,80 @@ def main() -> None:
             paired_result["baseline_dir"] = str(base_dir)
 
     # ------------------------------------------------------------------
+    # Ground truth comparison (FID / IS for generated + FP16 vs GT)
+    # ------------------------------------------------------------------
+    gt_result: Optional[Dict] = None
+    if args.ground_truth_dir is not None:
+        gt_dir = args.ground_truth_dir
+        if not gt_dir.exists():
+            print(f"WARNING: ground_truth_dir {gt_dir} does not exist — skipping GT metrics")
+        else:
+            gt_result = {}
+
+            # W4A8 (generated) vs ground truth
+            gen_dir = generated_dir
+            if gen_dir.exists():
+                n_gen = len(_list_images(gen_dir))
+                n_gt = len(_list_images(gt_dir))
+                print(f"\n=== Ground truth: W4A8 vs GT "
+                      f"({n_gen} generated vs {n_gt} GT) ===")
+                w4a8_gt = compute_fidelity_metrics(gen_dir, gt_dir)
+                if w4a8_gt is not None:
+                    gt_result["w4a8_vs_gt"] = {
+                        **w4a8_gt,
+                        "num_generated": n_gen,
+                        "num_gt": n_gt,
+                    }
+                    print(f"  W4A8 FID:  {w4a8_gt['fid']:.4f}")
+                    print(f"  W4A8 IS:   {w4a8_gt['isc_mean']:.2f} "
+                          f"± {w4a8_gt['isc_std']:.2f}")
+
+                sfid_w4a8 = compute_sfid(str(gen_dir), str(gt_dir))
+                if sfid_w4a8 is not None:
+                    if "w4a8_vs_gt" not in gt_result:
+                        gt_result["w4a8_vs_gt"] = {"num_generated": n_gen, "num_gt": n_gt}
+                    gt_result["w4a8_vs_gt"]["sfid"] = sfid_w4a8
+                    print(f"  W4A8 sFID: {sfid_w4a8:.4f}")
+            else:
+                print(f"WARNING: generated_dir {gen_dir} does not exist — "
+                      "skipping W4A8 vs GT")
+
+            # FP16 vs ground truth
+            if args.fp16_dir is not None:
+                fp16_dir = args.fp16_dir
+                if not fp16_dir.exists():
+                    print(f"WARNING: fp16_dir {fp16_dir} does not exist — "
+                          "skipping FP16 vs GT")
+                else:
+                    n_fp16 = len(_list_images(fp16_dir))
+                    n_gt = len(_list_images(gt_dir))
+                    print(f"\n=== Ground truth: FP16 vs GT "
+                          f"({n_fp16} FP16 vs {n_gt} GT) ===")
+                    fp16_gt = compute_fidelity_metrics(fp16_dir, gt_dir)
+                    if fp16_gt is not None:
+                        gt_result["fp16_vs_gt"] = {
+                            **fp16_gt,
+                            "num_fp16": n_fp16,
+                            "num_gt": n_gt,
+                            "fp16_dir": str(fp16_dir),
+                        }
+                        print(f"  FP16 FID:  {fp16_gt['fid']:.4f}")
+                        print(f"  FP16 IS:   {fp16_gt['isc_mean']:.2f} "
+                              f"± {fp16_gt['isc_std']:.2f}")
+
+                    sfid_fp16 = compute_sfid(str(fp16_dir), str(gt_dir))
+                    if sfid_fp16 is not None:
+                        if "fp16_vs_gt" not in gt_result:
+                            gt_result["fp16_vs_gt"] = {
+                                "num_fp16": n_fp16, "num_gt": n_gt,
+                                "fp16_dir": str(fp16_dir),
+                            }
+                        gt_result["fp16_vs_gt"]["sfid"] = sfid_fp16
+                        print(f"  FP16 sFID: {sfid_fp16:.4f}")
+
+            gt_result["ground_truth_dir"] = str(gt_dir)
+
+    # ------------------------------------------------------------------
     # Phase 4 — Cumulative checkpoint metrics (every --eval-interval images)
     # ------------------------------------------------------------------
     checkpoints: Optional[Dict] = None
@@ -1745,6 +1874,7 @@ def main() -> None:
         "model": model_stats,
         "fidelity": fidelity_result,
         "paired": paired_result,
+        "ground_truth": gt_result,
     }
 
     json_path = output_dir / "benchmark.json"
@@ -1755,7 +1885,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Console summary
     # ------------------------------------------------------------------
-    _print_results(args.config, lat_stats, memory_stats, fidelity_result, paired=paired_result)
+    _print_results(args.config, lat_stats, memory_stats, fidelity_result,
+                   paired=paired_result, gt=gt_result)
     print("\n✓ Complete")
 
 
