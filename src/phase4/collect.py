@@ -1,17 +1,20 @@
-"""Phase 4 data collection: capture linear-layer input tensors.
+"""Phase 4 data collection: capture block-level I/O for AdaRound reconstruction.
 
-Installs lightweight wrappers on every target nn.Linear, runs N calibration
-prompts through the CSB-balanced FP16 denoiser, and saves per-layer input
-tensors as NPZ files under ``output_dir/``.
+Installs a lightweight hook on each MMDiT transformer block, runs N calibration
+prompts through the CSB-balanced FP16 denoiser, and saves per-block NPZ files.
 
 Storage layout
 --------------
-``output_dir/<layer_name>.npz``  →  array ``inputs`` of shape
-``[n_samples, max_tokens, d_in]`` where ``n_samples = n_prompts × n_steps``
-and ``max_tokens`` is the token-subsampling cap from config.
+``output_dir/block_{idx:02d}/{sample:04d}.npz``
 
-b_inv is NOT applied during collection.  Layers that need it (o_proj, fc2)
-will have b_inv applied during the optimisation step.
+Each NPZ contains:
+  img_in   : (1, seq_img, hidden)  float16
+  txt_in   : (1, seq_txt, hidden)  float16
+  vec      : (1, hidden)           float16  — adaLN conditioning
+  pe       : (...)                 float16  — rotary position embeddings
+  img_out  : (1, seq_img, hidden)  float16
+  txt_out  : (1, seq_txt, hidden)  float16
+  sigma    : ()                    float32  — noise level for this step
 """
 
 from __future__ import annotations
@@ -29,137 +32,140 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Input-capture wrapper
+# Block I/O capture hook
 # ---------------------------------------------------------------------------
 
-class _InputCapture:
-    """Wraps an nn.Linear to record input tensors (without b_inv scaling)."""
+class _BlockCapture:
+    """Wraps a transformer block to record (inputs, outputs) per denoising step."""
 
-    def __init__(self, linear: Any, max_tokens: int = 64):
-        self._linear = linear
-        self._max_tokens = max_tokens
-        self._inputs: list[np.ndarray] = []
+    def __init__(self, block: Any):
+        self._block = block
+        self.samples: list[dict] = []
+        self._current_sigma: float = 0.0
 
-    def __call__(self, x: mx.array) -> mx.array:
-        if x.ndim == 3:
-            t = min(x.shape[1], self._max_tokens)
-            self._inputs.append(np.array(x[:, :t, :], dtype=np.float16))
-        else:
-            t = min(x.shape[0], self._max_tokens)
-            self._inputs.append(np.array(x[:t, :], dtype=np.float16))
-        return self._linear(x)
+    def __call__(self, img: mx.array, txt: mx.array, vec: mx.array, pe: mx.array) -> tuple:
+        out = self._block(img, txt, vec, pe)
+        img_out, txt_out = out
+        self.samples.append({
+            "img_in":  np.array(img,     dtype=np.float16),
+            "txt_in":  np.array(txt,     dtype=np.float16),
+            "vec":     np.array(vec,     dtype=np.float16),
+            "pe":      np.array(pe,      dtype=np.float16),
+            "img_out": np.array(img_out, dtype=np.float16),
+            "txt_out": np.array(txt_out, dtype=np.float16),
+            "sigma":   np.float32(self._current_sigma),
+        })
+        return out
 
-    # Proxy attributes so the rest of the model sees a normal linear
-    @property
-    def weight(self):
-        return self._linear.weight
-
-    @property
-    def bias(self):
-        return getattr(self._linear, "bias", None)
-
+    # Proxy attributes so pipeline internals can introspect the block
     def parameters(self):
-        return self._linear.parameters()
+        return self._block.parameters()
 
     def trainable_parameters(self):
-        return self._linear.trainable_parameters()
+        return self._block.trainable_parameters()
 
 
 # ---------------------------------------------------------------------------
-# Navigate to parent (mirrors phase2/quantize.py)
+# Sigma tracking hook on the MMDiT forward
 # ---------------------------------------------------------------------------
 
-def _navigate_to_parent(mmdit, name: str):
-    if name == "context_embedder":
-        return mmdit, "context_embedder"
-    if name == "final_layer.linear":
-        return mmdit.final_layer, "linear"
-    parts = name.split(".")
-    bidx = int(parts[1])
-    side = parts[2]
-    block = mmdit.multimodal_transformer_blocks[bidx]
-    tb = (
-        block.image_transformer_block
-        if side == "image"
-        else block.text_transformer_block
-    )
-    parent = tb
-    for part in parts[3:-1]:
-        parent = getattr(parent, part)
-    return parent, parts[-1]
+class _SigmaTracker:
+    """Wraps mmdit.__call__ to read the per-step sigma and push it to captures."""
+
+    def __init__(self, mmdit: Any, captures: list[_BlockCapture]):
+        self._mmdit = mmdit
+        self._captures = captures
+        self._original_call = mmdit.__class__.__call__
+
+    def install(self) -> None:
+        """Patch mmdit.__call__ to extract sigma before each denoising step."""
+        captures = self._captures
+        original_call = self._mmdit.__call__
+
+        def _patched(*args, **kwargs):
+            # DiffusionKit passes timestep as a positional or keyword arg.
+            # Sigma = timestep / 1000 (sampler convention: timestep = sigma * 1000)
+            ts = kwargs.get("timestep", None)
+            if ts is None and len(args) > 2:
+                ts = args[2]
+            if ts is not None:
+                sigma = float(mx.mean(mx.array(ts)).item()) / 1000.0
+                for cap in captures:
+                    cap._current_sigma = sigma
+            return original_call(*args, **kwargs)
+
+        self._mmdit.__call__ = _patched
+        self._patched_call = _patched
+
+    def remove(self) -> None:
+        self._mmdit.__call__ = self._mmdit.__class__.__call__.__get__(self._mmdit)
 
 
 # ---------------------------------------------------------------------------
 # Hook install / remove
 # ---------------------------------------------------------------------------
 
-def install_capture_hooks(
-    mmdit,
-    registry: list[dict],
-    max_tokens: int,
-) -> dict[str, _InputCapture]:
-    """Wrap every target nn.Linear with an _InputCapture."""
-    hooks: dict[str, _InputCapture] = {}
-    for entry in registry:
-        name = entry["name"]
-        module = entry.get("module")
-        if module is None:
-            continue
-        parent, attr = _navigate_to_parent(mmdit, name)
-        capture = _InputCapture(getattr(parent, attr), max_tokens=max_tokens)
-        setattr(parent, attr, capture)
-        hooks[name] = capture
-    logger.info("Installed capture hooks on %d layers", len(hooks))
-    return hooks
+def install_block_hooks(mmdit) -> dict[int, _BlockCapture]:
+    """Wrap every multimodal_transformer_block with a _BlockCapture."""
+    captures: dict[int, _BlockCapture] = {}
+    for i, block in enumerate(mmdit.multimodal_transformer_blocks):
+        cap = _BlockCapture(block)
+        mmdit.multimodal_transformer_blocks[i] = cap
+        captures[i] = cap
+    logger.info("Installed block hooks on %d blocks", len(captures))
+    return captures
 
 
-def remove_capture_hooks(
-    mmdit,
-    registry: list[dict],
-    hooks: dict[str, _InputCapture],
-) -> None:
-    """Restore original nn.Linear modules."""
-    for entry in registry:
-        name = entry["name"]
-        if name not in hooks:
-            continue
-        parent, attr = _navigate_to_parent(mmdit, name)
-        setattr(parent, attr, hooks[name]._linear)
-    logger.info("Removed %d capture hooks", len(hooks))
+def remove_block_hooks(mmdit, captures: dict[int, _BlockCapture]) -> None:
+    """Restore original transformer blocks."""
+    for i, cap in captures.items():
+        mmdit.multimodal_transformer_blocks[i] = cap._block
+    logger.info("Removed %d block hooks", len(captures))
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+def save_block_samples(captures: dict[int, _BlockCapture], output_dir: Path) -> None:
+    """Write per-block NPZ files to disk."""
+    for idx, cap in captures.items():
+        block_dir = output_dir / f"block_{idx:02d}"
+        block_dir.mkdir(parents=True, exist_ok=True)
+        for s, sample in enumerate(cap.samples):
+            np.savez_compressed(str(block_dir / f"{s:04d}.npz"), **sample)
+    total = sum(len(c.samples) for c in captures.values())
+    logger.info("Saved %d block samples to %s", total, output_dir)
 
 
 # ---------------------------------------------------------------------------
 # Main collection routine
 # ---------------------------------------------------------------------------
 
-def collect_layer_inputs(
+def collect_block_io(
     pipeline,
-    registry: list[dict],
     pairs: list[tuple[int, str]],
     output_dir: Path,
     config: dict,
 ) -> None:
-    """Run calibration prompts through the denoiser and save per-layer inputs.
+    """Run calibration prompts through the denoiser and save block I/O.
 
     Args:
-        pipeline: Loaded DiffusionPipeline with CSB-balanced FP16 weights.
-        registry: Phase 1/2 layer registry (with ``module`` references).
-        pairs: List of (seed, prompt) calibration pairs.
-        output_dir: Directory to write ``<layer_name>.npz`` files.
-        config: PHASE4_CONFIG dict.
+        pipeline  : DiffusionPipeline with CSB-balanced FP16 weights.
+        pairs     : (seed, prompt) calibration pairs.
+        output_dir: Root directory to write per-block NPZ files.
+        config    : PHASE4_CONFIG dict.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    max_tokens = config["max_tokens_per_sample"]
-    n_steps = config["n_steps"]
+    n_steps   = config["n_steps"]
     cfg_weight = config["cfg_weight"]
 
-    hooks = install_capture_hooks(pipeline.mmdit, registry, max_tokens)
+    captures = install_block_hooks(pipeline.mmdit)
 
     t0 = time.time()
     for idx, (seed, prompt) in enumerate(pairs):
-        logger.info("[%d/%d] seed=%d  prompt=%r", idx + 1, len(pairs), seed, prompt[:60])
-        mx.random.seed(seed)
+        logger.info("[%d/%d] seed=%d  %r", idx + 1, len(pairs), seed, prompt[:60])
         pipeline.generate_image(
             prompt,
             num_steps=n_steps,
@@ -169,21 +175,9 @@ def collect_layer_inputs(
 
     elapsed = time.time() - t0
     logger.info(
-        "Collection finished in %.1f s (%d prompts × %d steps = %d hook calls each)",
+        "Collection finished in %.1f s  (%d prompts × %d steps = %d samples/block)",
         elapsed, len(pairs), n_steps, len(pairs) * n_steps,
     )
 
-    remove_capture_hooks(pipeline.mmdit, registry, hooks)
-
-    # Save per-layer
-    n_saved = 0
-    for name, capture in hooks.items():
-        if not capture._inputs:
-            continue
-        arr = np.concatenate(capture._inputs, axis=0)   # [n_calls, tokens, d_in]
-        out_path = output_dir / f"{name}.npz"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(str(out_path), inputs=arr)
-        n_saved += 1
-
-    logger.info("Saved input tensors for %d layers to %s", n_saved, output_dir)
+    remove_block_hooks(pipeline.mmdit, captures)
+    save_block_samples(captures, output_dir)

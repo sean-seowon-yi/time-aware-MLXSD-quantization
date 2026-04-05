@@ -187,27 +187,26 @@ def main() -> None:
                     cfg["n_steps"])
         logger.info("=" * 60)
 
-        from .collect import collect_layer_inputs
+        from .collect import collect_block_io
 
         pairs = _load_pairs(args.prompts_file, args.num_prompts)
         logger.info("Calibration pairs: %d", len(pairs))
 
         t0 = time.time()
-        collect_layer_inputs(pipeline, registry, pairs, calib_dir, cfg)
+        collect_block_io(pipeline, pairs, calib_dir, cfg)
         logger.info("Collection done in %.1f s", time.time() - t0)
 
     # ===================================================================
     # AdaRound optimisation
     # ===================================================================
     logger.info("=" * 60)
-    logger.info("Running AdaRound (%d iters/layer, lr=%.1e, batch=%d)",
+    logger.info("Running block-wise AdaRound (%d iters/block, lr=%.1e, batch=%d)",
                 cfg["n_iters"], cfg["lr"], cfg["batch_size"])
     logger.info("=" * 60)
 
-    from .optimize import optimize_all_layers
+    from .optimize import optimize_all_blocks
 
-    # Re-apply CSB to get fresh FP16 balanced weights (collection may have
-    # modified the model if W4A8Linear stubs were present; reload clean)
+    # Reload fresh FP16 + CSB for optimisation (collection pipeline is still clean)
     pipeline2 = DiffusionPipeline(
         **PIPELINE_KWARGS,
         model_version=phase2_meta.get("model_version"),
@@ -217,7 +216,7 @@ def main() -> None:
     patch_pipeline_for_quantized_inference(pipeline2)
 
     t0 = time.time()
-    optimize_all_layers(
+    optimize_all_blocks(
         pipeline2, registry2, calibration, calib_dir, phase2_meta, cfg, args.output_dir,
     )
     elapsed = time.time() - t0
