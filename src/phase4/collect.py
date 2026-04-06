@@ -43,8 +43,11 @@ class _BlockCapture:
         self.samples: list[dict] = []
         self._current_sigma: float = 0.0
 
-    def __call__(self, img: mx.array, txt: mx.array, vec: mx.array, pe: mx.array) -> tuple:
-        out = self._block(img, txt, vec, pe)
+    def __call__(self, img: mx.array, txt: mx.array, vec: mx.array,
+                 pe: mx.array = None, *, positional_encodings: mx.array = None) -> tuple:
+        if pe is None:
+            pe = positional_encodings
+        out = self._block(img, txt, vec, positional_encodings=pe)
         img_out, txt_out = out
         self.samples.append({
             "img_in":  np.array(img,     dtype=np.float16),
@@ -58,6 +61,9 @@ class _BlockCapture:
         return out
 
     # Proxy attributes so pipeline internals can introspect the block
+    def __getattr__(self, name: str):
+        return getattr(self._block, name)
+
     def parameters(self):
         return self._block.parameters()
 
@@ -142,6 +148,30 @@ def save_block_samples(captures: dict[int, _BlockCapture], output_dir: Path) -> 
 # Main collection routine
 # ---------------------------------------------------------------------------
 
+def _snapshot_adaln_weights(mmdit) -> list[tuple[str, mx.array]]:
+    """Snapshot all adaLN modulation weights so they can be restored after
+    DiffusionKit's ``cache_modulation_params`` offloads them."""
+    from mlx.utils import tree_flatten
+    return [
+        (k, v) for k, v in tree_flatten(mmdit.parameters())
+        if "adaLN" in k
+    ]
+
+
+def _restore_adaln_weights(mmdit, captures: dict[int, "_BlockCapture"],
+                           snapshot: list[tuple[str, mx.array]]) -> None:
+    """Restore adaLN weights from a snapshot.
+
+    Temporarily swaps the real blocks back into the list so that
+    ``load_weights`` can traverse the module tree normally.
+    """
+    for i, cap in captures.items():
+        mmdit.multimodal_transformer_blocks[i] = cap._block
+    mmdit.load_weights(snapshot, strict=False)
+    for i, cap in captures.items():
+        mmdit.multimodal_transformer_blocks[i] = cap
+
+
 def collect_block_io(
     pipeline,
     pairs: list[tuple[int, str]],
@@ -161,6 +191,13 @@ def collect_block_io(
     n_steps   = config["n_steps"]
     cfg_weight = config["cfg_weight"]
 
+    # Snapshot adaLN weights *before* installing hooks, since
+    # cache_modulation_params offloads them and load_weights can't restore
+    # through _BlockCapture wrappers.
+    adaln_snapshot = _snapshot_adaln_weights(pipeline.mmdit)
+    logger.info("Snapshotted %d adaLN tensors for inter-prompt restoration",
+                len(adaln_snapshot))
+
     captures = install_block_hooks(pipeline.mmdit)
 
     t0 = time.time()
@@ -172,6 +209,11 @@ def collect_block_io(
             cfg_weight=cfg_weight,
             seed=seed,
         )
+        # cache_modulation_params offloads adaLN weights during denoising.
+        # clear_cache (at end of sample_euler) tries to restore them via
+        # load_weights, but that fails to traverse _BlockCapture wrappers.
+        # Restore from our snapshot instead.
+        _restore_adaln_weights(pipeline.mmdit, captures, adaln_snapshot)
 
     elapsed = time.time() - t0
     logger.info(
