@@ -201,7 +201,14 @@ def run_diagnostic_collection(
             mx.eval(x)
 
         pipeline.mmdit.load_weights(_adaln_cache, strict=False)
-        pipeline.mmdit.clear_modulation_params_cache()
+        # MLX nn.Module delattr is broken for dict attrs; reassign to empty instead
+        for _blk in pipeline.mmdit.multimodal_transformer_blocks:
+            if hasattr(_blk.image_transformer_block, "_modulation_params"):
+                _blk.image_transformer_block._modulation_params = {}
+            if hasattr(_blk.text_transformer_block, "_modulation_params"):
+                _blk.text_transformer_block._modulation_params = {}
+        if hasattr(pipeline.mmdit.final_layer, "_modulation_params"):
+            pipeline.mmdit.final_layer._modulation_params = {}
 
         elapsed = time.time() - t0
         logger.info(

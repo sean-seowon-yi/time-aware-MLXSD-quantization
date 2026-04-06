@@ -102,6 +102,8 @@ def main() -> None:
                    help="Adam learning rate (default: 1e-3)")
     p.add_argument("--batch-size", type=int, default=None,
                    help="Calibration samples per iteration (default: 8)")
+    p.add_argument("--blocks", type=str, default=None,
+                   help="Comma-separated block indices to optimize (default: all)")
 
     args = p.parse_args()
 
@@ -192,8 +194,12 @@ def main() -> None:
         pairs = _load_pairs(args.prompts_file, args.num_prompts)
         logger.info("Calibration pairs: %d", len(pairs))
 
+        block_subset = None
+        if args.blocks is not None:
+            block_subset = set(int(b) for b in args.blocks.split(","))
+
         t0 = time.time()
-        collect_block_io(pipeline, pairs, calib_dir, cfg)
+        collect_block_io(pipeline, pairs, calib_dir, cfg, block_subset=block_subset)
         logger.info("Collection done in %.1f s", time.time() - t0)
 
     # ===================================================================
@@ -215,9 +221,15 @@ def main() -> None:
     apply_csb_to_model(pipeline2.mmdit, registry2, calibration)
     patch_pipeline_for_quantized_inference(pipeline2)
 
+    block_subset = None
+    if args.blocks is not None:
+        block_subset = set(int(b) for b in args.blocks.split(","))
+        logger.info("Optimising blocks: %s", sorted(block_subset))
+
     t0 = time.time()
     optimize_all_blocks(
         pipeline2, registry2, calibration, calib_dir, phase2_meta, cfg, args.output_dir,
+        block_subset=block_subset,
     )
     elapsed = time.time() - t0
 

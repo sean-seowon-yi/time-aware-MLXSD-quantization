@@ -35,29 +35,53 @@ logger = logging.getLogger(__name__)
 # Block I/O capture hook
 # ---------------------------------------------------------------------------
 
-class _BlockCapture:
-    """Wraps a transformer block to record (inputs, outputs) per denoising step."""
+def _to_f16_safe(arr: mx.array) -> np.ndarray:
+    """Convert to float16, clipping values that would overflow."""
+    a = np.array(arr, dtype=np.float32)
+    return np.clip(a, -65504, 65504).astype(np.float16)
 
-    def __init__(self, block: Any):
+
+class _BlockCapture:
+    """Wraps a transformer block, streaming I/O samples directly to disk.
+
+    Avoids accumulating float32 tensors in RAM (which OOMs for many blocks).
+    """
+
+    def __init__(self, block: Any, output_dir: Path):
         self._block = block
-        self.samples: list[dict] = []
+        self._output_dir = output_dir
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._sample_idx: int = 0
         self._current_sigma: float = 0.0
 
     def __call__(self, img: mx.array, txt: mx.array, vec: mx.array,
                  pe: mx.array = None, *, positional_encodings: mx.array = None) -> tuple:
         if pe is None:
             pe = positional_encodings
+
+        # Grab pre-computed modulation params (set by cache_modulation_params)
+        itb = self._block.image_transformer_block
+        ttb = self._block.text_transformer_block
+        ts_key = float(vec[0]) if vec.size > 1 else float(vec)
+        img_mod = _to_f16_safe(itb._modulation_params[ts_key])
+        txt_mod = _to_f16_safe(ttb._modulation_params[ts_key])
+
         out = self._block(img, txt, vec, positional_encodings=pe)
         img_out, txt_out = out
-        self.samples.append({
-            "img_in":  np.array(img,     dtype=np.float16),
-            "txt_in":  np.array(txt,     dtype=np.float16),
-            "vec":     np.array(vec,     dtype=np.float16),
-            "pe":      np.array(pe,      dtype=np.float16),
-            "img_out": np.array(img_out, dtype=np.float16),
-            "txt_out": np.array(txt_out, dtype=np.float16),
-            "sigma":   np.float32(self._current_sigma),
-        })
+
+        np.savez(
+            str(self._output_dir / f"{self._sample_idx:04d}.npz"),
+            img_in=np.array(img,      dtype=np.float16),
+            txt_in=_to_f16_safe(txt),
+            vec=np.array(vec,         dtype=np.float32),
+            pe=np.array(pe,           dtype=np.float16),
+            img_out=np.array(img_out, dtype=np.float16),
+            txt_out=_to_f16_safe(txt_out),
+            img_mod=img_mod,
+            txt_mod=txt_mod,
+            sigma=np.float32(self._current_sigma),
+        )
+        self._sample_idx += 1
         return out
 
     # Proxy attributes so pipeline internals can introspect the block
@@ -111,14 +135,21 @@ class _SigmaTracker:
 # Hook install / remove
 # ---------------------------------------------------------------------------
 
-def install_block_hooks(mmdit) -> dict[int, _BlockCapture]:
-    """Wrap every multimodal_transformer_block with a _BlockCapture."""
+def install_block_hooks(mmdit, output_dir: Path,
+                        block_subset: set[int] | None = None) -> dict[int, _BlockCapture]:
+    """Wrap transformer blocks with _BlockCapture.
+
+    If *block_subset* is given, only those blocks are captured (saves disk).
+    """
     captures: dict[int, _BlockCapture] = {}
     for i, block in enumerate(mmdit.multimodal_transformer_blocks):
-        cap = _BlockCapture(block)
+        if block_subset is not None and i not in block_subset:
+            continue
+        cap = _BlockCapture(block, output_dir / f"block_{i:02d}")
         mmdit.multimodal_transformer_blocks[i] = cap
         captures[i] = cap
-    logger.info("Installed block hooks on %d blocks", len(captures))
+    logger.info("Installed block hooks on %d / %d blocks",
+                len(captures), len(mmdit.multimodal_transformer_blocks))
     return captures
 
 
@@ -133,15 +164,9 @@ def remove_block_hooks(mmdit, captures: dict[int, _BlockCapture]) -> None:
 # Persistence
 # ---------------------------------------------------------------------------
 
-def save_block_samples(captures: dict[int, _BlockCapture], output_dir: Path) -> None:
-    """Write per-block NPZ files to disk."""
-    for idx, cap in captures.items():
-        block_dir = output_dir / f"block_{idx:02d}"
-        block_dir.mkdir(parents=True, exist_ok=True)
-        for s, sample in enumerate(cap.samples):
-            np.savez_compressed(str(block_dir / f"{s:04d}.npz"), **sample)
-    total = sum(len(c.samples) for c in captures.values())
-    logger.info("Saved %d block samples to %s", total, output_dir)
+def _count_saved_samples(captures: dict[int, _BlockCapture]) -> int:
+    """Count total samples written to disk across all captures."""
+    return sum(cap._sample_idx for cap in captures.values())
 
 
 # ---------------------------------------------------------------------------
@@ -177,14 +202,16 @@ def collect_block_io(
     pairs: list[tuple[int, str]],
     output_dir: Path,
     config: dict,
+    block_subset: set[int] | None = None,
 ) -> None:
     """Run calibration prompts through the denoiser and save block I/O.
 
     Args:
-        pipeline  : DiffusionPipeline with CSB-balanced FP16 weights.
-        pairs     : (seed, prompt) calibration pairs.
-        output_dir: Root directory to write per-block NPZ files.
-        config    : PHASE4_CONFIG dict.
+        pipeline     : DiffusionPipeline with CSB-balanced FP16 weights.
+        pairs        : (seed, prompt) calibration pairs.
+        output_dir   : Root directory to write per-block NPZ files.
+        config       : PHASE4_CONFIG dict.
+        block_subset : If given, only capture these block indices.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -198,11 +225,14 @@ def collect_block_io(
     logger.info("Snapshotted %d adaLN tensors for inter-prompt restoration",
                 len(adaln_snapshot))
 
-    captures = install_block_hooks(pipeline.mmdit)
+    captures = install_block_hooks(pipeline.mmdit, output_dir, block_subset)
+
+    from tqdm import tqdm
 
     t0 = time.time()
-    for idx, (seed, prompt) in enumerate(pairs):
-        logger.info("[%d/%d] seed=%d  %r", idx + 1, len(pairs), seed, prompt[:60])
+    pbar = tqdm(pairs, desc="Collecting", unit="prompt")
+    for idx, (seed, prompt) in enumerate(pbar):
+        pbar.set_postfix_str(f"seed={seed}  {prompt[:40]}")
         pipeline.generate_image(
             prompt,
             num_steps=n_steps,
@@ -216,10 +246,11 @@ def collect_block_io(
         _restore_adaln_weights(pipeline.mmdit, captures, adaln_snapshot)
 
     elapsed = time.time() - t0
+    total = _count_saved_samples(captures)
     logger.info(
-        "Collection finished in %.1f s  (%d prompts × %d steps = %d samples/block)",
-        elapsed, len(pairs), n_steps, len(pairs) * n_steps,
+        "Collection finished in %.1f s  (%d prompts × %d steps = %d samples/block, "
+        "%d total written to %s)",
+        elapsed, len(pairs), n_steps, len(pairs) * n_steps, total, output_dir,
     )
 
     remove_block_hooks(pipeline.mmdit, captures)
-    save_block_samples(captures, output_dir)

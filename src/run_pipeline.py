@@ -117,11 +117,14 @@ def _parse_args():
     p.add_argument("--per-channel-rho-threshold", type=float, default=None)
 
     # --- Phase 4 args ---
-    p.add_argument("--num-prompts-gptq", type=int, default=16,
-                    help="Number of prompts for Phase 4 Hessian collection")
-    p.add_argument("--gptq-block-size", type=int, default=128)
-    p.add_argument("--gptq-damp-percent", type=float, default=0.01)
-    p.add_argument("--raw-hessian", action="store_true")
+    p.add_argument("--num-prompts-adaround", type=int, default=16,
+                    help="Number of prompts for Phase 4 AdaRound calibration")
+    p.add_argument("--adaround-iters", type=int, default=None,
+                    help="AdaRound iterations per block (default: 1000)")
+    p.add_argument("--adaround-lr", type=float, default=None,
+                    help="AdaRound Adam learning rate (default: 1e-3)")
+    p.add_argument("--adaround-batch-size", type=int, default=None,
+                    help="Calibration samples per AdaRound iter (default: 8)")
 
     # --- Misc ---
     p.add_argument("--dry-run", action="store_true",
@@ -270,7 +273,7 @@ def main():
             return rc
 
     # ------------------------------------------------------------------
-    # Phase 4: GPTQ
+    # Phase 4: AdaRound
     # ------------------------------------------------------------------
     if "phase4" in phases_to_run:
         if quantized_dir is None:
@@ -279,22 +282,25 @@ def main():
                 logger.error("--quantized-dir required for Phase 4")
                 return 1
 
+        adaround_out = str(Path(quantized_dir).parent / (Path(quantized_dir).name + "_adaround"))
         cmd = [
             py, "-m", "src.phase4.run_phase4",
-            "--quantized-dir", quantized_dir,
+            "--phase2-dir", quantized_dir,
             "--prompts-file", args.prompts_file,
-            "--num-prompts", str(args.num_prompts_gptq),
-            "--block-size", str(args.gptq_block_size),
-            "--damp-percent", str(args.gptq_damp_percent),
+            "--num-prompts", str(args.num_prompts_adaround),
+            "--output-dir", adaround_out,
         ]
-        if args.bits is not None:
-            cmd += ["--bits", str(args.bits)]
-        if args.raw_hessian:
-            cmd.append("--raw-hessian")
+        if args.adaround_iters is not None:
+            cmd += ["--n-iters", str(args.adaround_iters)]
+        if args.adaround_lr is not None:
+            cmd += ["--lr", str(args.adaround_lr)]
+        if args.adaround_batch_size is not None:
+            cmd += ["--batch-size", str(args.adaround_batch_size)]
 
         rc = _run(cmd, args.dry_run)
         if rc != 0:
             return rc
+        quantized_dir = adaround_out
 
     logger.info("=" * 60)
     logger.info("Pipeline complete!")

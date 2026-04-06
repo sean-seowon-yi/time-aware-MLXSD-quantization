@@ -242,13 +242,19 @@ def main():
         timesteps = pipeline.sampler.timestep(sigmas).astype(pipeline.activation_dtype)
         pipeline.mmdit.cache_modulation_params(pooled_conditioning, timesteps)
         adaln_stats = collect_adaln_stats(pipeline.mmdit)
-        pipeline.mmdit.clear_modulation_params_cache()
+        for _blk in pipeline.mmdit.multimodal_transformer_blocks:
+            if hasattr(_blk.image_transformer_block, "_modulation_params"):
+                _blk.image_transformer_block._modulation_params = {}
+            if hasattr(_blk.text_transformer_block, "_modulation_params"):
+                _blk.text_transformer_block._modulation_params = {}
+        if hasattr(pipeline.mmdit.final_layer, "_modulation_params"):
+            pipeline.mmdit.final_layer._modulation_params = {}
 
         remove_hooks(hooks)
 
         pipeline.mmdit.load_weights(adaln_cache, strict=False)
         if hasattr(pipeline.mmdit, "to_offload"):
-            delattr(pipeline.mmdit, "to_offload")
+            pipeline.mmdit.to_offload = []
 
         save_activation_stats(collector, registry, diagnostics_dir / "activation_stats")
         save_adaln_stats(adaln_stats, diagnostics_dir)

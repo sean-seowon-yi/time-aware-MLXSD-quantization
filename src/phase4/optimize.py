@@ -197,7 +197,9 @@ def _optimize_block(
         return {}
 
     samples = [np.load(str(f)) for f in sample_files]
-    logger.info("Block %02d: %d samples", block_idx, len(samples))
+    has_modulation = "img_mod" in samples[0] if samples else False
+    logger.info("Block %02d: %d samples (modulation=%s)", block_idx, len(samples),
+                "saved" if has_modulation else "missing")
 
     img_tb = block.image_transformer_block
     txt_tb = block.text_transformer_block
@@ -226,6 +228,20 @@ def _optimize_block(
     # --- Optimiser ---
     optimizer = optim.Adam(learning_rate=lr)
 
+    # Pre-initialise _modulation_params dicts on the transformer sub-blocks.
+    # cache_modulation_params (which normally fills these) is not called during
+    # optimisation — we set the per-sample modulation saved during collection.
+    if not has_modulation:
+        raise RuntimeError(
+            f"Block {block_idx:02d}: calibration samples missing 'img_mod'/'txt_mod'. "
+            f"Re-run collection (remove --skip-collection) to capture modulation params."
+        )
+
+    if not hasattr(img_tb, "_modulation_params"):
+        img_tb._modulation_params = {}
+    if not hasattr(txt_tb, "_modulation_params"):
+        txt_tb._modulation_params = {}
+
     def loss_fn(block_ref: Any) -> mx.array:
         batch_idx = np.random.randint(0, len(samples), size=batch_size)
         total_loss = mx.array(0.0)
@@ -238,6 +254,11 @@ def _optimize_block(
             img_tgt = mx.array(s["img_out"], dtype=mx.float32)
             txt_tgt = mx.array(s["txt_out"], dtype=mx.float32)
 
+            # Set modulation params for this sample so pre_sdpa can look them up
+            ts_key = float(vec[0]) if vec.size > 1 else float(vec)
+            img_tb._modulation_params[ts_key] = mx.array(s["img_mod"], dtype=mx.float32)
+            txt_tb._modulation_params[ts_key] = mx.array(s["txt_mod"], dtype=mx.float32)
+
             img_pred, txt_pred = block_ref(img_in, txt_in, vec, pe)
             img_pred = img_pred.astype(mx.float32)
             txt_pred = txt_pred.astype(mx.float32)
@@ -248,16 +269,33 @@ def _optimize_block(
 
     loss_and_grad = nn.value_and_grad(block, loss_fn)
 
+    from tqdm import tqdm
+
+    n_nan = 0
     t0 = time.time()
-    for step in range(1, n_iters + 1):
+    pbar = tqdm(range(1, n_iters + 1), desc=f"  Block {block_idx:02d}", unit="it", leave=True)
+    for step in pbar:
         loss, grads = loss_and_grad(block)
+        loss_val = float(loss.item())
+
+        if not np.isfinite(loss_val):
+            n_nan += 1
+            old_lr = float(optimizer.learning_rate.item()) if hasattr(optimizer.learning_rate, 'item') else float(optimizer.learning_rate)
+            new_lr = old_lr * 0.5
+            pbar.set_postfix_str(f"NaN! lr={new_lr:.1e}")
+            optimizer = optim.Adam(learning_rate=new_lr)
+            mx.eval(optimizer.state)
+            continue
+
         optimizer.update(block, grads)
         mx.eval(block, optimizer.state)
 
-        if step % 200 == 0 or step == 1:
-            logger.info("  block %02d  step %4d/%d  loss=%.5f", block_idx, step, n_iters, float(loss.item()))
+        if step % 50 == 0 or step == 1:
+            pbar.set_postfix_str(f"loss={loss_val:.5f}")
 
-    logger.info("  block %02d  done in %.1f s", block_idx, time.time() - t0)
+    if n_nan > 0:
+        logger.warning("  block %02d  finished with %d NaN steps", block_idx, n_nan)
+    logger.info("  block %02d  done in %.1f s  final_loss=%.5f", block_idx, time.time() - t0, loss_val)
 
     # --- Extract results and restore original linears ---
     results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None]] = {}
@@ -296,6 +334,7 @@ def optimize_all_blocks(
     phase2_meta: dict,
     config: dict,
     output_dir: Path,
+    block_subset: set[int] | None = None,
 ) -> None:
     """Run AdaRound for every block and save a phase2-compatible checkpoint."""
     from ..phase2.quantize import (
@@ -320,13 +359,18 @@ def optimize_all_blocks(
     n_adaround = 0
     n_rtn      = 0
 
+    from tqdm import tqdm
+
     n_blocks = len(pipeline.mmdit.multimodal_transformer_blocks)
 
-    for block_idx in range(n_blocks):
+    for block_idx in tqdm(range(n_blocks), desc="Blocks", unit="block"):
         block     = pipeline.mmdit.multimodal_transformer_blocks[block_idx]
         block_dir = data_dir / f"block_{block_idx:02d}"
 
-        if not block_dir.exists():
+        if block_subset is not None and block_idx not in block_subset:
+            logger.info("Block %02d: skipped (not in --blocks)", block_idx)
+            block_results = {}
+        elif not block_dir.exists():
             logger.warning("Block %02d: data dir not found (%s) — using RTN", block_idx, block_dir)
             block_results = {}
         else:
