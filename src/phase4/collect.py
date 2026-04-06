@@ -69,18 +69,20 @@ class _BlockCapture:
         out = self._block(img, txt, vec, positional_encodings=pe)
         img_out, txt_out = out
 
-        np.savez(
-            str(self._output_dir / f"{self._sample_idx:04d}.npz"),
-            img_in=np.array(img,      dtype=np.float16),
-            txt_in=_to_f16_safe(txt),
-            vec=np.array(vec,         dtype=np.float32),
-            pe=np.array(pe,           dtype=np.float16),
-            img_out=np.array(img_out, dtype=np.float16),
-            txt_out=_to_f16_safe(txt_out),
-            img_mod=img_mod,
-            txt_mod=txt_mod,
-            sigma=np.float32(self._current_sigma),
-        )
+        arrays = {
+            "img_in":  np.array(img,      dtype=np.float16),
+            "txt_in":  _to_f16_safe(txt),
+            "vec":     np.array(vec,      dtype=np.float32),
+            "pe":      np.array(pe,       dtype=np.float16),
+            "img_out": np.array(img_out,  dtype=np.float16),
+            "img_mod": img_mod,
+            "txt_mod": txt_mod,
+            "sigma":   np.float32(self._current_sigma),
+        }
+        if txt_out is not None:
+            arrays["txt_out"] = _to_f16_safe(txt_out)
+
+        np.savez(str(self._output_dir / f"{self._sample_idx:04d}.npz"), **arrays)
         self._sample_idx += 1
         return out
 

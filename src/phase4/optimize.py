@@ -252,7 +252,7 @@ def _optimize_block(
             vec     = mx.array(s["vec"],     dtype=mx.float32)
             pe      = mx.array(s["pe"],      dtype=mx.float32)
             img_tgt = mx.array(s["img_out"], dtype=mx.float32)
-            txt_tgt = mx.array(s["txt_out"], dtype=mx.float32)
+            txt_tgt = mx.array(s["txt_out"], dtype=mx.float32) if "txt_out" in s else None
 
             # Set modulation params for this sample so pre_sdpa can look them up
             ts_key = float(vec[0]) if vec.size > 1 else float(vec)
@@ -261,10 +261,11 @@ def _optimize_block(
 
             img_pred, txt_pred = block_ref(img_in, txt_in, vec, pe)
             img_pred = img_pred.astype(mx.float32)
-            txt_pred = txt_pred.astype(mx.float32)
-
             total_loss = total_loss + mx.mean((img_pred - img_tgt) ** 2)
-            total_loss = total_loss + mx.mean((txt_pred - txt_tgt) ** 2)
+
+            if txt_pred is not None and txt_tgt is not None:
+                txt_pred = txt_pred.astype(mx.float32)
+                total_loss = total_loss + mx.mean((txt_pred - txt_tgt) ** 2)
         return total_loss / batch_size
 
     loss_and_grad = nn.value_and_grad(block, loss_fn)
