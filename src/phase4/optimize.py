@@ -95,6 +95,59 @@ def _fake_quant_a8(x: mx.array) -> mx.array:
 
 
 # ---------------------------------------------------------------------------
+# AdaRound: rectified sigmoid, alpha init, B-annealing, round loss
+# ---------------------------------------------------------------------------
+
+_GAMMA: float = -0.1   # lower bound of rectified sigmoid
+_ZETA: float = 1.1     # upper bound of rectified sigmoid
+_ROUND_WEIGHT: float = 0.01  # lambda for round_loss
+
+
+def _rectified_sigmoid(alpha: mx.array) -> mx.array:
+    """Smooth rounding mask: clamp((zeta-gamma)*sigmoid(alpha)+gamma, 0, 1)."""
+    return mx.clip((_ZETA - _GAMMA) * mx.sigmoid(alpha) + _GAMMA, 0.0, 1.0)
+
+
+def _init_alpha(W_fp: np.ndarray, scales_exp: np.ndarray) -> np.ndarray:
+    """Initialise alpha so rectified_sigmoid(alpha) ≈ fractional part of W/scale.
+
+    This makes the initial soft weight match the FP16 weight exactly,
+    so the starting loss reflects true quantization error (not RTN).
+    """
+    rest = W_fp / scales_exp - np.floor(W_fp / scales_exp)
+    rest = np.clip(rest, 1e-6, 1.0 - 1e-6)
+    return -np.log((_ZETA - _GAMMA) / (rest - _GAMMA) - 1.0).astype(np.float32)
+
+
+def _round_loss(alphas: list[mx.array], b: float) -> mx.array:
+    """Regularisation that pushes rounding decisions toward 0 or 1."""
+    total = mx.array(0.0)
+    for alpha in alphas:
+        r = _rectified_sigmoid(alpha)
+        total = total + (1.0 - (mx.abs(r - 0.5) * 2.0) ** b).sum()
+    return total
+
+
+class _LinearTempDecay:
+    """Linearly anneals b from start_b to end_b after warm_up fraction."""
+
+    def __init__(self, t_max: int, warm_up: float = 0.2,
+                 start_b: float = 20.0, end_b: float = 2.0):
+        self.start_decay = int(warm_up * t_max)
+        self.t_max = t_max
+        self.start_b = start_b
+        self.end_b = end_b
+
+    def __call__(self, t: int) -> float:
+        if t < self.start_decay:
+            return self.start_b
+        if t >= self.t_max:
+            return self.end_b
+        frac = 1.0 - (t - self.start_decay) / (self.t_max - self.start_decay)
+        return self.end_b + (self.start_b - self.end_b) * frac
+
+
+# ---------------------------------------------------------------------------
 # _QuantProxy: drop-in replacement during AdaRound block optimisation
 # ---------------------------------------------------------------------------
 
@@ -112,10 +165,13 @@ class _QuantProxy(nn.Module):
         floor_w: np.ndarray,
         bias: np.ndarray | None,
         b_inv: np.ndarray | None,
-        alpha_init: float = 0.0,
+        alpha_init: np.ndarray | float = 0.0,
     ):
         super().__init__()
-        self.alpha = mx.full(W_fp.shape, alpha_init, dtype=mx.float32)  # learnable
+        if isinstance(alpha_init, np.ndarray):
+            self.alpha = mx.array(alpha_init, dtype=mx.float32)
+        else:
+            self.alpha = mx.full(W_fp.shape, alpha_init, dtype=mx.float32)
         self._W_fp      = mx.array(W_fp,       dtype=mx.float32)
         self._scales    = mx.array(scales_exp, dtype=mx.float32)
         self._floor_w   = mx.array(floor_w,    dtype=mx.float32)
@@ -128,7 +184,7 @@ class _QuantProxy(nn.Module):
         if self._b_inv is not None:
             x = x * self._b_inv
         x_q = _fake_quant_a8(x)
-        w_soft = (self._floor_w + mx.sigmoid(self.alpha)) * self._scales
+        w_soft = (self._floor_w + _rectified_sigmoid(self.alpha)) * self._scales
         out = x_q @ w_soft.T
         if self._bias is not None:
             out = out + self._bias
@@ -165,7 +221,8 @@ def _get_tb_linears(
         b_inv = b_inv_store.get(layer_name)
 
         scales, floor_w, scales_exp = _compute_quant_params(W_fp, bits, group_size)
-        proxy = _QuantProxy(W_fp, scales_exp, floor_w, bias, b_inv)
+        alpha_init = _init_alpha(W_fp, scales_exp)
+        proxy = _QuantProxy(W_fp, scales_exp, floor_w, bias, b_inv, alpha_init=alpha_init)
         result.append((rel_path, proxy, scales, floor_w))
 
     return result
@@ -291,6 +348,17 @@ def _optimize_block(
     if not hasattr(txt_tb, "_modulation_params"):
         txt_tb._modulation_params = {}
 
+    # B-annealing: round_loss coefficient decays 20→2 after 20% warmup
+    b_schedule = _LinearTempDecay(t_max=n_iters, warm_up=0.2, start_b=20.0, end_b=2.0)
+    current_b = [b_schedule(0)]  # mutable container for closure
+
+    # Paths to proxy modules for round_loss (collect from block_ref at call time)
+    _proxy_paths: list[tuple[Any, str]] = []
+    for rel_path, _, _, _ in img_linears:
+        _proxy_paths.append((img_tb, rel_path))
+    for rel_path, _, _, _ in txt_linears:
+        _proxy_paths.append((txt_tb, rel_path))
+
     def loss_fn(block_ref: Any) -> mx.array:
         batch_idx = np.random.randint(0, len(samples), size=batch_size)
         total_loss = mx.array(0.0)
@@ -315,7 +383,10 @@ def _optimize_block(
             if txt_pred is not None and txt_tgt is not None:
                 txt_pred = txt_pred.astype(mx.float32)
                 total_loss = total_loss + mx.mean((txt_pred - txt_tgt) ** 2)
-        return total_loss / batch_size
+        rec_loss = total_loss / batch_size
+        alphas = [_get_nested(tb, rp).alpha for tb, rp in _proxy_paths]
+        r_loss = _round_loss(alphas, current_b[0])
+        return rec_loss + _ROUND_WEIGHT * r_loss
 
     loss_and_grad = nn.value_and_grad(block, loss_fn)
 
@@ -346,6 +417,7 @@ def _optimize_block(
 
         optimizer.update(block, grads)
         mx.eval(block, optimizer.state)
+        current_b[0] = b_schedule(step)
         all_losses.append(loss_val)
 
         if step % 50 == 0 or step == 1:
