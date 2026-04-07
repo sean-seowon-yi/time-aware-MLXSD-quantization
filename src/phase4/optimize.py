@@ -322,6 +322,13 @@ def _optimize_block(
     from tqdm import tqdm
 
     n_nan = 0
+    loss_val = float("inf")
+    all_losses: list[float] = []
+    avg_window = 50           # steps to average over
+    converge_patience = 3     # consecutive flat averages before early stop
+    converge_rtol = 0.02      # 2% relative improvement threshold
+    flat_count = 0
+    prev_avg = None
     t0 = time.time()
     pbar = tqdm(range(1, n_iters + 1), desc=f"  Block {block_idx:02d}", unit="it", leave=True)
     for step in pbar:
@@ -339,9 +346,24 @@ def _optimize_block(
 
         optimizer.update(block, grads)
         mx.eval(block, optimizer.state)
+        all_losses.append(loss_val)
 
         if step % 50 == 0 or step == 1:
-            pbar.set_postfix_str(f"loss={loss_val:.5f}")
+            cur_avg = np.mean(all_losses[-avg_window:])
+            pbar.set_postfix_str(f"loss={loss_val:.5f} avg={cur_avg:.5f}")
+            logger.info("  block %02d  step %4d/%d  loss=%.5f  avg=%.5f",
+                        block_idx, step, n_iters, loss_val, cur_avg)
+            if prev_avg is not None:
+                rel_improvement = (prev_avg - cur_avg) / max(abs(prev_avg), 1e-8)
+                if rel_improvement < converge_rtol:
+                    flat_count += 1
+                    if flat_count >= converge_patience:
+                        logger.info("  block %02d  converged at step %d (avg stable for %d checks)",
+                                    block_idx, step, converge_patience)
+                        break
+                else:
+                    flat_count = 0
+            prev_avg = cur_avg
 
     if n_nan > 0:
         logger.warning("  block %02d  finished with %d NaN steps", block_idx, n_nan)
