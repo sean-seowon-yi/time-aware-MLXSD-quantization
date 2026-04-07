@@ -6,3 +6,9 @@ jaxtyping
 transformers
 pillow
 sentencepiece
+psutil
+torch-fidelity 
+torchvision 
+scipy 
+open_clip_torch 
+lpips

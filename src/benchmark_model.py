@@ -953,6 +953,19 @@ def _load_pipeline(
         quant_ctx["remove_act_fn"] = remove_dynamic_int8_act_hooks
         return pipeline, quant_ctx
 
+    if config == "naive_w4_poly":
+        if poly_schedule is None:
+            raise ValueError("--poly-schedule is required when --config naive_w4_poly")
+        from src.gptq.inference import (
+            install_act_quant_hooks,
+            remove_act_quant_hooks as _rtn_remove,
+        )
+        inject_weights_naive_int8(pipeline, group_size=group_size, bits=4)
+        hooks = install_act_quant_hooks(pipeline, config={}, poly_schedule=poly_schedule)
+        quant_ctx["gptq_hooks"] = hooks
+        quant_ctx["remove_act_fn"] = lambda _: _rtn_remove(pipeline, hooks)
+        return pipeline, quant_ctx
+
     if config == "gptq_only":
         if gptq_dir is None:
             raise ValueError("--gptq-dir is required when --config gptq_only")
