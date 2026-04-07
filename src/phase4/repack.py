@@ -58,6 +58,35 @@ def repack_to_mlx(
     return packed_mx, mlx_scales, mlx_biases
 
 
+def unpack_from_quantized_linear(
+    qlinear: nn.QuantizedLinear,
+    bits: int,
+    group_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Inverse of build_quantized_linear: extract int8 w_int and symmetric scales.
+
+    Returns:
+        w_int:  (d_out, d_in) int8 — signed quantized weights in [-qmax, qmax].
+        scales: (d_out, n_groups) float32 — per-group symmetric scales.
+    """
+    qmax = 2 ** (bits - 1) - 1
+    n_per_u32 = 32 // bits
+    mask = (1 << bits) - 1
+
+    packed = np.array(qlinear.weight, dtype=np.uint32)  # (d_out, d_in // n_per_u32)
+    d_out = packed.shape[0]
+    d_in = packed.shape[1] * n_per_u32
+
+    q_uint = np.zeros((d_out, d_in), dtype=np.uint8)
+    for k in range(n_per_u32):
+        q_uint[:, k::n_per_u32] = ((packed >> (bits * k)) & mask).astype(np.uint8)
+
+    w_int = q_uint.astype(np.int8) - np.int8(qmax)
+    scales = np.array(qlinear.scales, dtype=np.float32)
+
+    return w_int, scales
+
+
 def build_quantized_linear(
     W_q_int: np.ndarray,
     gptq_scales: np.ndarray,

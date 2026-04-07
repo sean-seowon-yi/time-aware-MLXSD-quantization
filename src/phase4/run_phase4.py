@@ -105,7 +105,16 @@ def main() -> None:
     p.add_argument("--blocks", type=str, default=None,
                    help="Comma-separated block indices to optimize (default: all)")
 
+    # --- Refinement ---
+    p.add_argument("--refine", type=Path, default=None,
+                   help="Path to existing AdaRound checkpoint to refine (continue training)")
+
     args = p.parse_args()
+
+    if args.refine:
+        args.skip_collection = True
+        if args.calibration_dir is None:
+            args.calibration_dir = args.refine / "calibration"
 
     if not args.skip_collection and args.prompts_file is None:
         p.error("--prompts-file is required unless --skip-collection is set")
@@ -212,14 +221,27 @@ def main() -> None:
 
     from .optimize import optimize_all_blocks
 
-    # Reload fresh FP16 + CSB for optimisation (collection pipeline is still clean)
-    pipeline2 = DiffusionPipeline(
-        **PIPELINE_KWARGS,
-        model_version=phase2_meta.get("model_version"),
-    )
-    registry2 = build_layer_registry(pipeline2.mmdit)
-    apply_csb_to_model(pipeline2.mmdit, registry2, calibration)
-    patch_pipeline_for_quantized_inference(pipeline2)
+    refine = args.refine is not None
+
+    if refine:
+        from ..phase2.quantize import load_quantized_model
+        logger.info("Refining from checkpoint: %s", args.refine)
+        pipeline2 = DiffusionPipeline(
+            **PIPELINE_KWARGS,
+            model_version=phase2_meta.get("model_version"),
+        )
+        load_quantized_model(pipeline2, args.refine)
+        # Build registry from the first (fresh) pipeline for metadata
+        registry2 = build_layer_registry(pipeline.mmdit)
+    else:
+        # Reload fresh FP16 + CSB for optimisation (collection pipeline is still clean)
+        pipeline2 = DiffusionPipeline(
+            **PIPELINE_KWARGS,
+            model_version=phase2_meta.get("model_version"),
+        )
+        registry2 = build_layer_registry(pipeline2.mmdit)
+        apply_csb_to_model(pipeline2.mmdit, registry2, calibration)
+        patch_pipeline_for_quantized_inference(pipeline2)
 
     block_subset = None
     if args.blocks is not None:
@@ -230,18 +252,19 @@ def main() -> None:
     optimize_all_blocks(
         pipeline2, registry2, calibration, calib_dir, phase2_meta, cfg, args.output_dir,
         block_subset=block_subset,
+        refine=refine,
     )
     elapsed = time.time() - t0
 
+    mode = "REFINE" if refine else "COMPLETE"
+    sep = "=" * 60
     logger.info(
-        "\n" + "=" * 60 + "\n"
-        "  PHASE 4 COMPLETE\n"
-        "=" * 60 + "\n"
+        "\n%s\n  PHASE 4 %s\n%s\n"
         "  Optimisation time:  %.1f s (%.1f min)\n"
         "  Iters per layer:    %d\n"
         "  Calibration data:   %s\n"
         "  Output:             %s",
-        elapsed, elapsed / 60,
+        sep, mode, sep, elapsed, elapsed / 60,
         cfg["n_iters"], calib_dir, args.output_dir,
     )
 

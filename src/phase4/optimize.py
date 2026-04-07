@@ -31,7 +31,7 @@ import mlx.optimizers as optim
 import numpy as np
 
 from ..phase2.quantize import W4A8Linear
-from .repack import build_quantized_linear
+from .repack import build_quantized_linear, unpack_from_quantized_linear
 
 logger = logging.getLogger(__name__)
 
@@ -112,9 +112,10 @@ class _QuantProxy(nn.Module):
         floor_w: np.ndarray,
         bias: np.ndarray | None,
         b_inv: np.ndarray | None,
+        alpha_init: float = 0.0,
     ):
         super().__init__()
-        self.alpha = mx.zeros(W_fp.shape, dtype=mx.float32)   # learnable
+        self.alpha = mx.full(W_fp.shape, alpha_init, dtype=mx.float32)  # learnable
         self._W_fp      = mx.array(W_fp,       dtype=mx.float32)
         self._scales    = mx.array(scales_exp, dtype=mx.float32)
         self._floor_w   = mx.array(floor_w,    dtype=mx.float32)
@@ -170,6 +171,49 @@ def _get_tb_linears(
     return result
 
 
+def _get_tb_linears_from_checkpoint(
+    tb: Any,
+    b_inv_store: dict[str, np.ndarray],
+    layer_prefix: str,
+    bits: int,
+    group_size: int,
+) -> list[tuple[str, _QuantProxy, np.ndarray, np.ndarray]]:
+    """Build _QuantProxy from an already-quantized W4A8Linear (for --refine).
+
+    Unpacks the existing quantized weights and uses them as floor_w.
+    """
+    result = []
+    for rel_path in _LINEAR_PATHS:
+        try:
+            layer = _get_nested(tb, rel_path)
+        except AttributeError:
+            continue
+        if not hasattr(layer, "qlinear"):
+            continue
+
+        w_int, scales = unpack_from_quantized_linear(layer.qlinear, bits, group_size)
+        d_out, d_in = w_int.shape
+        n_groups = scales.shape[1]
+        scales_exp = np.repeat(scales, group_size, axis=1)[:, :d_in]
+
+        floor_w = w_int.astype(np.float32)
+        W_fp = floor_w * scales_exp  # dequantized approximation (placeholder)
+
+        bias = np.array(layer.qlinear.bias) if getattr(layer.qlinear, "bias", None) is not None else None
+        layer_name = f"{layer_prefix}.{rel_path}"
+        b_inv = None
+        if hasattr(layer, "b_inv"):
+            b_inv = np.array(layer.b_inv, dtype=np.float32)
+        elif layer_name in b_inv_store:
+            b_inv = b_inv_store[layer_name]
+
+        # alpha_init=-5 so sigmoid(-5)≈0.007 — initial weights match checkpoint
+        proxy = _QuantProxy(W_fp, scales_exp, floor_w, bias, b_inv, alpha_init=-5.0)
+        result.append((rel_path, proxy, scales, floor_w))
+
+    return result
+
+
 def _optimize_block(
     block_idx: int,
     block: Any,
@@ -177,6 +221,7 @@ def _optimize_block(
     b_inv_store: dict[str, np.ndarray],
     phase2_meta: dict,
     config: dict,
+    refine: bool = False,
 ) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None]]:
     """Run AdaRound for all linears in one multimodal transformer block.
 
@@ -207,8 +252,12 @@ def _optimize_block(
     img_prefix = f"blocks.{block_idx}.image"
     txt_prefix = f"blocks.{block_idx}.text"
 
-    img_linears = _get_tb_linears(img_tb, b_inv_store, img_prefix, bits, group_size)
-    txt_linears = _get_tb_linears(txt_tb, b_inv_store, txt_prefix, bits, group_size)
+    if refine:
+        img_linears = _get_tb_linears_from_checkpoint(img_tb, b_inv_store, img_prefix, bits, group_size)
+        txt_linears = _get_tb_linears_from_checkpoint(txt_tb, b_inv_store, txt_prefix, bits, group_size)
+    else:
+        img_linears = _get_tb_linears(img_tb, b_inv_store, img_prefix, bits, group_size)
+        txt_linears = _get_tb_linears(txt_tb, b_inv_store, txt_prefix, bits, group_size)
 
     if not img_linears and not txt_linears:
         logger.warning("Block %02d: no quantisable linears found", block_idx)
@@ -336,6 +385,7 @@ def optimize_all_blocks(
     config: dict,
     output_dir: Path,
     block_subset: set[int] | None = None,
+    refine: bool = False,
 ) -> None:
     """Run AdaRound for every block and save a phase2-compatible checkpoint."""
     from ..phase2.quantize import (
@@ -377,6 +427,7 @@ def optimize_all_blocks(
         else:
             block_results = _optimize_block(
                 block_idx, block, block_dir, b_inv_store, phase2_meta, config,
+                refine=refine,
             )
 
         # --- Build W4A8Linear for each layer in this block and inject ---
@@ -398,43 +449,79 @@ def optimize_all_blocks(
             if int(parts[1]) != block_idx:
                 continue
 
-            linear = entry.get("module")
-            if linear is None:
-                continue
-
-            W_fp   = np.array(linear.weight, dtype=np.float32)
-            d_out, d_in = W_fp.shape
-            bias   = np.array(linear.bias) if getattr(linear, "bias", None) is not None else None
-            b_inv  = b_inv_store.get(name)
-            per_token = mean_rhos.get(name, 0.0) > rho_threshold
-
             if name in block_results:
-                w_int, scales, _ = block_results[name]
+                w_int, scales, bias_np = block_results[name]
+                b_inv  = b_inv_store.get(name)
+                per_token = mean_rhos.get(name, 0.0) > rho_threshold
+                d_out, d_in = w_int.shape
+
+                qlinear = build_quantized_linear(w_int, scales, bias_np, layer_bits, group_size)
+                b_inv_mx = mx.array(b_inv, dtype=mx.float32) if b_inv is not None else None
+                w4a8 = W4A8Linear(qlinear, b_inv=b_inv_mx, per_token=per_token)
+
+                parent, attr = _navigate_to_parent(pipeline.mmdit, name)
+                setattr(parent, attr, w4a8)
+
+                layer_meta[name] = {
+                    "d_in": d_in,
+                    "d_out": d_out,
+                    "has_bias": bias_np is not None,
+                    "bits": layer_bits,
+                    "has_b_inv": b_inv is not None,
+                    "per_token": per_token,
+                }
                 n_adaround += 1
+            elif refine:
+                # In refine mode, layer already has W4A8Linear from checkpoint
+                parent, attr = _navigate_to_parent(pipeline.mmdit, name)
+                existing = getattr(parent, attr)
+                if hasattr(existing, "qlinear"):
+                    ql = existing.qlinear
+                    d_in = ql.weight.shape[1] * (32 // layer_bits)
+                    d_out = ql.weight.shape[0]
+                    layer_meta[name] = {
+                        "d_in": d_in,
+                        "d_out": d_out,
+                        "has_bias": getattr(ql, "bias", None) is not None,
+                        "bits": layer_bits,
+                        "has_b_inv": hasattr(existing, "b_inv"),
+                        "per_token": getattr(existing, "_per_token", False),
+                    }
+                n_rtn += 1
             else:
+                linear = entry.get("module")
+                if linear is None:
+                    continue
+
+                W_fp   = np.array(linear.weight, dtype=np.float32)
+                d_out, d_in = W_fp.shape
+                bias   = np.array(linear.bias) if getattr(linear, "bias", None) is not None else None
+                b_inv  = b_inv_store.get(name)
+                per_token = mean_rhos.get(name, 0.0) > rho_threshold
+
                 # RTN fallback
                 scales, _, scales_exp = _compute_quant_params(W_fp, layer_bits, group_size)
                 w_int = np.clip(
                     np.round(W_fp / np.repeat(scales, group_size, axis=1)),
                     -qmax, qmax,
                 ).astype(np.int8)
+
+                qlinear = build_quantized_linear(w_int, scales, bias, layer_bits, group_size)
+                b_inv_mx = mx.array(b_inv, dtype=mx.float32) if b_inv is not None else None
+                w4a8 = W4A8Linear(qlinear, b_inv=b_inv_mx, per_token=per_token)
+
+                parent, attr = _navigate_to_parent(pipeline.mmdit, name)
+                setattr(parent, attr, w4a8)
+
+                layer_meta[name] = {
+                    "d_in": d_in,
+                    "d_out": d_out,
+                    "has_bias": bias is not None,
+                    "bits": layer_bits,
+                    "has_b_inv": b_inv is not None,
+                    "per_token": per_token,
+                }
                 n_rtn += 1
-
-            qlinear = build_quantized_linear(w_int, scales, bias, layer_bits, group_size)
-            b_inv_mx = mx.array(b_inv, dtype=mx.float32) if b_inv is not None else None
-            w4a8 = W4A8Linear(qlinear, b_inv=b_inv_mx, per_token=per_token)
-
-            parent, attr = _navigate_to_parent(pipeline.mmdit, name)
-            setattr(parent, attr, w4a8)
-
-            layer_meta[name] = {
-                "d_in": d_in,
-                "d_out": d_out,
-                "has_bias": bias is not None,
-                "bits": layer_bits,
-                "has_b_inv": b_inv is not None,
-                "per_token": per_token,
-            }
 
         mx.eval(pipeline.mmdit.parameters())
         logger.info("Block %02d injected (%d AdaRound, %d RTN so far)", block_idx, n_adaround, n_rtn)
