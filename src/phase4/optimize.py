@@ -155,7 +155,8 @@ class _QuantProxy(nn.Module):
     """Soft-quantized linear for AdaRound block reconstruction.
 
     Holds the FP16 balanced weights plus learnable rounding offsets (alpha).
-    Activation quantisation uses dynamic A8; b_inv is applied for o_proj/fc2.
+    Activation quantisation uses polynomial clipping when poly_alpha is set,
+    otherwise falls back to dynamic A8. b_inv is applied for o_proj/fc2.
     """
 
     def __init__(
@@ -177,18 +178,63 @@ class _QuantProxy(nn.Module):
         self._floor_w   = mx.array(floor_w,    dtype=mx.float32)
         self._bias      = mx.array(bias,       dtype=mx.float32) if bias is not None else None
         self._b_inv     = mx.array(b_inv,      dtype=mx.float32) if b_inv is not None else None
+        self._poly_alpha: float | None = None  # set per-sample from poly schedule
 
     def __call__(self, x: mx.array) -> mx.array:
         orig_dtype = x.dtype
         x = x.astype(mx.float32)
         if self._b_inv is not None:
             x = x * self._b_inv
-        x_q = _fake_quant_a8(x)
+        if self._poly_alpha is not None:
+            # Symmetric poly clipping: scale = poly_alpha / 127
+            scale = mx.array(self._poly_alpha / 127.0)
+            x_q = mx.clip(mx.round(x / scale), -128, 127) * scale
+        else:
+            x_q = _fake_quant_a8(x)
         w_soft = (self._floor_w + _rectified_sigmoid(self.alpha)) * self._scales
         out = x_q @ w_soft.T
         if self._bias is not None:
             out = out + self._bias
         return out.astype(orig_dtype)
+
+
+# ---------------------------------------------------------------------------
+# Poly schedule helpers
+# ---------------------------------------------------------------------------
+
+def _poly_key(block_idx: int, stream: str, rel_path: str) -> str:
+    """Map (block_idx, stream, rel_path) to poly schedule key.
+
+    e.g. (0, "img", "attn.q_proj") → "mm0_img_attn_q_proj"
+    """
+    return f"mm{block_idx}_{stream}_{rel_path.replace('.', '_')}"
+
+
+def _set_poly_alphas(
+    proxies: list[tuple[str, _QuantProxy]],
+    poly_layers: dict,
+    sigma_range: list[float] | None,
+    block_idx: int,
+    stream: str,
+    sigma: float,
+) -> None:
+    """Set poly_alpha on each proxy for the given sigma."""
+    for rel_path, proxy in proxies:
+        key = _poly_key(block_idx, stream, rel_path)
+        cfg = poly_layers.get(key)
+        if cfg is not None:
+            s = sigma
+            if sigma_range:
+                s = max(sigma_range[0], min(s, sigma_range[1]))
+            proxy._poly_alpha = max(float(np.polyval(cfg["coeffs"], s)), 1e-8)
+        else:
+            proxy._poly_alpha = None
+
+
+def _clear_poly_alphas(proxies: list[tuple[str, _QuantProxy]]) -> None:
+    """Reset poly_alpha to None on all proxies."""
+    for _, proxy in proxies:
+        proxy._poly_alpha = None
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +325,7 @@ def _optimize_block(
     phase2_meta: dict,
     config: dict,
     refine: bool = False,
+    poly_schedule: dict | None = None,
 ) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None]]:
     """Run AdaRound for all linears in one multimodal transformer block.
 
@@ -359,6 +406,16 @@ def _optimize_block(
     for rel_path, _, _, _ in txt_linears:
         _proxy_paths.append((txt_tb, rel_path))
 
+    # Poly schedule: build proxy lists for per-sample alpha setting
+    poly_layers = poly_schedule.get("layers", {}) if poly_schedule else {}
+    sigma_range = poly_schedule.get("sigma_range") if poly_schedule else None
+    _img_proxy_list = [(rp, proxy) for rp, proxy, _, _ in img_linears]
+    _txt_proxy_list = [(rp, proxy) for rp, proxy, _, _ in txt_linears]
+    use_poly = bool(poly_layers)
+    if use_poly:
+        logger.info("  block %02d  using poly clipping (%d schedule entries)",
+                    block_idx, len(poly_layers))
+
     def loss_fn(block_ref: Any) -> mx.array:
         batch_idx = np.random.randint(0, len(samples), size=batch_size)
         total_loss = mx.array(0.0)
@@ -371,6 +428,12 @@ def _optimize_block(
             img_tgt = mx.array(s["img_out"], dtype=mx.float32)
             txt_tgt = mx.array(s["txt_out"], dtype=mx.float32) if "txt_out" in s else None
 
+            # Set poly clipping alphas from this sample's sigma
+            if use_poly:
+                sigma = float(s["sigma"])
+                _set_poly_alphas(_img_proxy_list, poly_layers, sigma_range, block_idx, "img", sigma)
+                _set_poly_alphas(_txt_proxy_list, poly_layers, sigma_range, block_idx, "txt", sigma)
+
             # Set modulation params for this sample so pre_sdpa can look them up
             ts_key = float(vec[0]) if vec.size > 1 else float(vec)
             img_tb._modulation_params[ts_key] = mx.array(s["img_mod"], dtype=mx.float32)
@@ -378,11 +441,17 @@ def _optimize_block(
 
             img_pred, txt_pred = block_ref(img_in, txt_in, vec, pe)
             img_pred = img_pred.astype(mx.float32)
-            total_loss = total_loss + mx.mean((img_pred - img_tgt) ** 2)
+            # lp_loss: sum over (seq, hidden), mean over batch — matches poly-clipping branch
+            total_loss = total_loss + (img_pred - img_tgt).reshape(-1).square().sum()
 
             if txt_pred is not None and txt_tgt is not None:
                 txt_pred = txt_pred.astype(mx.float32)
-                total_loss = total_loss + mx.mean((txt_pred - txt_tgt) ** 2)
+                total_loss = total_loss + (txt_pred - txt_tgt).reshape(-1).square().sum()
+
+        if use_poly:
+            _clear_poly_alphas(_img_proxy_list)
+            _clear_poly_alphas(_txt_proxy_list)
+
         rec_loss = total_loss / batch_size
         alphas = [_get_nested(tb, rp).alpha for tb, rp in _proxy_paths]
         r_loss = _round_loss(alphas, current_b[0])
@@ -396,8 +465,8 @@ def _optimize_block(
     loss_val = float("inf")
     all_losses: list[float] = []
     avg_window = 50           # steps to average over
-    converge_patience = 3     # consecutive flat averages before early stop
-    converge_rtol = 0.02      # 2% relative improvement threshold
+    converge_patience = 5     # consecutive flat averages before early stop
+    converge_rtol = 0.005     # 0.5% relative improvement threshold
     flat_count = 0
     prev_avg = None
     t0 = time.time()
@@ -480,6 +549,7 @@ def optimize_all_blocks(
     output_dir: Path,
     block_subset: set[int] | None = None,
     refine: bool = False,
+    poly_schedule: dict | None = None,
 ) -> None:
     """Run AdaRound for every block and save a phase2-compatible checkpoint."""
     from ..phase2.quantize import (
@@ -522,6 +592,7 @@ def optimize_all_blocks(
             block_results = _optimize_block(
                 block_idx, block, block_dir, b_inv_store, phase2_meta, config,
                 refine=refine,
+                poly_schedule=poly_schedule,
             )
 
         # --- Build W4A8Linear for each layer in this block and inject ---
@@ -619,6 +690,12 @@ def optimize_all_blocks(
 
         mx.eval(pipeline.mmdit.parameters())
         logger.info("Block %02d injected (%d AdaRound, %d RTN so far)", block_idx, n_adaround, n_rtn)
+
+        # Free calibration data for this block (saves ~4 GB/block)
+        if block_dir.exists() and block_results:
+            import shutil
+            shutil.rmtree(block_dir)
+            logger.info("Cleaned up calibration data: %s", block_dir)
 
         # Checkpoint after every block
         output_dir.mkdir(parents=True, exist_ok=True)

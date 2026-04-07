@@ -47,17 +47,31 @@ class _BlockCapture:
     Avoids accumulating float32 tensors in RAM (which OOMs for many blocks).
     """
 
-    def __init__(self, block: Any, output_dir: Path):
+    def __init__(self, block: Any, output_dir: Path, step_stride: int = 1):
         self._block = block
         self._output_dir = output_dir
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._sample_idx: int = 0
+        self._step_count: int = 0
+        self._step_stride: int = step_stride
         self._current_sigma: float = 0.0
+
+    def reset_step_counter(self):
+        """Reset per-prompt step counter (call between prompts)."""
+        self._step_count = 0
 
     def __call__(self, img: mx.array, txt: mx.array, vec: mx.array,
                  pe: mx.array = None, *, positional_encodings: mx.array = None) -> tuple:
         if pe is None:
             pe = positional_encodings
+
+        out = self._block(img, txt, vec, positional_encodings=pe)
+
+        # Only save every Nth step
+        save = (self._step_count % self._step_stride == 0)
+        self._step_count += 1
+        if not save:
+            return out
 
         # Grab pre-computed modulation params (set by cache_modulation_params)
         itb = self._block.image_transformer_block
@@ -66,7 +80,6 @@ class _BlockCapture:
         img_mod = _to_f16_safe(itb._modulation_params[ts_key])
         txt_mod = _to_f16_safe(ttb._modulation_params[ts_key])
 
-        out = self._block(img, txt, vec, positional_encodings=pe)
         img_out, txt_out = out
 
         arrays = {
@@ -138,16 +151,19 @@ class _SigmaTracker:
 # ---------------------------------------------------------------------------
 
 def install_block_hooks(mmdit, output_dir: Path,
-                        block_subset: set[int] | None = None) -> dict[int, _BlockCapture]:
+                        block_subset: set[int] | None = None,
+                        step_stride: int = 1) -> dict[int, _BlockCapture]:
     """Wrap transformer blocks with _BlockCapture.
 
     If *block_subset* is given, only those blocks are captured (saves disk).
+    *step_stride* saves every Nth denoising step (default 1 = every step).
     """
     captures: dict[int, _BlockCapture] = {}
     for i, block in enumerate(mmdit.multimodal_transformer_blocks):
         if block_subset is not None and i not in block_subset:
             continue
-        cap = _BlockCapture(block, output_dir / f"block_{i:02d}")
+        cap = _BlockCapture(block, output_dir / f"block_{i:02d}",
+                            step_stride=step_stride)
         mmdit.multimodal_transformer_blocks[i] = cap
         captures[i] = cap
     logger.info("Installed block hooks on %d / %d blocks",
@@ -205,6 +221,7 @@ def collect_block_io(
     output_dir: Path,
     config: dict,
     block_subset: set[int] | None = None,
+    step_stride: int = 1,
 ) -> None:
     """Run calibration prompts through the denoiser and save block I/O.
 
@@ -214,6 +231,7 @@ def collect_block_io(
         output_dir   : Root directory to write per-block NPZ files.
         config       : PHASE4_CONFIG dict.
         block_subset : If given, only capture these block indices.
+        step_stride  : Save every Nth denoising step (default 1 = all).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -227,13 +245,22 @@ def collect_block_io(
     logger.info("Snapshotted %d adaLN tensors for inter-prompt restoration",
                 len(adaln_snapshot))
 
-    captures = install_block_hooks(pipeline.mmdit, output_dir, block_subset)
+    captures = install_block_hooks(pipeline.mmdit, output_dir, block_subset,
+                                    step_stride=step_stride)
+
+    # Track per-step sigma so each NPZ records the noise level
+    sigma_tracker = _SigmaTracker(pipeline.mmdit, list(captures.values()))
+    sigma_tracker.install()
+    logger.info("Installed sigma tracker on mmdit.__call__")
 
     from tqdm import tqdm
 
     t0 = time.time()
     pbar = tqdm(pairs, desc="Collecting", unit="prompt")
     for idx, (seed, prompt) in enumerate(pbar):
+        # Reset per-prompt step counters so stride aligns to prompt start
+        for cap in captures.values():
+            cap.reset_step_counter()
         pbar.set_postfix_str(f"seed={seed}  {prompt[:40]}")
         pipeline.generate_image(
             prompt,
@@ -249,10 +276,13 @@ def collect_block_io(
 
     elapsed = time.time() - t0
     total = _count_saved_samples(captures)
+    saved_per_prompt = len(range(0, n_steps, step_stride))
     logger.info(
-        "Collection finished in %.1f s  (%d prompts × %d steps = %d samples/block, "
-        "%d total written to %s)",
-        elapsed, len(pairs), n_steps, len(pairs) * n_steps, total, output_dir,
+        "Collection finished in %.1f s  (%d prompts × %d/%d steps (stride=%d) = "
+        "%d samples/block, %d total written to %s)",
+        elapsed, len(pairs), saved_per_prompt, n_steps, step_stride,
+        len(pairs) * saved_per_prompt, total, output_dir,
     )
 
+    sigma_tracker.remove()
     remove_block_hooks(pipeline.mmdit, captures)

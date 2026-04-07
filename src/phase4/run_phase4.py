@@ -94,6 +94,10 @@ def main() -> None:
                    help="CFG scale (default: 4.0)")
     p.add_argument("--max-tokens", type=int, default=None,
                    help="Tokens to capture per forward pass (default: 64)")
+    p.add_argument("--step-stride", type=int, default=2,
+                   help="Save every Nth denoising step during collection (default: 2)")
+    p.add_argument("--poly-schedule", type=Path, default=None,
+                   help="Polynomial clipping schedule JSON for σ-dependent A8 fake-quant")
 
     # --- Optimisation ---
     p.add_argument("--n-iters", type=int, default=None,
@@ -192,10 +196,11 @@ def main() -> None:
         logger.info("SKIPPING collection — using %s", calib_dir)
         logger.info("=" * 60)
     else:
+        n_prompts = args.num_prompts or len(_load_pairs(args.prompts_file, None))
+        saved_steps = cfg["n_steps"] // args.step_stride
         logger.info("=" * 60)
-        logger.info("Collecting layer inputs (%d prompts × %d steps)",
-                    args.num_prompts or len(_load_pairs(args.prompts_file, None)),
-                    cfg["n_steps"])
+        logger.info("Collecting layer inputs (%d prompts × %d/%d steps, stride=%d)",
+                    n_prompts, saved_steps, cfg["n_steps"], args.step_stride)
         logger.info("=" * 60)
 
         from .collect import collect_block_io
@@ -208,7 +213,9 @@ def main() -> None:
             block_subset = set(int(b) for b in args.blocks.split(","))
 
         t0 = time.time()
-        collect_block_io(pipeline, pairs, calib_dir, cfg, block_subset=block_subset)
+        collect_block_io(pipeline, pairs, calib_dir, cfg,
+                         block_subset=block_subset,
+                         step_stride=args.step_stride)
         logger.info("Collection done in %.1f s", time.time() - t0)
 
     # ===================================================================
@@ -248,11 +255,19 @@ def main() -> None:
         block_subset = set(int(b) for b in args.blocks.split(","))
         logger.info("Optimising blocks: %s", sorted(block_subset))
 
+    poly_schedule = None
+    if args.poly_schedule is not None:
+        poly_schedule = json.loads(args.poly_schedule.read_text())
+        logger.info("Poly schedule loaded: %d layers, sigma_range=%s",
+                    len(poly_schedule.get("layers", {})),
+                    poly_schedule.get("sigma_range"))
+
     t0 = time.time()
     optimize_all_blocks(
         pipeline2, registry2, calibration, calib_dir, phase2_meta, cfg, args.output_dir,
         block_subset=block_subset,
         refine=refine,
+        poly_schedule=poly_schedule,
     )
     elapsed = time.time() - t0
 
