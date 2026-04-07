@@ -228,8 +228,8 @@ def _optimize_block(
     Returns dict: {full_layer_name → (w_int, scales, bias)} for both image
     and text half-blocks.
     """
-    bits       = config["bits"]
-    group_size = config["group_size"]
+    bits       = phase2_meta["bits"]
+    group_size = phase2_meta["group_size"]
     n_iters    = config["n_iters"]
     lr         = config["lr"]
     batch_size = config["batch_size"]
@@ -416,8 +416,8 @@ def optimize_all_blocks(
         save_quantized_model,
     )
 
-    bits        = config["bits"]
-    group_size  = config["group_size"]
+    bits        = phase2_meta["bits"]
+    group_size  = phase2_meta["group_size"]
     qmax        = 2 ** (bits - 1) - 1
     b_inv_set   = set(calibration["b_inv_layers"])
     b_inv_store = {
