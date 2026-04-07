@@ -441,12 +441,11 @@ def _optimize_block(
 
             img_pred, txt_pred = block_ref(img_in, txt_in, vec, pe)
             img_pred = img_pred.astype(mx.float32)
-            # lp_loss: sum over (seq, hidden), mean over batch — matches poly-clipping branch
-            total_loss = total_loss + (img_pred - img_tgt).reshape(-1).square().sum()
+            total_loss = total_loss + mx.mean((img_pred - img_tgt) ** 2)
 
             if txt_pred is not None and txt_tgt is not None:
                 txt_pred = txt_pred.astype(mx.float32)
-                total_loss = total_loss + (txt_pred - txt_tgt).reshape(-1).square().sum()
+                total_loss = total_loss + mx.mean((txt_pred - txt_tgt) ** 2)
 
         if use_poly:
             _clear_poly_alphas(_img_proxy_list)
