@@ -64,9 +64,22 @@ Average across 15 layers |            |            | 1.68x
 
 v2 won 0/95 layers. RTN won 95/95.
 
+## Important: poly clipping is NOT removed from inference
+
+The fix only removes activation quantization from `_QuantProxy.__call__`, which is the
+**optimization-time** soft-weight proxy used solely during AdaRound training. It is not
+the inference module.
+
+Poly clipping at **inference** lives in `W4A8Linear.__call__` and is unaffected by this
+fix. The poly schedule (if provided via `--poly-schedule`) is still applied at inference
+time to clip activations before A8 quantization — that is the intended use of poly
+clipping. What was wrong was applying it *during weight-rounding optimization*, where it
+biased the gradient away from minimizing weight quantization error.
+
 ## Files Modified
 
 - `src/phase4/optimize.py`
-  - `_QuantProxy.__call__`: removed `_fake_quant_a8` and poly clipping from forward pass
+  - `_QuantProxy.__call__`: removed fake A8 activation quantization (including poly
+    clipping) from the optimization forward pass — poly clipping at inference is unaffected
   - `loss_fn`: reverted `square().sum()` back to `mx.mean(... ** 2)`
   - Convergence params: reverted to `patience=3, rtol=0.02`
