@@ -579,20 +579,11 @@ class _QuantProxy:
         self._poly_shift = poly_shift
 
     def __call__(self, x: mx.array) -> mx.array:
-        if self._poly_alpha is not None and self._poly_shift is not None:
-            # Asymmetric path: center ± range → [min_val, max_val]
-            center = self._poly_shift
-            range_val = self._poly_alpha
-            min_val = center - range_val
-            max_val = center + range_val
-            x_q = fake_quant_asymmetric(x, min_val, max_val, self._qmin_a, self._qmax_a)
-        elif self._poly_alpha is not None:
-            # Symmetric poly path: α / qmax
-            scale = mx.array(self._poly_alpha / max(abs(self._qmax_a), 1))
-            x_q = fake_quant_per_tensor(x, scale, self._qmin_a, self._qmax_a)
-        else:
-            x_q = fake_quant_per_tensor(x, self._a_scale, self._qmin_a, self._qmax_a)
-        y = x_q @ self._soft_weight.T
+        # Use FP activations — activation quantization is not applied here.
+        # Applying fake A8 quant during weight-rounding optimization causes the
+        # optimizer to compensate for activation errors through weight adjustments.
+        # That compensation is lost on hard rounding, leaving weights worse than RTN.
+        y = x @ self._soft_weight.T
         if hasattr(self._orig, "bias") and self._orig.bias is not None:
             y = y + self._orig.bias
         return y
