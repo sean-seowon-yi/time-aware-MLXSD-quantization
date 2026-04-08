@@ -185,14 +185,8 @@ class _QuantProxy(nn.Module):
         x = x.astype(mx.float32)
         if self._b_inv is not None:
             x = x * self._b_inv
-        if self._poly_alpha is not None:
-            # Symmetric poly clipping: scale = poly_alpha / 127
-            scale = mx.array(self._poly_alpha / 127.0)
-            x_q = mx.clip(mx.round(x / scale), -128, 127) * scale
-        else:
-            x_q = _fake_quant_a8(x)
         w_soft = (self._floor_w + _rectified_sigmoid(self.alpha)) * self._scales
-        out = x_q @ w_soft.T
+        out = x @ w_soft.T
         if self._bias is not None:
             out = out + self._bias
         return out.astype(orig_dtype)
@@ -464,8 +458,8 @@ def _optimize_block(
     loss_val = float("inf")
     all_losses: list[float] = []
     avg_window = 50           # steps to average over
-    converge_patience = 5     # consecutive flat averages before early stop
-    converge_rtol = 0.005     # 0.5% relative improvement threshold
+    converge_patience = 3     # consecutive flat averages before early stop
+    converge_rtol = 0.02      # 2% relative improvement threshold
     flat_count = 0
     prev_avg = None
     t0 = time.time()
