@@ -183,8 +183,10 @@ class _QuantProxy(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         orig_dtype = x.dtype
         x = x.astype(mx.float32)
-        if self._b_inv is not None:
-            x = x * self._b_inv
+        # b_inv is NOT applied here. Applying it during optimization creates the same
+        # gradient bias as activation quantization: the optimizer tries to compensate
+        # for the b_inv scaling through weight adjustments, which are lost on hard
+        # rounding. b_inv belongs only in W4A8Linear at inference time.
         w_soft = (self._floor_w + _rectified_sigmoid(self.alpha)) * self._scales
         out = x @ w_soft.T
         if self._bias is not None:
@@ -458,7 +460,7 @@ def _optimize_block(
     loss_val = float("inf")
     all_losses: list[float] = []
     avg_window = 50           # steps to average over
-    converge_patience = 3     # consecutive flat averages before early stop
+    converge_patience = 999   # early stopping disabled — run all n_iters
     converge_rtol = 0.02      # 2% relative improvement threshold
     flat_count = 0
     prev_avg = None

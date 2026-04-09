@@ -64,6 +64,28 @@ Average across 15 layers |            |            | 1.68x
 
 v2 won 0/95 layers. RTN won 95/95.
 
+## Third bug: b_inv in QuantProxy forward (same pattern)
+
+`_QuantProxy.__call__` was applying `b_inv` to the input `x` before the weight multiply:
+
+```python
+x = x * self._b_inv   # applied only for o_proj / fc2
+out = x @ w_soft.T
+```
+
+The FP16+CSB targets captured during collection were computed WITHOUT `b_inv` (the FP16
+model applies it implicitly through the W4A8Linear at inference, not during FP16 forward).
+This creates the identical gradient bias: the optimizer spends iterations trying to make
+`(x * b_inv) @ w_soft.T ≈ x @ W_fp.T` — an impossible target since `b_inv ∈ [0.11, 0.46]`
+and weights are constrained within ±1 quantization step. After 3000 iterations the rounding
+decisions degrade to the point of producing pure noise at inference.
+
+**Fix:** Remove `b_inv` from `_QuantProxy.__call__`. It belongs only in `W4A8Linear`.
+
+This was discovered because the activation-quant-bias fix allowed the optimizer to run
+longer (3000 iters instead of early stopping at ~650), amplifying the b_inv bias enough
+to destroy inference quality.
+
 ## Important: poly clipping is NOT removed from inference
 
 The fix only removes activation quantization from `_QuantProxy.__call__`, which is the
