@@ -454,6 +454,33 @@ def _optimize_block(
 
     loss_and_grad = nn.value_and_grad(block, loss_fn)
 
+    # --- Sanity check: initial rec_loss should be ~0 ---
+    # At alpha_init, w_soft ≈ W_fp so block output ≈ FP16 target.
+    # A large initial rec_loss means a gradient bias bug (b_inv / fake-quant in QuantProxy).
+    _diag_batch = min(4, len(samples))
+    _init_rec = 0.0
+    for si in range(_diag_batch):
+        s = samples[si]
+        _img_in  = mx.array(s["img_in"],  dtype=mx.float32)
+        _txt_in  = mx.array(s["txt_in"],  dtype=mx.float32)
+        _vec     = mx.array(s["vec"],     dtype=mx.float32)
+        _pe      = mx.array(s["pe"],      dtype=mx.float32)
+        _img_tgt = mx.array(s["img_out"], dtype=mx.float32)
+        _txt_tgt = mx.array(s["txt_out"], dtype=mx.float32) if "txt_out" in s else None
+        _ts_key  = float(_vec[0]) if _vec.size > 1 else float(_vec)
+        img_tb._modulation_params[_ts_key] = mx.array(s["img_mod"], dtype=mx.float32)
+        txt_tb._modulation_params[_ts_key] = mx.array(s["txt_mod"], dtype=mx.float32)
+        _ip, _tp = block(_img_in, _txt_in, _vec, _pe)
+        _init_rec += float(mx.mean((_ip.astype(mx.float32) - _img_tgt) ** 2).item())
+        if _tp is not None and _txt_tgt is not None:
+            _init_rec += float(mx.mean((_tp.astype(mx.float32) - _txt_tgt) ** 2).item())
+    _init_rec /= _diag_batch
+    logger.info("  block %02d  initial rec_loss=%.2f  (should be ~0; large value = QuantProxy bug)",
+                block_idx, _init_rec)
+    if _init_rec > 1000.0:
+        logger.error("  block %02d  INITIAL REC_LOSS TOO HIGH (%.2f) — "
+                     "check QuantProxy for b_inv or fake-quant on x", block_idx, _init_rec)
+
     from tqdm import tqdm
 
     n_nan = 0
@@ -523,6 +550,34 @@ def _optimize_block(
 
             # Restore original linear
             _set_nested(tb, rel_path, proxy._W_fp)   # placeholder; real restore below
+
+    # --- AdaRound vs RTN win-rate check ---
+    # AdaRound should beat RTN on per-weight MSE for the majority of layers.
+    # If win_rate < 50%, the optimization did not improve rounding — likely a bug.
+    ada_wins = 0
+    ada_total = 0
+    for prefix, tb, linears_list in [
+        (img_prefix, img_tb, img_linears),
+        (txt_prefix, txt_tb, txt_linears),
+    ]:
+        for rel_path, proxy, scales, floor_w in linears_list:
+            W_fp_np    = np.array(proxy._W_fp)
+            scales_exp = np.array(proxy._scales)
+            alpha_np   = np.array(proxy.alpha)
+            round_delta = (alpha_np > 0).astype(np.float32)
+            w_ada = (np.array(floor_w) + round_delta) * scales_exp
+            w_rtn = np.round(W_fp_np / np.clip(scales_exp, 1e-8, None)) * scales_exp
+            mse_ada = float(np.mean((w_ada - W_fp_np) ** 2))
+            mse_rtn = float(np.mean((w_rtn - W_fp_np) ** 2))
+            if mse_ada <= mse_rtn:
+                ada_wins += 1
+            ada_total += 1
+    win_pct = 100.0 * ada_wins / max(ada_total, 1)
+    logger.info("  block %02d  AdaRound wins %d/%d layers (%.0f%%) vs RTN per-weight MSE",
+                block_idx, ada_wins, ada_total, win_pct)
+    if win_pct < 50.0:
+        logger.error("  block %02d  AdaRound LOSING to RTN (%.0f%% win rate) — "
+                     "optimization did not improve rounding, check for bugs", block_idx, win_pct)
 
     # Actually restore the original nn.Linear modules (stored in proxy._W_fp is wrong)
     # We need to reload them — done by the caller after inject
