@@ -532,6 +532,68 @@ def _optimize_block(
         logger.warning("  block %02d  finished with %d NaN steps", block_idx, n_nan)
     logger.info("  block %02d  done in %.1f s  final_loss=%.5f", block_idx, time.time() - t0, loss_val)
 
+    # --- Block-output MSE: AdaRound vs RTN ---
+    # Must run BEFORE proxy replacement — proxies must still be installed in the block.
+    # Hard-binarize alphas for both AdaRound and RTN, run calibration samples, compare MSE.
+    _n_check = min(len(samples), 16)
+
+    _saved_alphas: dict = {}
+    for _pfx, _tb_ref, _llist in [(img_prefix, img_tb, img_linears),
+                                   (txt_prefix, txt_tb, txt_linears)]:
+        for _rp, _proxy, _, _ in _llist:
+            _saved_alphas[(_pfx, _rp)] = np.array(_proxy.alpha)
+
+    def _set_alphas_and_run_mse(alpha_dict: dict) -> float:
+        for (_pfx, _rp), _val in alpha_dict.items():
+            _tb = img_tb if _pfx == img_prefix else txt_tb
+            _get_nested(_tb, _rp).alpha = mx.array(_val, dtype=mx.float32)
+        _total = 0.0
+        for _si in range(_n_check):
+            _s = samples[_si]
+            _img = mx.array(_s["img_in"],  dtype=mx.float32)
+            _txt = mx.array(_s["txt_in"],  dtype=mx.float32)
+            _vec = mx.array(_s["vec"],     dtype=mx.float32)
+            _pe  = mx.array(_s["pe"],      dtype=mx.float32)
+            _tgt = mx.array(_s["img_out"], dtype=mx.float32)
+            _key = float(_vec[0]) if _vec.size > 1 else float(_vec)
+            img_tb._modulation_params[_key] = mx.array(_s["img_mod"], dtype=mx.float32)
+            txt_tb._modulation_params[_key] = mx.array(_s["txt_mod"], dtype=mx.float32)
+            _pred, _ = block(_img, _txt, _vec, _pe)
+            _total += float(mx.mean((_pred.astype(mx.float32) - _tgt) ** 2).item())
+        return _total / _n_check
+
+    _ada_alphas: dict = {}
+    _rtn_alphas: dict = {}
+    for _pfx, _tb_ref, _llist in [(img_prefix, img_tb, img_linears),
+                                   (txt_prefix, txt_tb, txt_linears)]:
+        for _rp, _proxy, _, _fw in _llist:
+            _a = _saved_alphas[(_pfx, _rp)]
+            _ada_alphas[(_pfx, _rp)] = (_a > 0).astype(np.float32) * 200 - 100
+            _rest = (np.array(_proxy._W_fp)
+                     / np.clip(np.array(_proxy._scales), 1e-8, None)
+                     - np.array(_fw))
+            _rtn_alphas[(_pfx, _rp)] = (_rest >= 0.5).astype(np.float32) * 200 - 100
+
+    _ada_mse = _set_alphas_and_run_mse(_ada_alphas)
+    _rtn_mse = _set_alphas_and_run_mse(_rtn_alphas)
+
+    # Restore trained alphas for results extraction below
+    for (_pfx, _rp), _val in _saved_alphas.items():
+        _tb = img_tb if _pfx == img_prefix else txt_tb
+        _get_nested(_tb, _rp).alpha = mx.array(_val, dtype=mx.float32)
+
+    _impr = (_rtn_mse - _ada_mse) / max(_rtn_mse, 1e-10) * 100
+    logger.info(
+        "  block %02d  block-output MSE: AdaRound=%.4f  RTN=%.4f  improvement=%.1f%%  %s",
+        block_idx, _ada_mse, _rtn_mse, _impr,
+        "OK" if _ada_mse < _rtn_mse else "WORSE THAN RTN",
+    )
+    if _ada_mse >= _rtn_mse:
+        logger.error(
+            "  block %02d  AdaRound block output WORSE than RTN — "
+            "optimization degraded this block", block_idx,
+        )
+
     # --- Extract results and restore original linears ---
     results: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray | None]] = {}
 
