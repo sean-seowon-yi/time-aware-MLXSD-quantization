@@ -48,15 +48,14 @@ def _build_config(args) -> dict:
         cfg["final_layer_bits"] = args.final_layer_bits
     if args.ssc_tau is not None:
         cfg["ssc_tau"] = args.ssc_tau
-    if args.per_token_rho_threshold is not None:
-        cfg["per_token_rho_threshold"] = args.per_token_rho_threshold
+    cfg["static_granularity"] = args.static_granularity
     cfg["model_version"] = MODEL_VERSION
     return cfg
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase 2: W4A8 quantization via CSB + SSC",
+        description="Phase 2: W4A8 quantization via CSB + SSC (static A8)",
     )
     parser.add_argument(
         "--output-dir", type=str, default="quantized",
@@ -86,8 +85,16 @@ def main():
     parser.add_argument("--final-layer-bits", type=int, default=None, help="Final layer bits (default: 4)")
     parser.add_argument("--ssc-tau", type=float, default=None,
                          help="SSC temperature (default: 1.0). Values < 1 sharpen time-weighting.")
-    parser.add_argument("--per-token-rho-threshold", type=float, default=None,
-                         help="Layers with mean rho above this use per-token A8 (default: 0.5)")
+    parser.add_argument(
+        "--static-mode", type=str, default="ssc_weighted",
+        choices=["ssc_weighted", "global_max"],
+        help="How to aggregate calibration timesteps for static A8 scales (default: ssc_weighted)",
+    )
+    parser.add_argument(
+        "--static-granularity", type=str, default="per_tensor",
+        choices=["per_tensor", "per_channel"],
+        help="Static A8 scale granularity (default: per_tensor)",
+    )
 
     args = parser.parse_args()
 
@@ -99,10 +106,11 @@ def main():
         save_calibration,
     )
     from .balance import apply_csb_to_model
-    from .quantize import (
-        patch_pipeline_for_quantized_inference,
-        quantize_model,
-        save_quantized_model,
+    from .quantize import patch_pipeline_for_quantized_inference
+    from .quantize_static import (
+        compute_static_scales,
+        quantize_model_static,
+        save_quantized_model_static,
     )
 
     output_dir = Path(args.output_dir)
@@ -166,6 +174,15 @@ def main():
     registry = build_layer_registry(pipeline.mmdit)
     logger.info("Registry: %d linear layers", len(registry))
 
+    light_registry = []
+    for entry in registry:
+        light_registry.append({
+            "name": entry["name"],
+            "block": entry["block"],
+            "family": entry["family"],
+            "side": entry["side"],
+        })
+
     # ===================================================================
     # Apply CSB
     # ===================================================================
@@ -177,14 +194,26 @@ def main():
     # Patch pipeline immediately after CSB so adaLN weights are preserved
     patch_pipeline_for_quantized_inference(pipeline)
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+    from .fp_snapshot import save_fp_pre_rtn_snapshot
+
+    save_fp_pre_rtn_snapshot(registry, cfg, output_dir)
+
     # ===================================================================
-    # Quantize
+    # Quantize (static A8)
     # ===================================================================
-    logger.info("=== QUANTIZING ===")
+    logger.info("=== QUANTIZING (static A8) ===")
     t0 = time.time()
-    layer_meta = quantize_model(
-        pipeline.mmdit, registry, b_inv_map, cfg,
-        mean_rhos=calibration.get("mean_rhos"),
+    static_scales = compute_static_scales(
+        light_registry,
+        diagnostics_dir,
+        calibration,
+        config=cfg,
+        mode=args.static_mode,
+        granularity=args.static_granularity,
+    )
+    layer_meta = quantize_model_static(
+        pipeline.mmdit, registry, b_inv_map, static_scales, config=cfg,
     )
     logger.info("Quantization finished in %.1f s", time.time() - t0)
 
@@ -192,31 +221,37 @@ def main():
     # Save
     # ===================================================================
     logger.info("=== SAVING ===")
-    save_quantized_model(
+    save_quantized_model_static(
         pipeline.mmdit,
         output_dir,
         cfg,
         layer_meta,
         calibration["b_inv_layers"],
+        static_scales,
+        granularity=args.static_granularity,
+        mode=args.static_mode,
     )
     logger.info("All outputs saved to %s", output_dir)
 
     # --- Summary ---
     n_quantized = len(layer_meta)
     n_online = len(b_inv_map)
-    n_per_token = sum(1 for m in layer_meta.values() if m.get("per_token", False))
+    n_per_channel = sum(1 for m in layer_meta.values() if m.get("per_channel", False))
     logger.info(
         "\n=== SUMMARY ===\n"
         "  Quantized layers:  %d\n"
         "  Online b_inv:      %d\n"
-        "  Per-token A8:      %d\n"
+        "  Static mode:       %s\n"
+        "  Granularity:       %s\n"
+        "  Per-channel layers:%d\n"
         "  Group size:        %d\n"
         "  Weight bits:       %d\n"
         "  QKV method:        %s\n"
         "  Alpha:             %.2f\n"
         "  SSC tau:           %.2f\n"
         "  Output:            %s",
-        n_quantized, n_online, n_per_token,
+        n_quantized, n_online,
+        args.static_mode, args.static_granularity, n_per_channel,
         cfg["group_size"], cfg["bits"],
         cfg["qkv_method"], cfg["alpha"],
         cfg.get("ssc_tau", 1.0),

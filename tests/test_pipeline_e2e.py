@@ -1,4 +1,4 @@
-"""End-to-end integration test: calibrate → CSB → quantize → save → load."""
+"""End-to-end integration test: calibrate → CSB → static quantize → save → load."""
 
 import mlx.core as mx
 import numpy as np
@@ -9,12 +9,15 @@ from conftest import H, FFN_H, MockMMDiT, MockPipeline
 from src.phase2.balance import apply_csb_to_model
 from src.phase2.calibrate import calibrate_all_layers, save_calibration, load_calibration
 from src.phase2.quantize import (
-    W4A8Linear,
     _navigate_to_parent,
-    load_quantized_model,
     patch_pipeline_for_quantized_inference,
-    quantize_model,
-    save_quantized_model,
+)
+from src.phase2.quantize_static import (
+    W4A8StaticLinear,
+    compute_static_scales,
+    load_quantized_model_static,
+    quantize_model_static,
+    save_quantized_model_static,
 )
 
 
@@ -40,15 +43,31 @@ class TestFullPipeline:
         pipeline = MockPipeline(mock_mmdit)
         patch_pipeline_for_quantized_inference(pipeline)
 
-        # === 4. Quantize ===
-        layer_meta = quantize_model(mock_mmdit, registry, b_inv_map, test_config)
+        light_registry = [
+            {"name": e["name"], "block": e["block"], "family": e["family"], "side": e["side"]}
+            for e in registry
+        ]
+
+        # === 4. Static scales + quantize ===
+        static_scales = compute_static_scales(
+            light_registry,
+            mock_diagnostics,
+            cal,
+            test_config,
+            mode="ssc_weighted",
+            granularity="per_tensor",
+        )
+        layer_meta = quantize_model_static(
+            mock_mmdit, registry, b_inv_map, static_scales, test_config,
+        )
         assert len(layer_meta) > 0
 
         # === 5. Save ===
         out_dir = tmp_path / "quantized"
         cfg_save = {**test_config, "model_version": "test-mock-model"}
-        save_quantized_model(
+        save_quantized_model_static(
             mock_mmdit, out_dir, cfg_save, layer_meta, cal["b_inv_layers"],
+            static_scales, granularity="per_tensor", mode="ssc_weighted",
         )
         assert (out_dir / "mmdit_quantized.safetensors").exists()
         assert (out_dir / "quantize_config.json").exists()
@@ -58,7 +77,7 @@ class TestFullPipeline:
         mx.eval(fresh_mmdit.parameters())
         fresh_pipeline = MockPipeline(fresh_mmdit)
 
-        loaded_meta = load_quantized_model(fresh_pipeline, out_dir)
+        loaded_meta = load_quantized_model_static(fresh_pipeline, out_dir)
         assert loaded_meta["model_version"] == "test-mock-model"
         assert len(loaded_meta["quantized_layers"]) == len(layer_meta)
 
@@ -69,8 +88,8 @@ class TestFullPipeline:
                 continue
             parent, attr = _navigate_to_parent(fresh_mmdit, entry["name"])
             layer = getattr(parent, attr)
-            assert isinstance(layer, W4A8Linear), (
-                f"{entry['name']} should be W4A8Linear after load"
+            assert isinstance(layer, W4A8StaticLinear), (
+                f"{entry['name']} should be W4A8StaticLinear after load"
             )
 
         # context_embedder should remain nn.Linear
@@ -146,5 +165,13 @@ class TestHyperparameterSweep:
         b_inv_map = apply_csb_to_model(mmdit, registry, cal, hidden_size=H)
         assert isinstance(b_inv_map, dict)
 
-        layer_meta = quantize_model(mmdit, registry, b_inv_map, cfg)
+        light_registry = [
+            {"name": e["name"], "block": e["block"], "family": e["family"], "side": e["side"]}
+            for e in registry
+        ]
+        static_scales = compute_static_scales(
+            light_registry, mock_diagnostics, cal, cfg,
+            mode="ssc_weighted", granularity="per_tensor",
+        )
+        layer_meta = quantize_model_static(mmdit, registry, b_inv_map, static_scales, cfg)
         assert len(layer_meta) > 0

@@ -234,10 +234,10 @@ def main():
 
     # --- Load quantized weights (W4A8 mode only) ---
     if args.mode == "w4a8":
-        from .quantize import load_quantized_model
+        from .quantize_static import load_quantized_model_static
 
         logger.info("Loading quantized model from %s ...", args.quantized_dir)
-        load_quantized_model(pipeline, Path(args.quantized_dir))
+        load_quantized_model_static(pipeline, Path(args.quantized_dir))
         logger.info("Quantized model ready.")
 
     # --- Generate ---
@@ -300,7 +300,8 @@ def main():
             "qkv_method": quant_meta.get("qkv_method"),
             "group_size": quant_meta.get("group_size"),
             "ssc_tau": quant_meta.get("ssc_tau", 1.0),
-            "per_token_rho_threshold": quant_meta.get("per_token_rho_threshold", 0.5),
+            "static_mode": quant_meta.get("static_mode"),
+            "static_granularity": quant_meta.get("static_granularity"),
         }
     meta_path = output_root / "run_meta.json"
     meta_path.write_text(json.dumps(run_meta, indent=2, ensure_ascii=False))

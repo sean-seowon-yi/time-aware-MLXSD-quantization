@@ -94,6 +94,21 @@ class ChannelStatsCollector:
         steps = {k[1] for k in self._agg}
         return max(steps) + 1 if steps else 0
 
+    def _d_in_for_layer(self, layer_name: str) -> int:
+        """Channel width for *layer_name* from any aggregated step (not another layer)."""
+        for (ln, _), entry in self._agg.items():
+            if ln == layer_name:
+                return int(entry["max"].shape[0])
+        if not self._agg:
+            raise RuntimeError("Collector has no aggregated data — cannot infer d_in")
+        fallback = int(next(iter(self._agg.values()))["max"].shape[0])
+        logger.warning(
+            "No aggregated rows for layer %r — using d_in=%d from another layer "
+            "(zero-fill for missing steps may be mis-sized)",
+            layer_name, fallback,
+        )
+        return fallback
+
     def sigma_values(self) -> np.ndarray:
         """Return sigma values ordered by step index."""
         step_sigma = {}
@@ -117,8 +132,7 @@ class ChannelStatsCollector:
                 rows.append(self._agg[key]["max"])
             else:
                 logger.warning("Missing data for %s step %d", layer_name, step_idx)
-                d_in = next(iter(self._agg.values()))["max"].shape[0]
-                rows.append(np.zeros(d_in))
+                rows.append(np.zeros(self._d_in_for_layer(layer_name)))
         return np.stack(rows)
 
     def get_mean_trajectory(self, layer_name: str) -> np.ndarray:
@@ -132,8 +146,7 @@ class ChannelStatsCollector:
                 rows.append(entry["mean_sum"] / entry["count"])
             else:
                 logger.warning("Missing mean data for %s step %d", layer_name, step_idx)
-                d_in = next(iter(self._agg.values()))["max"].shape[0]
-                rows.append(np.zeros(d_in))
+                rows.append(np.zeros(self._d_in_for_layer(layer_name)))
         return np.stack(rows)
 
 

@@ -84,10 +84,13 @@ class W4A8PolyLinear(nn.Module):
         poly_coeffs: mx.array,
         b_inv: mx.array | None = None,
         shift_coeffs: mx.array | None = None,
+        *,
+        alpha_multiplier: float = 1.0,
     ):
         super().__init__()
         self.qlinear = qlinear
         self.poly_coeffs = poly_coeffs
+        self._alpha_multiplier = mx.array(float(alpha_multiplier), dtype=mx.float32)
         if b_inv is not None:
             self.b_inv = b_inv
         if shift_coeffs is not None:
@@ -101,8 +104,9 @@ class W4A8PolyLinear(nn.Module):
 
         sigma = _get_current_sigma()
 
-        alpha = poly_eval(self.poly_coeffs, sigma)
-        alpha = mx.maximum(alpha, mx.array(1e-8))
+        alpha = poly_eval(self.poly_coeffs, sigma) * self._alpha_multiplier
+        # Floor on α for numerical safety (same as get_poly_alpha in phase4_1.utils).
+        alpha = mx.maximum(alpha, mx.array(0.01))
         scale = alpha / 127.0
 
         if hasattr(self, "shift_coeffs"):
@@ -207,51 +211,38 @@ def uninstall_sigma_hook(mmdit) -> None:
 # Load Phase 2 model + upgrade to polynomial A8
 # ---------------------------------------------------------------------------
 
-def load_quantized_model_poly(pipeline, quantized_dir: Path) -> dict:
+def load_quantized_model_poly(
+    pipeline,
+    quantized_dir: Path,
+    schedule_override: dict | None = None,
+) -> dict:
     """Load a Phase 2 W4A8 checkpoint and upgrade to polynomial A8.
-
-    Automatically dispatches to the correct Phase 2 loader (dynamic or
-    static) based on ``quantize_config.json``'s ``act_quant`` field.
 
     Steps
     -----
-    1. Load Phase 2 quantized model (``W4A8Linear`` or ``W4A8StaticLinear``).
-    2. Read ``poly_schedule.json``.
+    1. Load Phase 2 quantized model (``W4A8StaticLinear``).
+    2. Read ``poly_schedule.json`` (or use ``schedule_override`` if given).
     3. Replace each wrapped module that has a schedule entry with
        :class:`W4A8PolyLinear`.
     4. Install the σ hook on the pipeline's MMDiT.
 
     Returns the loaded metadata dict (extended with poly info).
     """
-    import json as _json
+    from ..phase2.quantize_static import W4A8StaticLinear, load_quantized_model_static
 
-    qcfg_path = quantized_dir / "quantize_config.json"
-    is_static = False
-    if qcfg_path.exists():
-        is_static = _json.loads(qcfg_path.read_text()).get("act_quant") == "static"
+    meta = load_quantized_model_static(pipeline, quantized_dir)
+    _accepted_types = (W4A8StaticLinear,)
 
-    if is_static:
-        from ..phase2.quantize_static import W4A8StaticLinear, load_quantized_model_static
-        meta = load_quantized_model_static(pipeline, quantized_dir)
-        _accepted_types = (W4A8StaticLinear,)
+    if schedule_override is not None:
+        schedule = schedule_override
     else:
-        from ..phase2.quantize import load_quantized_model
-        meta = load_quantized_model(pipeline, quantized_dir)
-        _accepted_types = None  # will import below
-
-    from ..phase2.quantize import W4A8Linear
-    if _accepted_types is None:
-        _accepted_types = (W4A8Linear,)
-    else:
-        _accepted_types = (_accepted_types[0], W4A8Linear)
-
-    schedule_path = quantized_dir / POLY_SCHEDULE_FILENAME
-    if not schedule_path.exists():
-        raise FileNotFoundError(
-            f"Missing {schedule_path} — run generate_schedule.py first"
-        )
-    with open(schedule_path) as f:
-        schedule = json.load(f)
+        schedule_path = quantized_dir / POLY_SCHEDULE_FILENAME
+        if not schedule_path.exists():
+            raise FileNotFoundError(
+                f"Missing {schedule_path} — run generate_schedule.py first"
+            )
+        with open(schedule_path) as f:
+            schedule = json.load(f)
 
     n_replaced = 0
     for name, entry in schedule["layers"].items():
@@ -275,8 +266,14 @@ def load_quantized_model_poly(pipeline, quantized_dir: Path) -> dict:
         if "shift_coeffs" in entry:
             shift_coeffs = mx.array(entry["shift_coeffs"], dtype=mx.float32)
 
+        alpha_multiplier = float(entry.get("alpha_multiplier", 1.0))
+
         poly_module = W4A8PolyLinear(
-            module.qlinear, coeffs, b_inv, shift_coeffs,
+            module.qlinear,
+            coeffs,
+            b_inv,
+            shift_coeffs,
+            alpha_multiplier=alpha_multiplier,
         )
         setattr(parent, attr_name, poly_module)
         n_replaced += 1

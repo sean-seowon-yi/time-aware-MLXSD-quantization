@@ -166,6 +166,6 @@ def test_config():
         "bits": 4,
         "a_bits": 8,
         "qkv_method": "max",
-        "final_layer_bits": 4,
-        "exclude_layers": ["context_embedder"],
+        "final_layer_bits": 16,
+        "exclude_layers": ["context_embedder", "final_layer.linear"],
     }

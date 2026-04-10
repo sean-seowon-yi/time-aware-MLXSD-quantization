@@ -1,9 +1,8 @@
 """Static W4A8 quantization: pre-computed activation scales from calibration.
 
-Alternative to the default dynamic A8 path.  Dynamic A8 computes
-``scale = max(|x|) / 127`` on every forward pass.  Static A8 uses fixed
-scales derived from Phase 1 calibration statistics, eliminating the per-
-forward max-reduction at the cost of potential clipping of unseen activations.
+Static A8 uses fixed scales derived from Phase 1 calibration statistics,
+avoiding per-forward max-reduction at the cost of potential clipping of
+unseen activations.
 
 Scale-computation modes
 -----------------------
@@ -35,6 +34,7 @@ from mlx.utils import tree_flatten
 
 from ..phase1.analyze import compute_spearman_trajectory, compute_ssc_weights
 from .config import MODEL_VERSION, PHASE2_CONFIG, QUANTIZED_WEIGHTS_FILENAME
+from .fp_snapshot import attach_fp_pre_rtn_meta
 from .quantize import _navigate_to_parent, patch_pipeline_for_quantized_inference
 
 logger = logging.getLogger(__name__)
@@ -69,8 +69,8 @@ def fake_quantize_a8_static_per_channel(x: mx.array, scales: mx.array) -> mx.arr
 class W4A8StaticLinear(nn.Module):
     """Drop-in replacement for ``nn.Linear`` with W4 weights and static A8.
 
-    Identical to ``W4A8Linear`` except the activation scale is a stored
-    constant rather than being recomputed from the input on each call.
+    Wraps ``nn.QuantizedLinear`` with CSB ``b_inv`` (when needed) and static
+    symmetric 8-bit fake-quantization using stored scale(s).
     """
 
     def __init__(
@@ -179,6 +179,9 @@ def compute_static_scales(
                 logger.warning("No weight stats for %s — skipping", name)
                 continue
             wt_salience = wt_data[wt_key]  # [d_in]
+            # Spearman ρ uses raw Phase-1 activations (same as calibrate.py SSC).
+            # The weighted sum applies those timestep weights to *post-CSB* magnitudes
+            # the quantizer actually sees (adjusted_traj).
             rho_traj = compute_spearman_trajectory(raw_act_traj, wt_salience)
             ssc_w = compute_ssc_weights(rho_traj, tau=ssc_tau)
             representative = ssc_w @ adjusted_traj  # [d_in]
@@ -330,6 +333,7 @@ def save_quantized_model_static(
         "static_granularity": granularity,
         "quantized_layers": layer_meta,
     }
+    attach_fp_pre_rtn_meta(meta, output_dir)
     meta_path = output_dir / QUANTIZE_CONFIG_FILENAME
     meta_path.write_text(json.dumps(meta, indent=2))
     logger.info("Saved static quantization config to %s", meta_path)

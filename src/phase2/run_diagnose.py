@@ -121,8 +121,8 @@ def main():
         )
 
         logger.info("Loading quantized model from %s ...", quantized_dir)
-        from .quantize import load_quantized_model
-        load_quantized_model(pipeline, quantized_dir)
+        from .quantize_static import load_quantized_model_static
+        load_quantized_model_static(pipeline, quantized_dir)
         logger.info("Quantized model loaded.")
 
         from ..phase1.config import CALIBRATION_PAIRS

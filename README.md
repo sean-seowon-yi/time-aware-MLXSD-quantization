@@ -10,17 +10,15 @@ Time-aware post-training quantization for **Stable Diffusion 3 Medium (MMDiT)** 
 |------|------|
 | **`src/phase1/`** | Diagnostic collection: hooks on target `nn.Linear` layers, activation stats per σ-step, weight salience. Outputs under `diagnostics/`. |
 | **`src/phase2/`** | Calibration (`calibrate.py`), CSB (`balance.py`), dynamic W4A8 (`quantize.py`), **static** W4A8 (`quantize_static.py`), end-to-end CLI (`run_e2e.py`), inference (`run_inference.py`), optional post-quant diagnostics (`run_diagnose.py`), and **visualization scripts** (`plot_post_csb.py`, `plot_weight_profile.py`, `plot_quantized_weight.py`, `plot_mse_vs_block.py`). |
-| **`src/benchmark/`** | `benchmark_model.py` — image generation; FID/IS/KID vs `--reference-dir`; optional paired PSNR/LPIPS vs **`--baseline-dir`** (same filenames as generated images). |
-| **`src/sweep/`** | Hyperparameter sweep (quantize → inference → metrics → summarize). See `src/sweep/SWEEP.md`. |
+| **`src/benchmark/`** | `gt_comparison_pipeline.py` — GT comparison: generates W4A8 images if needed, then computes FID, CMMD, CLIP scores, and LPIPS against ground truth and FP16 baselines. |
 | **`src/settings/`** | `coco_100_calibration_prompts.txt` (100 tab-separated seed/prompt pairs for Phase 1) and `evaluation_set.txt` (larger set for benchmarks/sweeps). |
 | **`DiffusionKit/`** | Vendored DiffusionKit Python sources (see `DiffusionKit/README.md`). |
 
 **Documentation** (in `src/`):
 
-- `PHASE1.md` — design and architecture notes for Phase 1 diagnostics.
-- `PHASE2.md` — CSB/SSC/W4A8 pipeline, data flow, CLI reference.
-- `phase1_findings.md` — summarized empirical findings from collected diagnostics.
-- `sweep/SWEEP.md` — sweep matrix, staged evaluation, CLI.
+- `PHASE1.md` -- design and architecture notes for Phase 1 diagnostics.
+- `PHASE2.md` -- CSB/SSC/W4A8 pipeline, data flow, CLI reference.
+- `phase1_findings.md` -- summarized empirical findings from collected diagnostics.
 
 There is **no** `src/calibration_sample_generation/` or `src/activation_diagnostics/` tree; those paths referred to an older scaffold and are **not** present in this codebase.
 
@@ -96,15 +94,18 @@ python -m src.phase2.run_inference --mode w4a8 --quantized-dir quantized/<tag>/ 
 
 Images are written under **`results/fp16/`** (fp16 mode) or **`results/<config_tag>/`** (w4a8 mode, where `<config_tag>` comes from `quantize_config.json` via `config_tag_from_meta`, e.g. `w4a8_l2_a0.50_gs32`). Filenames use **3-digit** indices (`000.png`, `001.png`, …) aligned with prompt order and per-line seeds in tab-separated prompt files.
 
-**Benchmark**
+**Benchmark (GT comparison)**
 
 ```bash
-python -m src.benchmark.benchmark_model --config w4a8 --quantized-dir quantized/<tag>/ \
-  --num-images 256 --reload-n 0 --output-dir benchmark_results/<tag> \
-  --reference-dir results/fp16
+python -m src.benchmark.gt_comparison_pipeline \
+  --ground-truth-dir /path/to/gt_images \
+  --fp16-images-dir benchmark_results/fp16_p2/images \
+  --quantized-dir quantized/<tag>/ \
+  --output-dir benchmark_results/<tag>_gt_eval \
+  --config w4a8_poly
 ```
 
-Use `--config fp16_p2` for baseline FP16 with the same Phase 2 pipeline settings (`shift=3.0`, etc.). `--config w4a8` loads from `--quantized-dir` and uses `quantize_config.json` to instantiate dynamic vs static W4A8 (`act_quant`). For paired PSNR/LPIPS, use **`--baseline-dir`**; `--reference-dir` is for FID/IS/KID-style reference sets. See `benchmark_model.py` docstring.
+Computes FID, CMMD, CLIP image-text scores, and LPIPS. Generates W4A8 images automatically if not already present. See `gt_comparison_pipeline.py` docstring.
 
 **Visualization helpers** (several require **`--calibration-dir`** on a quantized output tree with `calibration.npz`):
 
@@ -113,9 +114,7 @@ Use `--config fp16_p2` for baseline FP16 with the same Phase 2 pipeline settings
 - `python -m src.phase2.plot_quantized_weight --quantized-dir quantized/<tag>/` — per-group FP vs dequantized W4 (**requires MLX**).
 - `python -m src.phase2.plot_mse_vs_block --quantized-dir quantized/<tag>/` — analytical W4 / dynamic-A8 MSE vs block (**requires MLX**).
 
-**Sweep pipeline:** `python -m src.sweep.cli` — see `src/sweep/SWEEP.md`.
-
-Full detail, theory, and artifact tables: **`src/PHASE2.md`** (all-caps `PHASE2`; on case-sensitive systems this is the only path — not `Phase2.md`).
+Full detail, theory, and artifact tables: **`src/PHASE2.md`** (all-caps `PHASE2`; on case-sensitive systems this is the only path -- not `Phase2.md`).
 
 ---
 
@@ -130,4 +129,4 @@ Full detail, theory, and artifact tables: **`src/PHASE2.md`** (all-caps `PHASE2`
 ## References
 
 - **PTQ4DiT** (methodology): *Post-training Quantization for Diffusion Transformers*.
-- **TaQ-DiT** / time-aware quantization: cited in early project docs; this repo’s implementation is **PTQ4DiT-aligned CSB/SSC** on SD3/MMDiT via DiffusionKit.
+- This repo implements **PTQ4DiT-aligned CSB/SSC**, polynomial σ-aware activation clipping, and alpha search on SD3/MMDiT via DiffusionKit.

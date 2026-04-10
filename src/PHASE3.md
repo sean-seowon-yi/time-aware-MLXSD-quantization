@@ -2,18 +2,17 @@
 
 ## 1. Motivation and Scope
 
-Phase 2 provides two activation-quantization strategies for the 286 W4A8 target layers:
+Phase 2 uses **static** activation quantization for the 286 W4A8 target layers:
 
 | Mode | Scale computation | Strengths | Weaknesses |
 |------|-------------------|-----------|------------|
-| **Dynamic** | `scale = max(|x|) / 127` every forward | Tracks every input exactly | Per-forward max-reduction cost; no offline optimisation signal |
-| **Static** (SSC-weighted / global-max) | One fixed scale per layer from Phase 1 calibration | Zero runtime overhead | Conservative: a single number must cover all σ; under-utilises the INT8 grid at most timesteps |
+| **Static** (SSC-weighted / global-max) | One fixed scale per layer from Phase 1 calibration | Zero per-forward max-reduction overhead | Conservative: a single number must cover all σ; under-utilises the INT8 grid at most timesteps |
 
-Both approaches ignore a key empirical observation: **activation magnitudes are smooth, low-degree functions of the denoising noise level σ**. Rectified flow's linear interpolation `x_t = (1−t)·x_0 + t·ε` produces activation trajectories that are well-described by degree-2 or degree-3 polynomials (median R² ≈ 0.94 for non-constant layers; see `useful_doc/POLYNOMIAL_CLIPPING_EXPLAINER.md` §3–4 and Phase 1 findings on temporal CoV).
+That fixed-scale view ignores a key empirical observation: **activation magnitudes are smooth, low-degree functions of the denoising noise level σ**. Rectified flow's linear interpolation `x_t = (1−t)·x_0 + t·ε` produces activation trajectories that are well-described by degree-2 or degree-3 polynomials (median R² ≈ 0.94 for non-constant layers; see Phase 1 findings on temporal CoV).
 
-Phase 3 introduces **polynomial clipping**: instead of a constant scale or a runtime max-reduction, each layer's A8 clipping bound is evaluated as `α(σ) = poly(σ)` — a cheap polynomial of the current noise level. This is a **third activation-quantization mode** that sits alongside `dynamic` and `static` in the existing `--act-quant` CLI.
+Phase 3 introduces **polynomial clipping**: instead of the Phase 2 **static** A8 scale, each layer's A8 clipping bound is evaluated as `α(σ) = poly(σ)` — a cheap polynomial of the current noise level. **Poly mode replaces the static A8 step** in the wrapped linear (σ-conditioned scales instead of stored static scales).
 
-**Goal.** Replace the `fake_quantize_a8` step inside `W4A8Linear.__call__` with a σ-conditioned variant that:
+**Goal.** Replace the static A8 step inside `W4A8StaticLinear.__call__` with a σ-conditioned variant that:
 
 1. Evaluates a per-layer polynomial at the current σ to obtain the clipping bound α.
 2. Computes `scale = α / 127`.
@@ -50,14 +49,14 @@ Phase 2 pipeline (unchanged)                     Phase 3 addition
 
 ### 2.1 What polynomial clipping replaces
 
-| Component | Dynamic A8 | Static A8 | **Polynomial A8** |
-|-----------|------------|-----------|-------------------|
-| Scale source | `max(\|x\|)` at runtime | Fixed scalar from calibration | `poly(σ) / 127` |
-| σ-awareness | Implicit (input varies) | None | Explicit |
-| Runtime cost per layer | max-reduce over full tensor | 0 | 1 polynomial eval (~5 FLOPs) |
-| Granularity | per-tensor or per-token | per-tensor or per-channel | **per-tensor or per-channel** |
-| Offline cost | 0 | SSC-weighted aggregation | Polynomial fitting |
-| INT8 utilisation | Optimal (tracks real data) | Worst-case (conservative) | Near-optimal (tracks trajectory) |
+| Component | Static A8 | **Polynomial A8** |
+|-----------|-----------|-------------------|
+| Scale source | Fixed scalar from calibration | `poly(σ) / 127` |
+| σ-awareness | None | Explicit |
+| Runtime cost per layer | 0 | 1 polynomial eval (~5 FLOPs) |
+| Granularity | per-tensor or per-channel | **per-tensor or per-channel** |
+| Offline cost | SSC-weighted aggregation | Polynomial fitting |
+| INT8 utilisation | Worst-case (conservative) | Near-optimal (tracks trajectory) |
 
 ### 2.2 What stays the same
 
@@ -474,9 +473,9 @@ def load_quantized_model_poly(pipeline, quantized_dir: Path) -> dict:
 ```
 
 Steps:
-1. Call Phase 2's `load_quantized_model(pipeline, quantized_dir)` — creates `W4A8Linear` modules with correct `b_inv` values (populated via `load_weights` from safetensors).
+1. Call Phase 2's `load_quantized_model_static(pipeline, quantized_dir)` — creates `W4A8StaticLinear` modules with correct `b_inv` values (populated via `load_weights` from safetensors).
 2. Read `poly_schedule.json`.
-3. For each schedule entry, navigate to the `W4A8Linear` module and replace it with `W4A8PolyLinear`, transferring:
+3. For each schedule entry, navigate to the `W4A8StaticLinear` module and replace it with `W4A8PolyLinear`, transferring:
    - `module.qlinear` (W4 weights, already loaded).
    - `module.b_inv` if present (for o_proj/fc2).
    - `mx.array(entry["coeffs"])` — auto-detects shape: 1D list → `[d+1]`, 2D list → `[d_in, d+1]`.
@@ -488,12 +487,12 @@ Steps:
 
 ### 6.1 `run_e2e.py` extension (future)
 
-Add `"poly"` as a third `--act-quant` choice. The e2e pipeline gains one additional step after CSB + W4:
+After the usual Phase 2 static W4A8 save, **poly mode** is applied by generating `poly_schedule.json` (e.g. `python -m src.phase3.generate_schedule …`) and loading with `load_quantized_model_poly` at inference — **poly replaces the static A8 step** inside each target linear; weights and CSB metadata stay the same.
 
 ```
-Step 5 (existing):  W4 quantisation
+Step 5 (existing):  W4 quantisation (static A8)
 Step 5b (new):      Generate polynomial schedule from diagnostics + calibration
-Step 6 (existing):  Save checkpoint
+Step 6 (existing):  Save checkpoint (+ optional poly_schedule.json alongside)
 ```
 
 The schedule JSON is saved alongside `mmdit_quantized.safetensors`:
@@ -501,7 +500,7 @@ The schedule JSON is saved alongside `mmdit_quantized.safetensors`:
 ```
 quantized/<tag>/
 ├── mmdit_quantized.safetensors
-├── quantize_config.json          # act_quant: "poly"
+├── quantize_config.json          # static A8 metadata; poly indicated when loader uses poly_schedule.json
 ├── calibration.npz
 ├── calibration_meta.json
 └── poly_schedule.json            # per-layer polynomial coefficients
@@ -509,7 +508,7 @@ quantized/<tag>/
 
 ### 6.2 Loading at inference (future)
 
-`run_inference.py` and `benchmark_model.py` already branch on `act_quant` (`dynamic` vs `static`). Add a third branch:
+`run_inference.py` and benchmark tooling can branch on checkpoint metadata (e.g. presence of `poly_schedule.json` or `act_quant` in `quantize_config.json`) to call `load_quantized_model_poly` instead of static-only loading:
 
 ```python
 if meta.get("act_quant") == "poly":
@@ -534,15 +533,9 @@ if meta.get("act_quant") == "poly":
 
 ---
 
-## 8. Relationship to AdaRound / GPTQ Weight Optimisation
+## 8. Relationship to Phase 4 GPTQ
 
-Polynomial clipping is not just a better A8 strategy — it **enables** timestep-aware weight optimisation. When a future GPTQ or AdaRound pass optimises weight rounding:
-
-1. **Correct per-σ clipping**: Each calibration sample arrives with its σ. The polynomial evaluates `α(σ)` to give the correct clipping bound for that sample. The reconstruction loss then reflects only weight-rounding error, not clipping error.
-
-2. **σ-weighted loss**: Weight the reconstruction loss by `w(σ) = 1/(σ + offset)` (perceptual) or `w(σ) = |dα/dσ|` (trajectory sensitivity). These strategies only make sense when the clipping is already correct at each σ.
-
-3. **Derivative-based weighting**: The polynomial gives an exact derivative `dα/dσ` for free (e.g. for degree 2: `c₁ + 2c₂σ`). This identifies σ regions where the clipping bound is most sensitive.
+Polynomial σ-aware fake-quantisation is used during **Hessian collection** in `src/phase4` so calibration activations use **`α(σ)`** instead of a single static clip. That keeps the Hessian/GPTQ objective aligned with the same σ-dependent A8 behaviour you deploy via `W4A8PolyLinear` and `load_quantized_model_poly`.
 
 ---
 
@@ -564,10 +557,9 @@ Per-tensor-only schedules are trivially small. Per-channel adds cost but only fo
 |-----------|-----------------|--------------------|
 | Polynomial eval (degree 2, per-tensor) | 4 | 1,144 |
 | Polynomial eval (degree 2, per-channel, d_in=1536) | 4 × 1536 ≈ 6K | ~102K (17 layers) |
-| Dynamic A8 max-reduce (per-tensor, d_in=1536) | ~1536 | ~439,296 |
 | W4 matmul (e.g. 1536×1536) | ~4.7M | ~1.35B |
 
-Per-tensor polynomial eval is **~400× cheaper** than dynamic max-reduction. Per-channel polynomial eval costs ~6K FLOPs per layer (comparable to the max-reduce) but produces a tighter bound. Both are **negligible** compared to the matmul.
+Per-tensor and per-channel polynomial eval add only a handful of FLOPs per layer. Both are **negligible** compared to the matmul.
 
 ### 9.3 Memory
 
@@ -604,25 +596,28 @@ python -m src.phase3.generate_schedule \
 ### 10.2 End-to-end with polynomial A8 (future)
 
 ```bash
-# Full pipeline: collection → CSB → W4 → poly A8 schedule → save
-python -m src.phase2.run_e2e --output-dir quantized/ --act-quant poly
+# Phase 2: collection → CSB → W4 → static A8 → save
+python -m src.phase2.run_e2e --output-dir quantized/
 
-# With per-channel for high-ρ layers
-python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection \
-    --act-quant poly --poly-per-channel-rho-threshold 0.5
+# Phase 3: build poly_schedule.json next to the checkpoint
+python -m src.phase3.generate_schedule \
+    --diagnostics-dir diagnostics \
+    --calibration-dir quantized/<tag>/ \
+    --per-channel-rho-threshold 0.5 \
+    --output quantized/<tag>/poly_schedule.json
 ```
 
 ### 10.3 Inference (future)
 
 ```bash
-# Inference loads poly_schedule.json automatically when act_quant=poly
+# Inference: poly path when wired to load_quantized_model_poly + poly_schedule.json
 python -m src.phase2.run_inference --mode w4a8 \
     --quantized-dir quantized/<tag>/ \
     --prompts-file src/settings/evaluation_set.txt \
     --output-dir results/
 ```
 
-No special flags — the loader detects `"act_quant": "poly"` in `quantize_config.json` and instantiates `W4A8PolyLinear` modules with the σ hook.
+When integrated, the loader would detect poly mode (e.g. `"act_quant": "poly"` in `quantize_config.json` or presence of `poly_schedule.json`) and instantiate `W4A8PolyLinear` modules with the σ hook.
 
 ---
 
@@ -650,16 +645,16 @@ No special flags — the loader detects `"act_quant": "poly"` in `quantize_confi
 
 | Step | Description |
 |------|-------------|
-| 5 | Extend `run_e2e.py` with `--act-quant poly` and `--poly-per-channel-rho-threshold` |
-| 6 | Extend `run_inference.py` and `benchmark_model.py` to detect `act_quant=poly` and call `load_quantized_model_poly` |
+| 5 | Wire optional post-save step: `generate_schedule` + persist `poly_schedule.json` next to checkpoints |
+| 6 | Extend `run_inference.py` and benchmark tooling to detect poly mode and call `load_quantized_model_poly` |
 | 7 | Phase 1 enhancement: collect signed `tensor_min` / `tensor_max` to enable shift polynomials |
-| 8 | Benchmark comparison: dynamic vs static vs polynomial A8 on the standard evaluation set |
+| 8 | Benchmark comparison: static vs polynomial A8 on the standard evaluation set |
 
 ---
 
 ## 12. Expected Degree Distribution (from Phase 1 Data)
 
-Based on Phase 1 findings and the explainer analysis:
+Based on Phase 1 findings:
 
 | Degree | Expected count | Fraction | Typical layers |
 |--------|---------------|----------|----------------|
@@ -668,22 +663,22 @@ Based on Phase 1 findings and the explainer analysis:
 | 3 (cubic) | ~1–5 | ~1% | Layers with U-shaped or inflection-point trajectories |
 | 4 (quartic) | 0–1 | <1% | Extremely rare |
 
-~80% of layers get a single constant (identical to static A8 with max absmax), while ~20% benefit from σ-aware clipping. With `--per-channel-rho-threshold 0.5`, approximately 17 of those ~57 dynamic layers also get per-channel granularity.
+~80% of layers get a single constant (identical to static A8 with max absmax), while ~20% benefit from σ-aware clipping. With `--per-channel-rho-threshold 0.5`, approximately 17 of those ~57 non-constant layers also get per-channel granularity.
 
 ---
 
-## 13. Comparison of All A8 Modes
+## 13. Comparison of A8 modes (static baseline vs polynomial)
 
-| Property | Dynamic | Static | Polynomial (per-tensor) | Polynomial (per-channel) |
-|----------|---------|--------|------------------------|-------------------------|
-| Scale accuracy | Exact | Conservative | Near-exact (R² ≈ 0.94) | Near-exact per channel |
-| Runtime overhead | max-reduce per layer per step | 0 | ~5 FLOPs per layer | ~6K FLOPs per layer (d_in=1536) |
-| σ-awareness | Implicit | None | Explicit | Explicit |
-| Channel-level precision | No (one scale for all) | No | No (one scale for all) | Yes (one scale per channel) |
-| INT8 grid utilisation | Optimal | Under-utilised | Near-optimal | Near-optimal per channel |
-| Enables σ-aware AdaRound | No | No | Yes | Yes |
-| Checkpoint size increase | 0 | `static_scales.npz` (~KB) | `poly_schedule.json` (~15 KB) | ~600 KB (17 per-channel layers) |
-| Handles unseen σ values | Yes (data-driven) | Partially | Yes (extrapolates) | Yes (extrapolates) |
+| Property | Static | Polynomial (per-tensor) | Polynomial (per-channel) |
+|----------|--------|------------------------|-------------------------|
+| Scale accuracy | Conservative | Near-exact (R² ≈ 0.94) | Near-exact per channel |
+| Runtime overhead | 0 | ~5 FLOPs per layer | ~6K FLOPs per layer (d_in=1536) |
+| σ-awareness | None | Explicit | Explicit |
+| Channel-level precision | No (one scale for all) or per-channel static | No (one scale for all) | Yes (one scale per channel) |
+| INT8 grid utilisation | Under-utilised | Near-optimal | Near-optimal per channel |
+| Used in Phase 4 Hessian / GPTQ path | No | Yes | Yes |
+| Checkpoint size increase | `static_scales.npz` (~KB) | `poly_schedule.json` (~15 KB) | ~600 KB (17 per-channel layers) |
+| Handles unseen σ values | Partially | Yes (extrapolates) | Yes (extrapolates) |
 
 ---
 
@@ -692,6 +687,6 @@ Based on Phase 1 findings and the explainer analysis:
 - **Phase 1 diagnostics:** `diagnostics/` (activation trajectories, sigma schedule).
 - **Phase 2 calibration:** `quantized/<tag>/calibration.npz` (balancing vectors `b`), `calibration_meta.json` (layer names, mean Spearman ρ).
 - **Phase 2 documentation:** `src/Phase2.md` (CSB, SSC, W4A8 architecture).
-- **Polynomial clipping theory:** `useful_doc/POLYNOMIAL_CLIPPING_EXPLAINER.md`.
+- **Polynomial clipping:** `src/phase3/poly_clipping.py` and this document.
 - **Phase 3 implementation:** `src/phase3/` (schedule generation, polynomial eval, inference module).
 - **PTQ4DiT paper:** Eq. 4 (salience), Eq. 7 (balancing), Eq. 11 (SSC weights).

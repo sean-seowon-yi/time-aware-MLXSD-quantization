@@ -2,7 +2,7 @@
 against Phase 1 FP16 baselines.
 
 Reuses Phase 1's ChannelStatsCollector + hook infrastructure (adapted for
-W4A8Linear modules) and adds weight-error analysis that compares original
+W4A8StaticLinear modules) and adds weight-error analysis that compares original
 FP16 weights against dequantized 4-bit weights.
 """
 
@@ -17,7 +17,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..phase1.hooks import ChannelStatsCollector
-from .quantize import W4A8Linear
+from .quantize_static import W4A8StaticLinear
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 def build_quantized_registry(mmdit) -> list[dict]:
     """Walk the quantized MMDiT and build a registry analogous to Phase 1.
 
-    For W4A8Linear modules, d_in comes from qlinear; for unquantized nn.Linear
+    For W4A8StaticLinear modules, d_in comes from qlinear; for unquantized nn.Linear
     modules, it comes from weight.shape[1].
     """
     registry = []
@@ -51,7 +51,7 @@ def build_quantized_registry(mmdit) -> list[dict]:
                     "family": proj_name,
                     "side": side,
                     "d_in": d_in,
-                    "quantized": isinstance(layer, W4A8Linear),
+                    "quantized": isinstance(layer, W4A8StaticLinear),
                 })
 
             if not (side == "text" and skip_text_post):
@@ -64,7 +64,7 @@ def build_quantized_registry(mmdit) -> list[dict]:
                         "family": "o_proj",
                         "side": side,
                         "d_in": _get_d_in(o_proj),
-                        "quantized": isinstance(o_proj, W4A8Linear),
+                        "quantized": isinstance(o_proj, W4A8StaticLinear),
                     })
 
                 for ff_name in ("fc1", "fc2"):
@@ -76,7 +76,7 @@ def build_quantized_registry(mmdit) -> list[dict]:
                         "family": ff_name,
                         "side": side,
                         "d_in": _get_d_in(layer),
-                        "quantized": isinstance(layer, W4A8Linear),
+                        "quantized": isinstance(layer, W4A8StaticLinear),
                     })
 
     registry.append({
@@ -97,24 +97,24 @@ def build_quantized_registry(mmdit) -> list[dict]:
         "family": "final_linear",
         "side": "image",
         "d_in": _get_d_in(fl),
-        "quantized": isinstance(fl, W4A8Linear),
+        "quantized": isinstance(fl, W4A8StaticLinear),
     })
 
     return registry
 
 
 def _get_d_in(layer) -> int:
-    if isinstance(layer, W4A8Linear):
+    if isinstance(layer, W4A8StaticLinear):
         return layer.qlinear.weight.shape[1] * (32 // layer.qlinear.bits)
     return layer.weight.shape[1]
 
 
 # ---------------------------------------------------------------------------
-# Hook adapter for W4A8Linear
+# Hook adapter for W4A8StaticLinear
 # ---------------------------------------------------------------------------
 
 class QuantizedLinearHook:
-    """Monkey-patches a W4A8Linear or nn.Linear so that __call__ records the
+    """Monkey-patches a W4A8StaticLinear or nn.Linear so that __call__ records the
     input activation to a ChannelStatsCollector.
     """
 

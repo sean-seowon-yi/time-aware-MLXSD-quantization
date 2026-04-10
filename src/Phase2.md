@@ -516,71 +516,62 @@ which internally calls `mx.quantize` and stores the quantized representation. At
 
 ### 7.2 Activation Quantization (A8)
 
-Dynamic per-tensor symmetric 8-bit fake quantization applied at runtime:
+**Static** symmetric 8-bit fake quantization: scales are **precomputed offline** from Phase 1 trajectories and Phase 2 calibration (post-CSB view of activations) and stored in `static_scales.npz`. At inference there is **no** per-forward max-reduction over activations.
+
+**Per-tensor** (default): one scalar scale per layer, `scale = α / 127` with `α` from SSC-weighted or global-max aggregation.
 
 $$
-\text{scale} = \frac{\max(|X|)}{127}, \quad X_q = \text{clamp}\left(\text{round}\left(\frac{X}{\text{scale}}\right),\; -128,\; 127\right), \quad \hat{X} = X_q \cdot \text{scale}
+X_q = \text{clamp}\left(\text{round}\left(\frac{X}{\text{scale}}\right),\; -128,\; 127\right), \quad \hat{X} = X_q \cdot \text{scale}
 $$
 
 ```python
-def fake_quantize_a8(x: mx.array) -> mx.array:
-    x_abs_max = mx.max(mx.abs(x))
-    scale = x_abs_max / 127.0
-    scale = mx.maximum(scale, mx.array(1e-8))
+def fake_quantize_a8_static(x: mx.array, scale: mx.array) -> mx.array:
     x_q = mx.clip(mx.round(x / scale), -128, 127)
     return x_q * scale
 ```
 
-This is a "fake quantization" — the output is a float tensor that has been quantized and dequantized. It accurately simulates the precision loss of 8-bit inference. The quantization is **per-tensor** (single scale factor for the entire activation tensor), which is the standard approach for activation quantization.
-
-**Per-token variant for high-ρ layers:** For layers where CSB incompletely equalises cross-channel dynamic range (mean ρ > `per_token_rho_threshold`, default 0.5), a per-token quantization is used instead:
+**Per-channel static** (optional granularity): `scales` has shape `[d_in]` and broadcasts over batch and sequence dimensions — tighter bounds where CSB leaves residual cross-channel spread (see `quantize_static.py`).
 
 ```python
-def fake_quantize_a8_per_token(x: mx.array) -> mx.array:
-    scale = mx.max(mx.abs(x), axis=-1, keepdims=True) / 127.0
-    scale = mx.maximum(scale, mx.array(1e-8))
-    x_q = mx.clip(mx.round(x / scale), -128, 127)
-    return x_q * scale
+def fake_quantize_a8_static_per_channel(x: mx.array, scales: mx.array) -> mx.array:
+    x_q = mx.clip(mx.round(x / scales), -128, 127)
+    return x_q * scales
 ```
 
-This computes one scale per sequence position (row) rather than one for the whole tensor, providing finer-grained quantization for the ~17 layers with ρ > 0.5. These include early-block attention projections (blocks 0–3), late text-side MLPs (blocks 20–22), and `final_layer.linear`. The per-token mode is automatically selected during quantization based on the mean ρ computed during calibration.
+This is still "fake quantization" — the output is float with simulated 8-bit error. Scale computation modes (`ssc_weighted`, `global_max`) and granularities (`per_tensor`, `per_channel`) are selected when building the checkpoint (`compute_static_scales` in `quantize_static.py`).
 
-**Why not per-channel:** Per-channel activation quantization requires knowing the per-channel statistics at runtime, adding overhead. Per-tensor (or per-token) is simpler and, for the majority of layers where CSB is effective, per-tensor is sufficient.
+### 7.3 W4A8StaticLinear Class
 
-### 7.3 W4A8Linear Class
-
-A drop-in replacement for `nn.Linear` that combines W4 weight storage, A8 activation quantization, and optional online CSB balancing:
+A drop-in replacement for `nn.Linear` that combines W4 weight storage, **static** A8 activation quantization, and optional online CSB balancing:
 
 ```python
-class W4A8Linear(nn.Module):
-    """W4A8 quantized linear with optional online CSB balancing."""
+class W4A8StaticLinear(nn.Module):
+    """W4 weights + static A8 fake-quant; optional online CSB b_inv."""
 
     def __init__(
         self,
         qlinear: nn.QuantizedLinear,
         b_inv: mx.array | None = None,
-        per_token: bool = False,
+        scale: mx.array | None = None,
+        per_channel: bool = False,
     ):
         super().__init__()
         self.qlinear = qlinear
-        self._per_token = per_token
+        self._per_channel = per_channel
         if b_inv is not None:
-            self.b_inv = b_inv  # [d_in], stored as float32
+            self.b_inv = b_inv
+        if scale is not None:
+            self.static_scale = scale
 
     def __call__(self, x: mx.array) -> mx.array:
         orig_dtype = x.dtype
-
-        # 1. Online CSB balancing (for o_proj, fc2)
         if hasattr(self, "b_inv"):
             x = (x * self.b_inv).astype(orig_dtype)
-
-        # 2. A8 fake quantization (per-token for high-rho layers)
-        if self._per_token:
-            x = fake_quantize_a8_per_token(x)
-        else:
-            x = fake_quantize_a8(x)
-
-        # 3. W4 quantized matmul
+        if hasattr(self, "static_scale"):
+            if self._per_channel:
+                x = fake_quantize_a8_static_per_channel(x, self.static_scale)
+            else:
+                x = fake_quantize_a8_static(x, self.static_scale)
         return self.qlinear(x)
 ```
 
@@ -663,7 +654,7 @@ Phase 1 findings: mean ρ = 0.334, with individual layers spanning 0.06–0.70. 
 Phase 1 findings: extreme activation salience in fc1/fc2 (127–414), with most layers showing high ρ (0.6–0.8 for blocks 20–22 fc1, blocks 21–22 fc2). Notable exception: `blocks.20.text.mlp.fc2` has ρ = 0.13 despite high salience (179), making it a better CSB target than its neighbors. Block 23 text has no FFN (see Section 9.4). These are the highest-risk quantization targets.
 
 **Approach.** Apply CSB+SSC. The high activation salience means the balancing factors will be large, significantly compressing the activation dynamic range. Verify that the compressed range still has sufficient precision in 8-bit. If not:
-- **Fallback:** Per-token activation quantization (separate scale per sequence position) instead of per-tensor.
+- **Fallback:** Tighter static scales (e.g. `per_channel` granularity), higher weight precision on selected layers, or Phase 3 polynomial A8 for σ-aware clipping.
 
 ### 9.4 Block 23 Text
 
@@ -697,7 +688,8 @@ src/phase2/
 ├── config.py             # Hyperparameters, constants, pipeline kwargs
 ├── calibrate.py          # Load Phase 1 data, compute SSC weights + balancing vectors
 ├── balance.py            # Absorb B⁻¹ into adaLN, balance weights, collect b_inv
-├── quantize.py           # W4A8Linear, fake_quantize_a8, quantize/save/load model
+├── quantize.py           # Shared utilities (_navigate_to_parent, patch_pipeline_for_quantized_inference)
+├── quantize_static.py    # W4A8StaticLinear, fake_quantize_a8_static*, compute_static_scales, quantize/save/load static
 ├── diagnose.py           # Post-quantization diagnostics (W4A8 vs FP16 comparison)
 ├── visualize_quant.py    # Post-quantization diagnostic plots
 ├── run_quantize.py       # CLI: calibrate → balance → quantize → save (Phase 1 data required)
@@ -719,7 +711,6 @@ PHASE2_CONFIG = {
     "a_bits": 8,                 # Activation quantization bits
     "qkv_method": "max",         # "max", "geomean", or "l2" (Section 4)
     "ssc_tau": 1.0,              # SSC temperature (< 1 sharpens, Section 2.2)
-    "per_token_rho_threshold": 0.5,  # layers with ρ above this use per-token A8
     "final_layer_bits": 4,       # Can override to 8 or 16 for final layer
     "exclude_layers": [          # Layers to skip quantization
         "context_embedder",
@@ -779,36 +770,50 @@ def apply_csb_to_model(mmdit, registry, calibration, hidden_size=1536) -> dict[s
 ### 10.5 quantize.py
 
 ```python
-def fake_quantize_a8(x: mx.array) -> mx.array:
-    """Dynamic per-tensor symmetric 8-bit fake quantization."""
-
-class W4A8Linear(nn.Module):
-    """Drop-in nn.Linear replacement.  See Section 7.3."""
-
-def quantize_model(mmdit, registry, b_inv_map, config) -> dict[str, dict]:
-    """Replace target nn.Linear with W4A8Linear.  Returns layer_meta dict."""
+def _navigate_to_parent(mmdit, name: str):
+    """Return (parent, attr) for setattr(parent, attr, module) replacement."""
 
 def patch_pipeline_for_quantized_inference(pipeline) -> None:
     """Capture post-CSB adaLN weights and monkey-patch pipeline.load_mmdit
     so DiffusionKit restores absorbed (not original) adaLN weights."""
-
-def save_quantized_model(mmdit, output_dir, config, layer_meta, b_inv_layers) -> None:
-    """Save mmdit_quantized.safetensors + quantize_config.json.
-    Filters out to_offload.* keys before saving."""
-
-def load_quantized_model(pipeline, output_dir) -> dict:
-    """Create W4A8Linear stubs → load weights → patch pipeline."""
 ```
 
-### 10.6 diagnose.py (post-quantization diagnostics)
+### 10.6 quantize_static.py
+
+```python
+def fake_quantize_a8_static(x: mx.array, scale: mx.array) -> mx.array:
+    """Static per-tensor symmetric 8-bit fake quantization."""
+
+def fake_quantize_a8_static_per_channel(x: mx.array, scales: mx.array) -> mx.array:
+    """Static per-channel symmetric 8-bit fake quantization."""
+
+class W4A8StaticLinear(nn.Module):
+    """Drop-in nn.Linear replacement.  See Section 7.3."""
+
+def compute_static_scales(...) -> dict[str, np.ndarray | float]:
+    """Derive per-layer scales from Phase 1 diagnostics + calibration."""
+
+def quantize_model_static(mmdit, registry, b_inv_map, static_scales, config) -> dict[str, dict]:
+    """Replace target nn.Linear with W4A8StaticLinear.  Returns layer_meta dict."""
+
+def save_quantized_model_static(mmdit, output_dir, config, layer_meta, b_inv_layers,
+                                static_scales, granularity, mode) -> None:
+    """Save mmdit_quantized.safetensors + quantize_config.json + static_scales.npz.
+    Filters out to_offload.* keys before saving."""
+
+def load_quantized_model_static(pipeline, output_dir) -> dict:
+    """Create W4A8StaticLinear stubs → load weights → patch pipeline."""
+```
+
+### 10.7 diagnose.py (post-quantization diagnostics)
 
 ```python
 def build_quantized_registry(mmdit) -> list[dict]:
-    """Like Phase 1 registry but handles W4A8Linear modules.
+    """Like Phase 1 registry but handles W4A8StaticLinear modules.
     Recovers d_in from packed QuantizedLinear weights."""
 
 class QuantizedLinearHook:
-    """Monkey-patches W4A8Linear.__call__ to record input activations
+    """Monkey-patches W4A8StaticLinear.__call__ to record input activations
     BEFORE b_inv scaling and A8 fake-quantization."""
 
 def run_quantized_collection(pipeline, seed_prompt_pairs, collector, ...) -> None:
@@ -909,7 +914,7 @@ After CSB absorption, the adaLN weights contain the modified (absorbed) values. 
 1. Capturing the current (post-CSB) adaLN weights.
 2. Monkey-patching `pipeline.load_mmdit` so that when called with `only_modulation_dict=True`, it returns the captured post-CSB weights instead of loading originals from disk.
 
-This patch is applied both during `run_quantize.py` (after CSB, before saving) and inside `load_quantized_model()` (after loading saved weights).
+This patch is applied both during `run_quantize.py` (after CSB, before saving) and inside `load_quantized_model_static()` (after loading saved weights).
 
 ---
 
@@ -971,25 +976,24 @@ Phase 2c: W4A8 Quantization
 ├── For each of 286 target layers:
 │   ├── nn.QuantizedLinear.from_linear(linear, group_size=64, bits=4)
 │   │   └── mx.quantize: per-group affine 4-bit (Round-to-Nearest)
-│   ├── W4A8Linear or W4A8StaticLinear(qlinear, b_inv, static_scale, ...)
-│   │   (dynamic per-forward A8 vs fixed static scales; see --act-quant in run_e2e)
+│   ├── W4A8StaticLinear(qlinear, b_inv, static_scale, per_channel=...)
 │   └── setattr(parent, attr, w4a8_module)  →  replace in model tree
-└── save_quantized_model() / save_quantized_model_static()
+└── save_quantized_model_static(...)
     ├── mmdit_quantized.safetensors  (filters to_offload.* keys)
-    ├── quantize_config.json         (layer metadata, b_inv_layers, hyperparams, act_quant)
-    └── [static only] static_scales.npz
+    ├── quantize_config.json         (layer metadata, b_inv_layers, hyperparams, act_quant: static)
+    └── static_scales.npz
 │
 ▼
 Inference  [fp16 model, fp32 b_inv multiply]
-├── load_quantized_model(pipeline, output_dir)
-│   ├── Create W4A8Linear stubs from metadata
+├── load_quantized_model_static(pipeline, output_dir)
+│   ├── Create W4A8StaticLinear stubs from metadata
 │   ├── Load safetensors weights (filter to_offload.*)
 │   └── patch_pipeline_for_quantized_inference()
 └── pipeline.generate_image(prompt, seed=seed, ...)
     └── For each denoising step:
-        └── For each W4A8Linear layer:
+        └── For each W4A8StaticLinear layer:
             ├── x * b_inv [fp32] → .astype(fp16)   (online layers only)
-            ├── fake_quantize_a8(x)                  (per-tensor symmetric 8-bit)
+            ├── fake_quantize_a8_static(x, scale)  (or per-channel variant)
             └── qlinear(x)                           (4-bit × fp16 matmul)
 ```
 
@@ -1017,8 +1021,9 @@ python -m src.phase2.run_e2e --output-dir quantized/ --alpha 0.3 --qkv-method ge
 # L2-norm QKV merge
 python -m src.phase2.run_e2e --output-dir quantized/ --qkv-method l2 --skip-collection
 
-# Static A8 (see §15.5)
-python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection --act-quant static
+# Static mode / granularity (defaults: ssc_weighted, per_tensor; see §15.5)
+python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection \
+    --static-mode ssc_weighted --static-granularity per_tensor
 ```
 
 ### 15.2 Standalone Quantization (requires prior Phase 1 data)
@@ -1074,26 +1079,26 @@ python -m src.phase2.run_diagnose --analysis-only --output-dir post_quant_diagno
 
 ### 15.5 Static activation quantization (W4A8)
 
-Static scales are computed from Phase 1 diagnostics + full calibration (including balancing vectors) and saved with the checkpoint. **Only** `run_e2e.py` implements this path (`quantize_static.py`). The standalone `run_quantize.py` script performs **dynamic** A8 only.
+Static scales are computed from Phase 1 diagnostics + full calibration (including balancing vectors) and saved with the checkpoint. Both **`run_e2e.py`** and **`run_quantize.py`** use `quantize_static.py` (there is no dynamic A8 path).
 
 ```bash
-python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection \
-  --act-quant static --static-mode ssc_weighted --static-granularity per_tensor
+# Defaults: SSC-weighted scales, per-tensor (same as a bare run_e2e)
+python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection
 
 # Optional: global-max aggregation, or per-channel static scales
 python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection \
-  --act-quant static --static-mode global_max
+  --static-mode global_max
 python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection \
-  --act-quant static --static-granularity per_channel
+  --static-granularity per_channel
 ```
 
 Saved `quantize_config.json` includes `"act_quant": "static"`, `"static_mode"`, `"static_granularity"`, and `static_scales.npz` alongside `mmdit_quantized.safetensors`.
 
-### 15.6 Benchmark (`src/benchmark/benchmark_model.py`)
+### 15.6 Benchmark (`src/benchmark/generate.py` / GT pipeline)
 
 Generates images from the prompt file (default `src/settings/evaluation_set.txt`), optional FID/IS/KID vs `--reference-dir`, CLIP metrics, and paired **PSNR/LPIPS** vs `--baseline-dir` (matched by **filename**, e.g. `041.png` to `041.png`). Tab-separated `seed<TAB>prompt` files supply **per-image seeds**; otherwise **`--seed` + `img_idx`** is used.
 
-Use **`--config w4a8`** with **`--quantized-dir`**; the loader reads `quantize_config.json` and instantiates dynamic or static W4A8 (`act_quant`). The alias **`w4a8_static`** exists but is optional. For filename alignment with `run_inference` (3-digit names), use **`--config w4a8`** (or `fp16_p2`) with the same `--prompt-csv` and `--num-images` as the FP16 baseline. See the module docstring for `--reload-n` (memory) and `fp16_p2` baseline settings.
+Use **`--config w4a8`** with **`--quantized-dir`**; the loader reads `quantize_config.json` and instantiates **static** W4A8 (`W4A8StaticLinear`). Config aliases such as **`w4a8_static`** / **`w4a8_poly`** remain for tooling compatibility. For filename alignment with `run_inference` (3-digit names), use **`--config w4a8`** (or `fp16_p2`) with the same `--prompt-csv` and `--num-images` as the FP16 baseline. See the module docstring for `--reload-n` (memory) and `fp16_p2` baseline settings.
 
 ### 15.7 Standalone visualization pipelines
 
@@ -1104,7 +1109,7 @@ These read `diagnostics/` and/or `quantized/` and do not modify the model. **`pl
 | `src.phase2.plot_post_csb` | Activation absmax vs σ (pre-CSB vs post-CSB `/ b`; optional static clip if `static_scales.npz` is present under `--calibration-dir`). |
 | `src.phase2.plot_weight_profile` | Per-channel weight absmax before/after CSB (`w` vs `w * b`). |
 | `src.phase2.plot_quantized_weight` | Per-group absmax: post-CSB FP vs W4-dequantized (needs `mlx`). |
-| `src.phase2.plot_mse_vs_block` | Analytical W4 / dynamic-A8 MSE vs block index (needs `mlx`). |
+| `src.phase2.plot_mse_vs_block` | Analytical W4 / static-A8 MSE vs block index (needs `mlx`). |
 
 ---
 
@@ -1130,7 +1135,6 @@ Non-quantized components (adaLN, embedders, norms, SDPA, text encoders, VAE) rem
 - **group_size (W4):** Smaller groups (32) provide finer-grained quantization but increase scale/bias overhead. Larger groups (128) are more memory-efficient but may lose precision on layers with heterogeneous weight distributions. Default 64 is a standard balance.
 - **QKV method:** Test all three methods (max, geomean, l2) on a small validation set and compare output MSE. By the power-mean inequality, geomean ≤ l2 ≤ max, so they produce progressively more conservative (larger) merged weight salience. The sweep pipeline (`src/sweep/`) automates this comparison.
 - **ssc_tau (SSC temperature):** τ = 1.0 is the PTQ4DiT default. Lower values (e.g., 0.5, 0.3) sharpen the time-aware weighting, giving more influence to timesteps with strong complementarity. Phase 1 findings show SSC is near-uniform for ~87% of layers with τ = 1.0; temperature scaling primarily affects the ~13% of layers (image-side MLPs, mid-block q_proj) where ρ trajectories span > 0.3. Risk: τ too low may over-concentrate weight on a few timesteps.
-- **per_token_rho_threshold:** Layers with mean ρ above this threshold use per-token (one scale per sequence position) rather than per-tensor activation quantization. Default 0.5. Lowering the threshold applies per-token A8 to more layers (higher overhead, potentially better quality); raising it restricts per-token to only the most challenging layers.
 
 ### 16.3 Validation Strategy
 
@@ -1152,15 +1156,15 @@ For each comparison, compute:
 | File | Contents |
 |---|---|
 | `mmdit_quantized.safetensors` | All MMDiT parameters (quantized + non-quantized). `to_offload.*` keys filtered out. |
-| `quantize_config.json` | Hyperparameters, per-layer metadata (`d_in`, `d_out`, `has_bias`, `bits`, `has_b_inv`), `b_inv_layers` list, and `act_quant` (`dynamic` / `static`) plus static mode/granularity when applicable. |
+| `quantize_config.json` | Hyperparameters, per-layer metadata (`d_in`, `d_out`, `has_bias`, `bits`, `has_b_inv`), `b_inv_layers` list, and `act_quant` (`static`) plus `static_mode` / `static_granularity`. |
 | `calibration.npz` | Per-layer balancing vectors `b` (float64). |
 | `calibration_meta.json` | Layer names and `b_inv_layers` list. |
 | `static_scales.npz` | (Static A8 only) Per-layer scalar or per-channel scales. |
 
-**Loading sequence** (`load_quantized_model`):
+**Loading sequence** (`load_quantized_model_static`):
 
 1. Read `quantize_config.json` to learn which layers are quantized and their shapes.
-2. For each quantized layer, create a `W4A8Linear` stub (with `nn.QuantizedLinear` of correct `d_in`/`d_out`/`bits`/`group_size` and a zero `b_inv` placeholder if needed).
+2. For each quantized layer, create a `W4A8StaticLinear` stub (with `nn.QuantizedLinear` of correct `d_in`/`d_out`/`bits`/`group_size`, static scales from `static_scales.npz`, and a zero `b_inv` placeholder if needed).
 3. Replace the corresponding `nn.Linear` in the model tree.
 4. Load `mmdit_quantized.safetensors`, filtering out `to_offload.*` keys.
 5. Call `patch_pipeline_for_quantized_inference()` to prevent DiffusionKit from overwriting absorbed adaLN weights.
