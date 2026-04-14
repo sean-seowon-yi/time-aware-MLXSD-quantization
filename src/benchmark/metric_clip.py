@@ -221,17 +221,18 @@ def compute_cmmd_from_embeddings(
     gen_emb: np.ndarray,
     ref_emb: np.ndarray,
 ) -> Optional[float]:
-    """CMMD via RBF-kernel MMD over CLIP embeddings (median heuristic for gamma)."""
+    """CMMD via RBF-kernel MMD over CLIP embeddings (fixed σ=10, ×1000; Google CMMD)."""
     if gen_emb.shape[0] < 2 or ref_emb.shape[0] < 2:
         print("WARNING: CMMD requires >= 2 images per directory -- returning None.")
         return None
-    all_emb = np.concatenate([gen_emb, ref_emb], axis=0)
-    dists = _pairwise_sq_dists(all_emb, all_emb)
-    tri = dists[np.triu_indices_from(dists, k=1)]
-    med = np.median(tri[tri > 0])
-    if not np.isfinite(med) or med <= 0:
-        med = 1.0
-    gamma = 1.0 / (2.0 * med)
+    # all_emb = np.concatenate([gen_emb, ref_emb], axis=0)
+    # dists = _pairwise_sq_dists(all_emb, all_emb)
+    # tri = dists[np.triu_indices_from(dists, k=1)]
+    # med = np.median(tri[tri > 0])
+    # if not np.isfinite(med) or med <= 0:
+    #     med = 1.0
+    # gamma = 1.0 / (2.0 * med)
+    gamma = 1.0 / (2.0 * 10.0**2)
 
     d_rr = _pairwise_sq_dists(ref_emb, ref_emb)
     d_ff = _pairwise_sq_dists(gen_emb, gen_emb)
@@ -242,4 +243,5 @@ def compute_cmmd_from_embeddings(
     k_fr = np.exp(-gamma * d_fr)
 
     mmd2 = float(k_rr.mean() + k_ff.mean() - 2.0 * k_fr.mean())
-    return mmd2
+    # return mmd2
+    return mmd2 * 1000.0

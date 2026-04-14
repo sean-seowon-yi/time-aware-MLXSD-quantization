@@ -13,6 +13,9 @@ def compute_fidelity_metrics(
     *,
     kid_subset_max: int = 1000,
     use_cuda: bool = False,
+    isc: bool = True,
+    kid: bool = True,
+    prc: bool = True,
 ) -> Optional[Dict]:
     """
     Compute FID, IS, KID, Precision, and Recall between two image directories.
@@ -23,6 +26,9 @@ def compute_fidelity_metrics(
     ----------
     generated_dir, reference_dir : str | Path
         Directories containing images (PNG/JPEG).
+    isc, kid, prc : bool
+        When False, skip that metric in torch-fidelity (faster; missing keys
+        become NaN in the returned dict). FID is always requested.
 
     Returns
     -------
@@ -48,18 +54,20 @@ def compute_fidelity_metrics(
     cap = max(1, int(kid_subset_max))
     kid_subset_size = min(n_gen, n_ref, cap)
 
-    metrics = calculate_metrics(
+    cm_kw: Dict = dict(
         input1=str(generated_dir),
         input2=str(reference_dir),
         fid=True,
-        isc=True,
-        kid=True,
-        prc=True,
-        kid_subset_size=kid_subset_size,
+        isc=isc,
+        kid=kid,
+        prc=prc,
         verbose=False,
         cuda=use_cuda,
         save_cpu_ram=not use_cuda,
     )
+    if kid:
+        cm_kw["kid_subset_size"] = kid_subset_size
+    metrics = calculate_metrics(**cm_kw)
     return {
         "fid": float(metrics.get("frechet_inception_distance", float("nan"))),
         "isc_mean": float(metrics.get("inception_score_mean", float("nan"))),
