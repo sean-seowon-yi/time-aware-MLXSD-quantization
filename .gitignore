@@ -80,6 +80,7 @@ metrics/
 # run_diagnose, plot scripts, ad-hoc figures
 post_quant_diagnostics/
 plots/
+report/
 
 # Legacy / scratch plot dirs (kept for compatibility)
 activation_plots/

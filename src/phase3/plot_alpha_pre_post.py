@@ -110,6 +110,34 @@ _LBL_ACT = "Abs Max Activation"
 _LBL_POLY = "Poly curve"
 _LBL_POLY_ALPHA = "Poly curve shifted by α"
 
+# Match ``_plot_single_alpha`` / ``plot_poly_pre_post._plot_single`` (7×4, title 11, legend 8).
+_PLOT_FIGSIZE = (7, 4)
+_PLOT_TITLE_FONTSIZE = 11
+_PLOT_LEGEND_FONTSIZE = 8
+_PLOT_GRID_ALPHA = 0.25
+
+# Alpha-by-block plot: MLP fc1/fc2 only (image + text) + baseline at 1.0.
+DEFAULT_ALPHA_BY_BLOCK_LAYER_TYPES: tuple[str, ...] = (
+    "image.mlp.fc1",
+    "image.mlp.fc2",
+    "text.mlp.fc1",
+    "text.mlp.fc2",
+)
+_ALPHA_BY_BLOCK_LINEWIDTH = 1.1
+_ALPHA_BY_BLOCK_MARKER_SIZE = 3
+_ALPHA_BY_BLOCK_BASELINE_LINEWIDTH = 1.0
+
+
+def _friendly_layer_type(layer_type: str) -> str:
+    """``image.mlp.fc2`` → ``Image FC2`` (same naming style as ``_friendly_title``)."""
+    for prefix, side in (("image", "Image"), ("text", "Text")):
+        p = f"{prefix}."
+        if layer_type.startswith(p):
+            rest = layer_type[len(p) :]
+            nice = _SUBLAYER_LABEL.get(rest, rest.replace("_", " "))
+            return f"{side} {nice}"
+    return layer_type
+
 
 def _layer_sort_key(name: str) -> tuple[int, int, int, str]:
     """Sort key: block index, image before text, attention/MLP family."""
@@ -453,12 +481,16 @@ def plot_alpha_by_block(
     """Plot per-block ``alpha_multiplier`` as a line plot, one line per layer type.
 
     Layer types are ``{side}.{sublayer}`` strings, e.g.
-    ``image.mlp.fc1``, ``text.mlp.fc2``.  Pass *layer_types* to filter
-    (default: all types present in the schedule).
+    ``image.mlp.fc1``, ``text.mlp.fc2``.  When *layer_types* is ``None``,
+    only image/text ``mlp.fc1`` and ``mlp.fc2`` are shown (plus baseline
+    at 1.0). Pass an explicit list to override.
     """
     if not HAS_MPL:
         logger.error("matplotlib is required")
         return
+
+    if layer_types is None or len(layer_types) == 0:
+        layer_types = list(DEFAULT_ALPHA_BY_BLOCK_LAYER_TYPES)
 
     with open(schedule_path) as f:
         schedule = json.load(f)
@@ -474,7 +506,7 @@ def plot_alpha_by_block(
         side = m.group(2)
         sublayer = m.group(3)
         layer_type = f"{side}.{sublayer}"
-        if layer_types is not None and layer_type not in layer_types:
+        if layer_type not in layer_types:
             continue
         alpha = float(entry.get("alpha_multiplier", 1.0))
         by_type.setdefault(layer_type, {})[block_idx] = alpha
@@ -484,48 +516,59 @@ def plot_alpha_by_block(
         return
 
     all_blocks = sorted({b for d in by_type.values() for b in d})
-    n_blocks = len(all_blocks)
-
-    fig, ax = plt.subplots(figsize=(14, 6))
 
     markers = ["o", "s", "^", "D", "v", "P", "X", "h", "<", ">", "d", "*"]
-    sorted_types = sorted(by_type.keys())
+    sorted_types = [t for t in layer_types if t in by_type]
+
+    default_title = "α multiplier by block and layer type"
 
     def _draw(ax, *, style: str) -> None:
         for i, layer_type in enumerate(sorted_types):
             block_alphas = by_type[layer_type]
             blocks = sorted(block_alphas.keys())
             values = [block_alphas[b] for b in blocks]
+            leg = _friendly_layer_type(layer_type)
             if style == "scatter":
                 ax.scatter(
                     blocks, values,
-                    marker=markers[i % len(markers)], s=40,
-                    label=layer_type, alpha=0.85, edgecolors="none", zorder=2,
+                    marker=markers[i % len(markers)], s=28,
+                    label=leg, alpha=0.85, edgecolors="none", zorder=2,
                 )
             else:
                 ax.plot(
                     blocks, values,
-                    marker="o", markersize=3, linewidth=1.5,
-                    label=layer_type, zorder=2,
+                    marker="o",
+                    markersize=_ALPHA_BY_BLOCK_MARKER_SIZE,
+                    linewidth=_ALPHA_BY_BLOCK_LINEWIDTH,
+                    label=leg, zorder=2,
                 )
         ax.axhline(
-            y=1.0, color="gray", linestyle="--", linewidth=1,
+            y=1.0, color="gray", linestyle="--",
+            linewidth=_ALPHA_BY_BLOCK_BASELINE_LINEWIDTH,
             alpha=0.5, label="baseline (1.0)",
         )
         ax.set_xlabel("Block index")
-        ax.set_ylabel("Alpha multiplier")
-        ax.set_xticks(range(n_blocks))
-        suffix = " (scatter)" if style == "scatter" else " (line)"
-        ax.set_title((title or "alpha_multiplier by block and layer type") + suffix)
-        ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
-        ax.grid(True, alpha=0.3)
+        ax.set_ylabel("α multiplier")
+        ax.set_xticks(all_blocks)
+        ax.set_title(
+            title or default_title,
+            fontsize=_PLOT_TITLE_FONTSIZE,
+        )
+        ax.legend(
+            loc="best",
+            fontsize=_PLOT_LEGEND_FONTSIZE,
+            frameon=True,
+            framealpha=0.9,
+            fancybox=True,
+        )
+        ax.grid(True, alpha=_PLOT_GRID_ALPHA)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     stem = output_path.stem
     ext = output_path.suffix or ".png"
 
     for style in ("scatter", "line"):
-        fig, ax = plt.subplots(figsize=(14, 6))
+        fig, ax = plt.subplots(figsize=_PLOT_FIGSIZE)
         _draw(ax, style=style)
         fig.tight_layout()
         p = output_path.with_name(f"{stem}_{style}{ext}")
@@ -582,7 +625,7 @@ def main() -> None:
     parser.add_argument(
         "--alpha-layer-types", type=str, nargs="*", default=None,
         help="Layer types for the alpha-by-block plot, e.g. image.mlp.fc1 "
-             "text.mlp.fc2.  Default: all types.",
+             "text.mlp.fc2.  Default: image/text mlp.fc1 and mlp.fc2 only.",
     )
     args = parser.parse_args()
 
