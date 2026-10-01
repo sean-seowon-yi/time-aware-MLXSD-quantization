@@ -1,0 +1,2916 @@
+{
+  "version": "poly_v3_csb",
+  "max_degree": 4,
+  "sigma_range": [
+    0.008928571827709675,
+    1.0
+  ],
+  "n_layers": 285,
+  "n_per_channel": 0,
+  "layers": {
+    "blocks.0.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.5513611387622412
+      ],
+      "r2": 1.0,
+      "cv": 0.0655,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.0019399127960205078
+    },
+    "blocks.0.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.7650465715820867
+      ],
+      "r2": 1.0,
+      "cv": 0.1724,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0010727997885810003
+    },
+    "blocks.0.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.5513611387622412
+      ],
+      "r2": 1.0,
+      "cv": 0.0655,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.0017638653649224175
+    },
+    "blocks.0.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.5513611387622412
+      ],
+      "r2": 1.0,
+      "cv": 0.0655,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0016292729907565646
+    },
+    "blocks.0.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        1.8671863279301
+      ],
+      "r2": 1.0,
+      "cv": 0.1143,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00021951892640855578
+    },
+    "blocks.0.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.6418603057230032
+      ],
+      "r2": 1.0,
+      "cv": 0.2174,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0012270658281114367
+    },
+    "blocks.0.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.4658346310222674
+      ],
+      "r2": 1.0,
+      "cv": 0.0667,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0007691541247897678
+    },
+    "blocks.0.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.8552063110868924
+      ],
+      "r2": 1.0,
+      "cv": 0.0671,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.004379635704888238
+    },
+    "blocks.0.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.4658346310222674
+      ],
+      "r2": 1.0,
+      "cv": 0.0667,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0007905411190456814
+    },
+    "blocks.0.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.4658346310222674
+      ],
+      "r2": 1.0,
+      "cv": 0.0667,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.00047962167527940537
+    },
+    "blocks.0.text.mlp.fc1": {
+      "degree": 2,
+      "coeffs": [
+        3.2324715149672536,
+        -4.443071614686457,
+        2.8958904225994475
+      ],
+      "r2": 0.7976,
+      "cv": 0.2511,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.005273227691650391
+    },
+    "blocks.0.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        3.5589431007182655
+      ],
+      "r2": 1.0,
+      "cv": 0.0273,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.011778810289171007
+    },
+    "blocks.1.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.281399793663248
+      ],
+      "r2": 1.0,
+      "cv": 0.1097,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.004118932088216146
+    },
+    "blocks.1.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.7671502514261845
+      ],
+      "r2": 1.0,
+      "cv": 0.0878,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0025740011003282334
+    },
+    "blocks.1.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.281399793663248
+      ],
+      "r2": 1.0,
+      "cv": 0.1097,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.006254571702745225
+    },
+    "blocks.1.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.281399793663248
+      ],
+      "r2": 1.0,
+      "cv": 0.1097,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.0032964212629530165
+    },
+    "blocks.1.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        3.0062373781413965
+      ],
+      "r2": 1.0,
+      "cv": 0.1628,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.000926390012105306
+    },
+    "blocks.1.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.4109795784522716
+      ],
+      "r2": 1.0,
+      "cv": 0.119,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.003138544930352105
+    },
+    "blocks.1.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.669995687495383
+      ],
+      "r2": 1.0,
+      "cv": 0.1004,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0005143974092271593
+    },
+    "blocks.1.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.5179887300663626
+      ],
+      "r2": 1.0,
+      "cv": 0.121,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0008077097468905979
+    },
+    "blocks.1.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.669995687495383
+      ],
+      "r2": 1.0,
+      "cv": 0.1004,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.000494824727376302
+    },
+    "blocks.1.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.669995687495383
+      ],
+      "r2": 1.0,
+      "cv": 0.1004,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.00020222920841640897
+    },
+    "blocks.1.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        3.3436361748923575
+      ],
+      "r2": 1.0,
+      "cv": 0.0542,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.004794144100613064
+    },
+    "blocks.1.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        3.0957895799324096
+      ],
+      "r2": 1.0,
+      "cv": 0.0114,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.013166805691189236
+    },
+    "blocks.10.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.774393152751052
+      ],
+      "r2": 1.0,
+      "cv": 0.0732,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.007171718173556858
+    },
+    "blocks.10.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.9553291456312305
+      ],
+      "r2": 1.0,
+      "cv": 0.1116,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0076929211086697044
+    },
+    "blocks.10.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.774393152751052
+      ],
+      "r2": 1.0,
+      "cv": 0.0732,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.006935201009114583
+    },
+    "blocks.10.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.774393152751052
+      ],
+      "r2": 1.0,
+      "cv": 0.0732,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0075473259819878475
+    },
+    "blocks.10.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        1.8989922297280015
+      ],
+      "r2": 1.0,
+      "cv": 0.1457,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.0013593905766805013
+    },
+    "blocks.10.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.153149047628202
+      ],
+      "r2": 1.0,
+      "cv": 0.0647,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.0031854091220431856
+    },
+    "blocks.10.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.7832922079316043
+      ],
+      "r2": 1.0,
+      "cv": 0.1102,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0029538817935519748
+    },
+    "blocks.10.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.4617610396197525
+      ],
+      "r2": 1.0,
+      "cv": 0.0397,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.010157205369737413
+    },
+    "blocks.10.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.7832922079316043
+      ],
+      "r2": 1.0,
+      "cv": 0.1102,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0024969117906358507
+    },
+    "blocks.10.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.7832922079316043
+      ],
+      "r2": 1.0,
+      "cv": 0.1102,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0035705765618218315
+    },
+    "blocks.10.text.mlp.fc1": {
+      "degree": 2,
+      "coeffs": [
+        2.7999493162582696,
+        -4.54804118867871,
+        3.3610360593752593
+      ],
+      "r2": 0.6335,
+      "cv": 0.276,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.004361437479654948
+    },
+    "blocks.10.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        3.137721387947792
+      ],
+      "r2": 1.0,
+      "cv": 0.0844,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.010882205539279514
+    },
+    "blocks.11.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.291999143855369
+      ],
+      "r2": 1.0,
+      "cv": 0.0199,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.00683004167344835
+    },
+    "blocks.11.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.150603646909359
+      ],
+      "r2": 1.0,
+      "cv": 0.1242,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.006466496785481771
+    },
+    "blocks.11.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.291999143855369
+      ],
+      "r2": 1.0,
+      "cv": 0.0199,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.006594580332438151
+    },
+    "blocks.11.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.291999143855369
+      ],
+      "r2": 1.0,
+      "cv": 0.0199,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.007413692898220486
+    },
+    "blocks.11.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.207416277786115
+      ],
+      "r2": 1.0,
+      "cv": 0.1707,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.0012019618352254232
+    },
+    "blocks.11.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.373811958417266
+      ],
+      "r2": 1.0,
+      "cv": 0.1233,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.0032872833675808375
+    },
+    "blocks.11.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.238825066681117
+      ],
+      "r2": 1.0,
+      "cv": 0.167,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004016956753200955
+    },
+    "blocks.11.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.1695475958046737
+      ],
+      "r2": 1.0,
+      "cv": 0.0519,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.007840228610568576
+    },
+    "blocks.11.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.238825066681117
+      ],
+      "r2": 1.0,
+      "cv": 0.167,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0030766139560275607
+    },
+    "blocks.11.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.238825066681117
+      ],
+      "r2": 1.0,
+      "cv": 0.167,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004860886043972439
+    },
+    "blocks.11.text.mlp.fc1": {
+      "degree": 2,
+      "coeffs": [
+        3.447650393506212,
+        -5.556902595234979,
+        4.0858159330411095
+      ],
+      "r2": 0.6323,
+      "cv": 0.276,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.005915588802761502
+    },
+    "blocks.11.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        3.459766260094054
+      ],
+      "r2": 1.0,
+      "cv": 0.0299,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.013594419691297743
+    },
+    "blocks.12.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.1507837004771972
+      ],
+      "r2": 1.0,
+      "cv": 0.0683,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.011709717644585503
+    },
+    "blocks.12.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.6708038675486434
+      ],
+      "r2": 1.0,
+      "cv": 0.1674,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.008625967237684462
+    },
+    "blocks.12.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.1507837004771972
+      ],
+      "r2": 1.0,
+      "cv": 0.0683,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.010683707343207465
+    },
+    "blocks.12.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.1507837004771972
+      ],
+      "r2": 1.0,
+      "cv": 0.0683,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.013020544264051649
+    },
+    "blocks.12.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        1.6748901426496225
+      ],
+      "r2": 1.0,
+      "cv": 0.1226,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.0010636882781982421
+    },
+    "blocks.12.image.mlp.fc2": {
+      "degree": 2,
+      "coeffs": [
+        3.2158564596551247,
+        -2.9594239247311562,
+        1.800580966012876
+      ],
+      "r2": 0.418,
+      "cv": 0.2095,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.003962520599365234
+    },
+    "blocks.12.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.889016702009976
+      ],
+      "r2": 1.0,
+      "cv": 0.2069,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.003789216783311632
+    },
+    "blocks.12.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.820771857092454
+      ],
+      "r2": 1.0,
+      "cv": 0.067,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00980861579047309
+    },
+    "blocks.12.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.889016702009976
+      ],
+      "r2": 1.0,
+      "cv": 0.2069,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.003152917226155599
+    },
+    "blocks.12.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.889016702009976
+      ],
+      "r2": 1.0,
+      "cv": 0.2069,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.0037745429144965276
+    },
+    "blocks.12.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        3.230988051246744
+      ],
+      "r2": 1.0,
+      "cv": 0.2133,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0047847476535373265
+    },
+    "blocks.12.text.mlp.fc2": {
+      "degree": 2,
+      "coeffs": [
+        5.089162488026636,
+        -3.8267966878987068,
+        1.9763880488990673
+      ],
+      "r2": 0.7208,
+      "cv": 0.1563,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.014520411173502603
+    },
+    "blocks.13.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.2491171299950095
+      ],
+      "r2": 1.0,
+      "cv": 0.1182,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.005014190673828125
+    },
+    "blocks.13.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.3046483610848063
+      ],
+      "r2": 1.0,
+      "cv": 0.1268,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.007758965386284723
+    },
+    "blocks.13.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.2491171299950095
+      ],
+      "r2": 1.0,
+      "cv": 0.1182,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.00466819085015191
+    },
+    "blocks.13.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.2491171299950095
+      ],
+      "r2": 1.0,
+      "cv": 0.1182,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.005646941714816623
+    },
+    "blocks.13.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.3662906698484525
+      ],
+      "r2": 1.0,
+      "cv": 0.1977,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0010923870934380425
+    },
+    "blocks.13.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        1.9721820136534518
+      ],
+      "r2": 1.0,
+      "cv": 0.1043,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.0030782557593451608
+    },
+    "blocks.13.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.835931951147552
+      ],
+      "r2": 1.0,
+      "cv": 0.0656,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004187423706054688
+    },
+    "blocks.13.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.2871950838325916
+      ],
+      "r2": 1.0,
+      "cv": 0.0764,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.012426907857259115
+    },
+    "blocks.13.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.835931951147552
+      ],
+      "r2": 1.0,
+      "cv": 0.0656,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.003502370834350586
+    },
+    "blocks.13.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.835931951147552
+      ],
+      "r2": 1.0,
+      "cv": 0.0656,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.006214060465494792
+    },
+    "blocks.13.text.mlp.fc1": {
+      "degree": 2,
+      "coeffs": [
+        3.6695266147252146,
+        -4.948863312058954,
+        3.803539533568601
+      ],
+      "r2": 0.4445,
+      "cv": 0.2195,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.006269593132866754
+    },
+    "blocks.13.text.mlp.fc2": {
+      "degree": 2,
+      "coeffs": [
+        6.8678014620952705,
+        -1.6228844846207962,
+        -0.40306294642261153
+      ],
+      "r2": 0.7154,
+      "cv": 0.1226,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.02465066867404514
+    },
+    "blocks.14.image.attn.k_proj": {
+      "degree": 2,
+      "coeffs": [
+        4.574080449531401,
+        -2.747512084481135,
+        0.8267735447157155
+      ],
+      "r2": 0.8972,
+      "cv": 0.1701,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.00889868418375651
+    },
+    "blocks.14.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.9866295720339684
+      ],
+      "r2": 1.0,
+      "cv": 0.2013,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0110445556640625
+    },
+    "blocks.14.image.attn.q_proj": {
+      "degree": 2,
+      "coeffs": [
+        4.574080449531401,
+        -2.747512084481135,
+        0.8267735447157155
+      ],
+      "r2": 0.8972,
+      "cv": 0.1701,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.008311827765570746
+    },
+    "blocks.14.image.attn.v_proj": {
+      "degree": 2,
+      "coeffs": [
+        4.574080449531401,
+        -2.747512084481135,
+        0.8267735447157155
+      ],
+      "r2": 0.8972,
+      "cv": 0.1701,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.009382030063205295
+    },
+    "blocks.14.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        1.7662728047263927
+      ],
+      "r2": 1.0,
+      "cv": 0.1571,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.0008703123198615181
+    },
+    "blocks.14.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        1.8421501102271831
+      ],
+      "r2": 1.0,
+      "cv": 0.0708,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.002589748382568359
+    },
+    "blocks.14.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.212447046778763
+      ],
+      "r2": 1.0,
+      "cv": 0.1289,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.005346734788682726
+    },
+    "blocks.14.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.095994579383634
+      ],
+      "r2": 1.0,
+      "cv": 0.0429,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.015549789428710938
+    },
+    "blocks.14.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.212447046778763
+      ],
+      "r2": 1.0,
+      "cv": 0.1289,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004030707041422526
+    },
+    "blocks.14.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.212447046778763
+      ],
+      "r2": 1.0,
+      "cv": 0.1289,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.006276499430338541
+    },
+    "blocks.14.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        4.299465903957017
+      ],
+      "r2": 1.0,
+      "cv": 0.0944,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.025598997328016494
+    },
+    "blocks.14.text.mlp.fc2": {
+      "degree": 2,
+      "coeffs": [
+        21.128678429746675,
+        -13.844909899211222,
+        4.16835826449445
+      ],
+      "r2": 0.922,
+      "cv": 0.1907,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.3701559787326389
+    },
+    "blocks.15.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.041466627741137
+      ],
+      "r2": 1.0,
+      "cv": 0.0642,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.005981003655327691
+    },
+    "blocks.15.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.974178861125565
+      ],
+      "r2": 1.0,
+      "cv": 0.1331,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.007631746080186632
+    },
+    "blocks.15.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.041466627741137
+      ],
+      "r2": 1.0,
+      "cv": 0.0642,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.005208511352539063
+    },
+    "blocks.15.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.041466627741137
+      ],
+      "r2": 1.0,
+      "cv": 0.0642,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.006676180097791883
+    },
+    "blocks.15.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.1879272696750927
+      ],
+      "r2": 1.0,
+      "cv": 0.2208,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0008406785859002007
+    },
+    "blocks.15.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.0376141276830895
+      ],
+      "r2": 1.0,
+      "cv": 0.1514,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.0024032435946994357
+    },
+    "blocks.15.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.9499956721771354
+      ],
+      "r2": 1.0,
+      "cv": 0.1046,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0039521480136447485
+    },
+    "blocks.15.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.316775041595576
+      ],
+      "r2": 1.0,
+      "cv": 0.1147,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.008937811109754775
+    },
+    "blocks.15.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.9499956721771354
+      ],
+      "r2": 1.0,
+      "cv": 0.1046,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.003138456556532118
+    },
+    "blocks.15.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.9499956721771354
+      ],
+      "r2": 1.0,
+      "cv": 0.1046,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004985642751057943
+    },
+    "blocks.15.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        4.137308561529226
+      ],
+      "r2": 1.0,
+      "cv": 0.0413,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.008194120619032118
+    },
+    "blocks.15.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        3.236942413819091
+      ],
+      "r2": 1.0,
+      "cv": 0.0805,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.008257089402940539
+    },
+    "blocks.16.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.865647740630776
+      ],
+      "r2": 1.0,
+      "cv": 0.0787,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.011592992146809896
+    },
+    "blocks.16.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.039322927492578
+      ],
+      "r2": 1.0,
+      "cv": 0.1993,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.006304259830050998
+    },
+    "blocks.16.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.865647740630776
+      ],
+      "r2": 1.0,
+      "cv": 0.0787,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.010511781480577256
+    },
+    "blocks.16.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.865647740630776
+      ],
+      "r2": 1.0,
+      "cv": 0.0787,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.012898630777994791
+    },
+    "blocks.16.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        1.9136883829820173
+      ],
+      "r2": 1.0,
+      "cv": 0.2372,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.000728395938873291
+    },
+    "blocks.16.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        1.925970667091332
+      ],
+      "r2": 1.0,
+      "cv": 0.1344,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.002644680870903863
+    },
+    "blocks.16.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.2611819969788325
+      ],
+      "r2": 1.0,
+      "cv": 0.134,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0039086740281846786
+    },
+    "blocks.16.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.7951644811999654
+      ],
+      "r2": 1.0,
+      "cv": 0.1226,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.006333724551730686
+    },
+    "blocks.16.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.2611819969788325
+      ],
+      "r2": 1.0,
+      "cv": 0.134,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.003094109853108724
+    },
+    "blocks.16.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.2611819969788325
+      ],
+      "r2": 1.0,
+      "cv": 0.134,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.003782073974609375
+    },
+    "blocks.16.text.mlp.fc1": {
+      "degree": 2,
+      "coeffs": [
+        3.7491788188445887,
+        -4.27183076336921,
+        3.8896658196202147
+      ],
+      "r2": 0.1866,
+      "cv": 0.2313,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.008001330057779948
+    },
+    "blocks.16.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        3.551796168275445
+      ],
+      "r2": 1.0,
+      "cv": 0.1112,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.020931896633572047
+    },
+    "blocks.17.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.87339765229809
+      ],
+      "r2": 1.0,
+      "cv": 0.089,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.017665162828233508
+    },
+    "blocks.17.image.attn.o_proj": {
+      "degree": 2,
+      "coeffs": [
+        3.0354719975300815,
+        -4.081641603838728,
+        2.6999601272410527
+      ],
+      "r2": 0.4641,
+      "cv": 0.3052,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.008183856540256076
+    },
+    "blocks.17.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.87339765229809
+      ],
+      "r2": 1.0,
+      "cv": 0.089,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.0144346923828125
+    },
+    "blocks.17.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.87339765229809
+      ],
+      "r2": 1.0,
+      "cv": 0.089,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.01710223897298177
+    },
+    "blocks.17.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        1.5825355318762617
+      ],
+      "r2": 1.0,
+      "cv": 0.0823,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.0008597454494900173
+    },
+    "blocks.17.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.178709130085742
+      ],
+      "r2": 1.0,
+      "cv": 0.1736,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.002963776058620877
+    },
+    "blocks.17.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.56623127963906
+      ],
+      "r2": 1.0,
+      "cv": 0.2452,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004349336412217882
+    },
+    "blocks.17.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.6405590278259163
+      ],
+      "r2": 1.0,
+      "cv": 0.1433,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.0065866567823621965
+    },
+    "blocks.17.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.56623127963906
+      ],
+      "r2": 1.0,
+      "cv": 0.2452,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.003410626729329427
+    },
+    "blocks.17.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.56623127963906
+      ],
+      "r2": 1.0,
+      "cv": 0.2452,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004375525580512153
+    },
+    "blocks.17.text.mlp.fc1": {
+      "degree": 2,
+      "coeffs": [
+        4.083660349641125,
+        -6.84371673343685,
+        5.208751478390767
+      ],
+      "r2": 0.6133,
+      "cv": 0.2752,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.021926698472764756
+    },
+    "blocks.17.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        3.2641594984803364
+      ],
+      "r2": 1.0,
+      "cv": 0.093,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.029371866861979165
+    },
+    "blocks.18.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.291338746439562
+      ],
+      "r2": 1.0,
+      "cv": 0.0686,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.010863148159450955
+    },
+    "blocks.18.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.9308579267949417
+      ],
+      "r2": 1.0,
+      "cv": 0.1217,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.009626710679796008
+    },
+    "blocks.18.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.291338746439562
+      ],
+      "r2": 1.0,
+      "cv": 0.0686,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.009127666897243923
+    },
+    "blocks.18.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.291338746439562
+      ],
+      "r2": 1.0,
+      "cv": 0.0686,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.009329878913031685
+    },
+    "blocks.18.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        1.6486064631621073
+      ],
+      "r2": 1.0,
+      "cv": 0.1055,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0007563872867160374
+    },
+    "blocks.18.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        1.6188227373459907
+      ],
+      "r2": 1.0,
+      "cv": 0.0838,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.002516948488023546
+    },
+    "blocks.18.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.2673924008531334
+      ],
+      "r2": 1.0,
+      "cv": 0.0464,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004695985582139757
+    },
+    "blocks.18.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.301554459403574
+      ],
+      "r2": 1.0,
+      "cv": 0.1177,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.008253746032714844
+    },
+    "blocks.18.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.2673924008531334
+      ],
+      "r2": 1.0,
+      "cv": 0.0464,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004339592827690972
+    },
+    "blocks.18.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.2673924008531334
+      ],
+      "r2": 1.0,
+      "cv": 0.0464,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0064857114156087236
+    },
+    "blocks.18.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.72463664316821
+      ],
+      "r2": 1.0,
+      "cv": 0.0855,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.003852598402235243
+    },
+    "blocks.18.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.255488057428553
+      ],
+      "r2": 1.0,
+      "cv": 0.0893,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.004850708855523004
+    },
+    "blocks.19.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.1544042203274385
+      ],
+      "r2": 1.0,
+      "cv": 0.0413,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.016336878458658853
+    },
+    "blocks.19.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.7184311505205705
+      ],
+      "r2": 1.0,
+      "cv": 0.138,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.009680266486273872
+    },
+    "blocks.19.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.1544042203274385
+      ],
+      "r2": 1.0,
+      "cv": 0.0413,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.015914642333984375
+    },
+    "blocks.19.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.1544042203274385
+      ],
+      "r2": 1.0,
+      "cv": 0.0413,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.017379648844401043
+    },
+    "blocks.19.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        1.8225021891795443
+      ],
+      "r2": 1.0,
+      "cv": 0.0994,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.0010873196919759115
+    },
+    "blocks.19.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.237605616840094
+      ],
+      "r2": 1.0,
+      "cv": 0.1806,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00348663330078125
+    },
+    "blocks.19.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.7538230145025127
+      ],
+      "r2": 1.0,
+      "cv": 0.2079,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004929579416910807
+    },
+    "blocks.19.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.746004229254355
+      ],
+      "r2": 1.0,
+      "cv": 0.1339,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0068342734442816844
+    },
+    "blocks.19.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.7538230145025127
+      ],
+      "r2": 1.0,
+      "cv": 0.2079,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0031284234788682727
+    },
+    "blocks.19.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.7538230145025127
+      ],
+      "r2": 1.0,
+      "cv": 0.2079,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0042625486585829
+    },
+    "blocks.19.text.mlp.fc1": {
+      "degree": 2,
+      "coeffs": [
+        3.155550325047911,
+        -0.1387022092529348,
+        -0.7250345157947876
+      ],
+      "r2": 0.3497,
+      "cv": 0.1701,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.0184399905734592
+    },
+    "blocks.19.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.9182513608975693
+      ],
+      "r2": 1.0,
+      "cv": 0.0563,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.020072916666666666
+    },
+    "blocks.2.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.969271775690406
+      ],
+      "r2": 1.0,
+      "cv": 0.206,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0030762496524386934
+    },
+    "blocks.2.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.083338718024561
+      ],
+      "r2": 1.0,
+      "cv": 0.2623,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00303409915500217
+    },
+    "blocks.2.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.969271775690406
+      ],
+      "r2": 1.0,
+      "cv": 0.206,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0034997982449001736
+    },
+    "blocks.2.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.969271775690406
+      ],
+      "r2": 1.0,
+      "cv": 0.206,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00251563835144043
+    },
+    "blocks.2.image.mlp.fc1": {
+      "degree": 2,
+      "coeffs": [
+        2.702629427754054,
+        -4.987549561475184,
+        4.0541712327140855
+      ],
+      "r2": 0.6239,
+      "cv": 0.2791,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.0018280150095621745
+    },
+    "blocks.2.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.5236941274517153
+      ],
+      "r2": 1.0,
+      "cv": 0.0995,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.0035436651441786023
+    },
+    "blocks.2.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.6821162070425184
+      ],
+      "r2": 1.0,
+      "cv": 0.081,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0007252243889702691
+    },
+    "blocks.2.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.3968957031259188
+      ],
+      "r2": 1.0,
+      "cv": 0.0687,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0026890799204508462
+    },
+    "blocks.2.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.6821162070425184
+      ],
+      "r2": 1.0,
+      "cv": 0.081,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0006953861978318956
+    },
+    "blocks.2.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.6821162070425184
+      ],
+      "r2": 1.0,
+      "cv": 0.081,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.0006866956816779243
+    },
+    "blocks.2.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        3.7748758317679725
+      ],
+      "r2": 1.0,
+      "cv": 0.042,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.006792686886257595
+    },
+    "blocks.2.text.mlp.fc2": {
+      "degree": 4,
+      "coeffs": [
+        10.703968414714994,
+        -51.65317900453366,
+        126.88637434326752,
+        -136.31158934365274,
+        54.05346101846665
+      ],
+      "r2": 0.9548,
+      "cv": 0.4168,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.01609331258138021
+    },
+    "blocks.20.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.348418804453116
+      ],
+      "r2": 1.0,
+      "cv": 0.0897,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.02515447489420573
+    },
+    "blocks.20.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.0912505325442545
+      ],
+      "r2": 1.0,
+      "cv": 0.0455,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.023185384114583332
+    },
+    "blocks.20.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.348418804453116
+      ],
+      "r2": 1.0,
+      "cv": 0.0897,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.01802005852593316
+    },
+    "blocks.20.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.348418804453116
+      ],
+      "r2": 1.0,
+      "cv": 0.0897,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0180655025906033
+    },
+    "blocks.20.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.252752013950054
+      ],
+      "r2": 1.0,
+      "cv": 0.1353,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.001202395863003201
+    },
+    "blocks.20.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.2015836472581136
+      ],
+      "r2": 1.0,
+      "cv": 0.1966,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0034567926194932724
+    },
+    "blocks.20.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.1157020583652137
+      ],
+      "r2": 1.0,
+      "cv": 0.1479,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00623788833618164
+    },
+    "blocks.20.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.6446502974767894
+      ],
+      "r2": 1.0,
+      "cv": 0.1534,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.011543985154893664
+    },
+    "blocks.20.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.1157020583652137
+      ],
+      "r2": 1.0,
+      "cv": 0.1479,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.005650733947753906
+    },
+    "blocks.20.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.1157020583652137
+      ],
+      "r2": 1.0,
+      "cv": 0.1479,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.007926027086046008
+    },
+    "blocks.20.text.mlp.fc1": {
+      "degree": 2,
+      "coeffs": [
+        3.8782838231444035,
+        8.995656813247562,
+        -6.282806500196031
+      ],
+      "r2": 0.9262,
+      "cv": 0.1136,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.019317314995659723
+    },
+    "blocks.20.text.mlp.fc2": {
+      "degree": 2,
+      "coeffs": [
+        1.3632221209703244,
+        13.73228688871828,
+        -9.448131960700389
+      ],
+      "r2": 0.748,
+      "cv": 0.2333,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.78526220703125
+    },
+    "blocks.21.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.200351981805238
+      ],
+      "r2": 1.0,
+      "cv": 0.0436,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.020997648451063368
+    },
+    "blocks.21.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.834612879651662
+      ],
+      "r2": 1.0,
+      "cv": 0.0438,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.020613513522677953
+    },
+    "blocks.21.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.200351981805238
+      ],
+      "r2": 1.0,
+      "cv": 0.0436,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.017224780612521702
+    },
+    "blocks.21.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.200351981805238
+      ],
+      "r2": 1.0,
+      "cv": 0.0436,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.01989837646484375
+    },
+    "blocks.21.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        1.5813165937743086
+      ],
+      "r2": 1.0,
+      "cv": 0.0677,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.0011738189061482748
+    },
+    "blocks.21.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.1233625181098525
+      ],
+      "r2": 1.0,
+      "cv": 0.1627,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004434937371148004
+    },
+    "blocks.21.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.9169385464736992
+      ],
+      "r2": 1.0,
+      "cv": 0.096,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0065352121988932295
+    },
+    "blocks.21.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.7352665987912674
+      ],
+      "r2": 1.0,
+      "cv": 0.085,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.005177052391899957
+    },
+    "blocks.21.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.9169385464736992
+      ],
+      "r2": 1.0,
+      "cv": 0.096,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0043276210361056855
+    },
+    "blocks.21.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.9169385464736992
+      ],
+      "r2": 1.0,
+      "cv": 0.096,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.006703530629475912
+    },
+    "blocks.21.text.mlp.fc1": {
+      "degree": 2,
+      "coeffs": [
+        5.259266900111213,
+        14.88776298639901,
+        -8.990663742997944
+      ],
+      "r2": 0.9198,
+      "cv": 0.149,
+      "alpha_multiplier": 1.0,
+      "alpha_search_mse": 0.03268557400173611
+    },
+    "blocks.21.text.mlp.fc2": {
+      "degree": 2,
+      "coeffs": [
+        3.657345807581487,
+        6.752165059680867,
+        -4.045237788048687
+      ],
+      "r2": 0.9469,
+      "cv": 0.1169,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 1.1231434461805556
+    },
+    "blocks.22.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.58180876193069
+      ],
+      "r2": 1.0,
+      "cv": 0.0806,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.02616575961642795
+    },
+    "blocks.22.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.1195611693927088
+      ],
+      "r2": 1.0,
+      "cv": 0.1766,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.026985165066189237
+    },
+    "blocks.22.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.58180876193069
+      ],
+      "r2": 1.0,
+      "cv": 0.0806,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.025880301581488716
+    },
+    "blocks.22.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.58180876193069
+      ],
+      "r2": 1.0,
+      "cv": 0.0806,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.02831622314453125
+    },
+    "blocks.22.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.5322036879277023
+      ],
+      "r2": 1.0,
+      "cv": 0.152,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0019232076009114583
+    },
+    "blocks.22.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.3429592367523315
+      ],
+      "r2": 1.0,
+      "cv": 0.191,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004973570505777995
+    },
+    "blocks.22.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.8503222478282892
+      ],
+      "r2": 1.0,
+      "cv": 0.1625,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.007156499226888021
+    },
+    "blocks.22.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.7548291135596
+      ],
+      "r2": 1.0,
+      "cv": 0.1674,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0036437284681532117
+    },
+    "blocks.22.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.8503222478282892
+      ],
+      "r2": 1.0,
+      "cv": 0.1625,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0036535733540852865
+    },
+    "blocks.22.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.8503222478282892
+      ],
+      "r2": 1.0,
+      "cv": 0.1625,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.006454469892713759
+    },
+    "blocks.22.text.mlp.fc1": {
+      "degree": 2,
+      "coeffs": [
+        11.991117739928,
+        13.82760366922188,
+        -11.63042047945426
+      ],
+      "r2": 0.6635,
+      "cv": 0.0732,
+      "alpha_multiplier": 1.25,
+      "alpha_search_mse": 0.19521875
+    },
+    "blocks.22.text.mlp.fc2": {
+      "degree": 2,
+      "coeffs": [
+        8.738726429813365,
+        11.977371169264849,
+        -8.952737439708466
+      ],
+      "r2": 0.639,
+      "cv": 0.0898,
+      "alpha_multiplier": 1.0,
+      "alpha_search_mse": 33.156607638888886
+    },
+    "blocks.23.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.012867306047154
+      ],
+      "r2": 1.0,
+      "cv": 0.1598,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.009778784010145399
+    },
+    "blocks.23.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.946616616605524
+      ],
+      "r2": 1.0,
+      "cv": 0.1162,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.01281238301595052
+    },
+    "blocks.23.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.012867306047154
+      ],
+      "r2": 1.0,
+      "cv": 0.1598,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.013112011379665799
+    },
+    "blocks.23.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        4.012867306047154
+      ],
+      "r2": 1.0,
+      "cv": 0.1598,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.015442252265082465
+    },
+    "blocks.23.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.1072707444150676
+      ],
+      "r2": 1.0,
+      "cv": 0.134,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.0010497876273261176
+    },
+    "blocks.23.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        1.5449373200212662
+      ],
+      "r2": 1.0,
+      "cv": 0.151,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.0018744386037190756
+    },
+    "blocks.23.text.attn.k_proj": {
+      "degree": 2,
+      "coeffs": [
+        2.6101631085402213,
+        -4.721381347159955,
+        3.976844369800215
+      ],
+      "r2": 0.7042,
+      "cv": 0.2385,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.006718255784776476
+    },
+    "blocks.23.text.attn.q_proj": {
+      "degree": 2,
+      "coeffs": [
+        2.6101631085402213,
+        -4.721381347159955,
+        3.976844369800215
+      ],
+      "r2": 0.7042,
+      "cv": 0.2385,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.000384039216571384
+    },
+    "blocks.23.text.attn.v_proj": {
+      "degree": 2,
+      "coeffs": [
+        2.6101631085402213,
+        -4.721381347159955,
+        3.976844369800215
+      ],
+      "r2": 0.7042,
+      "cv": 0.2385,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.005477760738796658
+    },
+    "blocks.3.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.0273197319317258
+      ],
+      "r2": 1.0,
+      "cv": 0.0701,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.007654272291395399
+    },
+    "blocks.3.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.3856468215575424
+      ],
+      "r2": 1.0,
+      "cv": 0.1339,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0070902040269639754
+    },
+    "blocks.3.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.0273197319317258
+      ],
+      "r2": 1.0,
+      "cv": 0.0701,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.009162896898057726
+    },
+    "blocks.3.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.0273197319317258
+      ],
+      "r2": 1.0,
+      "cv": 0.0701,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.006748969184027778
+    },
+    "blocks.3.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.4570214789948057
+      ],
+      "r2": 1.0,
+      "cv": 0.1932,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0019256163703070747
+    },
+    "blocks.3.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.2174200352888525
+      ],
+      "r2": 1.0,
+      "cv": 0.0892,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004174203236897787
+    },
+    "blocks.3.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.75385989405891
+      ],
+      "r2": 1.0,
+      "cv": 0.0282,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.000625927554236518
+    },
+    "blocks.3.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.0626824384062368
+      ],
+      "r2": 1.0,
+      "cv": 0.1486,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0037451922098795574
+    },
+    "blocks.3.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.75385989405891
+      ],
+      "r2": 1.0,
+      "cv": 0.0282,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.0005458164744906955
+    },
+    "blocks.3.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.75385989405891
+      ],
+      "r2": 1.0,
+      "cv": 0.0282,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.00043277067608303495
+    },
+    "blocks.3.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.493133906595942
+      ],
+      "r2": 1.0,
+      "cv": 0.0403,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.004340431213378906
+    },
+    "blocks.3.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.2375289634156363
+      ],
+      "r2": 1.0,
+      "cv": 0.0384,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.008294234381781684
+    },
+    "blocks.4.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.356831352859343
+      ],
+      "r2": 1.0,
+      "cv": 0.1828,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.005181453280978732
+    },
+    "blocks.4.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.1638875099534967
+      ],
+      "r2": 1.0,
+      "cv": 0.1146,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.007252554151746962
+    },
+    "blocks.4.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.356831352859343
+      ],
+      "r2": 1.0,
+      "cv": 0.1828,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.005604148440890842
+    },
+    "blocks.4.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.356831352859343
+      ],
+      "r2": 1.0,
+      "cv": 0.1828,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004968907674153646
+    },
+    "blocks.4.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.64904123778914
+      ],
+      "r2": 1.0,
+      "cv": 0.1755,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0019381319681803385
+    },
+    "blocks.4.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        3.062235409892022
+      ],
+      "r2": 1.0,
+      "cv": 0.1422,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.003998984018961589
+    },
+    "blocks.4.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.5795535542994825
+      ],
+      "r2": 1.0,
+      "cv": 0.0802,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.000996986601087782
+    },
+    "blocks.4.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.9393795689772932
+      ],
+      "r2": 1.0,
+      "cv": 0.0568,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.005271099090576172
+    },
+    "blocks.4.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.5795535542994825
+      ],
+      "r2": 1.0,
+      "cv": 0.0802,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0009417441685994466
+    },
+    "blocks.4.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.5795535542994825
+      ],
+      "r2": 1.0,
+      "cv": 0.0802,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0009973994361029731
+    },
+    "blocks.4.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.2090887654686986
+      ],
+      "r2": 1.0,
+      "cv": 0.0553,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.004781447940402561
+    },
+    "blocks.4.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.9289295699948075
+      ],
+      "r2": 1.0,
+      "cv": 0.0914,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.008131692674424913
+    },
+    "blocks.5.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.096180544178469
+      ],
+      "r2": 1.0,
+      "cv": 0.0298,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.004588041517469618
+    },
+    "blocks.5.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.6648627979900121
+      ],
+      "r2": 1.0,
+      "cv": 0.0771,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.005772485097249349
+    },
+    "blocks.5.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.096180544178469
+      ],
+      "r2": 1.0,
+      "cv": 0.0298,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.005137476179334853
+    },
+    "blocks.5.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.096180544178469
+      ],
+      "r2": 1.0,
+      "cv": 0.0298,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.005286953396267361
+    },
+    "blocks.5.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        1.8708614643177597
+      ],
+      "r2": 1.0,
+      "cv": 0.1322,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.0019451880984836154
+    },
+    "blocks.5.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.0682133938001677
+      ],
+      "r2": 1.0,
+      "cv": 0.0557,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00426344723171658
+    },
+    "blocks.5.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.231269812199622
+      ],
+      "r2": 1.0,
+      "cv": 0.1477,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.001499261326260037
+    },
+    "blocks.5.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.491090094902401
+      ],
+      "r2": 1.0,
+      "cv": 0.0309,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.005217157151963975
+    },
+    "blocks.5.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.231269812199622
+      ],
+      "r2": 1.0,
+      "cv": 0.1477,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0012170931498209636
+    },
+    "blocks.5.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.231269812199622
+      ],
+      "r2": 1.0,
+      "cv": 0.1477,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0013491599824693467
+    },
+    "blocks.5.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.100496374992826
+      ],
+      "r2": 1.0,
+      "cv": 0.0746,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.005335728963216146
+    },
+    "blocks.5.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.8995599685114772
+      ],
+      "r2": 1.0,
+      "cv": 0.0659,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.007975889417860243
+    },
+    "blocks.6.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.5067741399665655
+      ],
+      "r2": 1.0,
+      "cv": 0.0716,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.005231116400824653
+    },
+    "blocks.6.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.5361478924146614
+      ],
+      "r2": 1.0,
+      "cv": 0.0509,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.006620924631754557
+    },
+    "blocks.6.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.5067741399665655
+      ],
+      "r2": 1.0,
+      "cv": 0.0716,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.005411771138509115
+    },
+    "blocks.6.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.5067741399665655
+      ],
+      "r2": 1.0,
+      "cv": 0.0716,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.005266524844699436
+    },
+    "blocks.6.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.313951689936846
+      ],
+      "r2": 1.0,
+      "cv": 0.2238,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.001610277705722385
+    },
+    "blocks.6.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.59999454724011
+      ],
+      "r2": 1.0,
+      "cv": 0.1156,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004346025678846571
+    },
+    "blocks.6.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.5899697406732765
+      ],
+      "r2": 1.0,
+      "cv": 0.1135,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00212635866800944
+    },
+    "blocks.6.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.802457939855813
+      ],
+      "r2": 1.0,
+      "cv": 0.0802,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00676420169406467
+    },
+    "blocks.6.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.5899697406732765
+      ],
+      "r2": 1.0,
+      "cv": 0.1135,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0018723862965901693
+    },
+    "blocks.6.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.5899697406732765
+      ],
+      "r2": 1.0,
+      "cv": 0.1135,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0021735492282443578
+    },
+    "blocks.6.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.183989128281527
+      ],
+      "r2": 1.0,
+      "cv": 0.1409,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.004024297078450521
+    },
+    "blocks.6.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.857711332957347
+      ],
+      "r2": 1.0,
+      "cv": 0.0787,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00793157704671224
+    },
+    "blocks.7.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.0690193411575493
+      ],
+      "r2": 1.0,
+      "cv": 0.076,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.007209733751085069
+    },
+    "blocks.7.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.1965991496647326
+      ],
+      "r2": 1.0,
+      "cv": 0.1131,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.010970873514811198
+    },
+    "blocks.7.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.0690193411575493
+      ],
+      "r2": 1.0,
+      "cv": 0.076,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.00830401611328125
+    },
+    "blocks.7.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.0690193411575493
+      ],
+      "r2": 1.0,
+      "cv": 0.076,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.009117267184787326
+    },
+    "blocks.7.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.835544134896091
+      ],
+      "r2": 1.0,
+      "cv": 0.2494,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.0017757369147406684
+    },
+    "blocks.7.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.2390682843511343
+      ],
+      "r2": 1.0,
+      "cv": 0.0971,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.0034898849063449435
+    },
+    "blocks.7.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.7464618141900772
+      ],
+      "r2": 1.0,
+      "cv": 0.0999,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00207105467054579
+    },
+    "blocks.7.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.8160246369928
+      ],
+      "r2": 1.0,
+      "cv": 0.0738,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.006729467180040148
+    },
+    "blocks.7.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.7464618141900772
+      ],
+      "r2": 1.0,
+      "cv": 0.0999,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0014869334962632921
+    },
+    "blocks.7.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.7464618141900772
+      ],
+      "r2": 1.0,
+      "cv": 0.0999,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0018873199886745877
+    },
+    "blocks.7.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.2926298299837216
+      ],
+      "r2": 1.0,
+      "cv": 0.1473,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.0038659464518229166
+    },
+    "blocks.7.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        3.5336089652639684
+      ],
+      "r2": 1.0,
+      "cv": 0.0539,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.005384699079725478
+    },
+    "blocks.8.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.3467484495082562
+      ],
+      "r2": 1.0,
+      "cv": 0.1264,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.006775389353434245
+    },
+    "blocks.8.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.1963341416394266
+      ],
+      "r2": 1.0,
+      "cv": 0.1046,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.008395758734809028
+    },
+    "blocks.8.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.3467484495082562
+      ],
+      "r2": 1.0,
+      "cv": 0.1264,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.007252044677734375
+    },
+    "blocks.8.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        3.3467484495082562
+      ],
+      "r2": 1.0,
+      "cv": 0.1264,
+      "alpha_multiplier": 0.8,
+      "alpha_search_mse": 0.00910646226671007
+    },
+    "blocks.8.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.5356797662461448
+      ],
+      "r2": 1.0,
+      "cv": 0.2276,
+      "alpha_multiplier": 0.9,
+      "alpha_search_mse": 0.0014863163630167643
+    },
+    "blocks.8.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.5254671885299294
+      ],
+      "r2": 1.0,
+      "cv": 0.156,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.0034730523427327475
+    },
+    "blocks.8.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.41387202961611
+      ],
+      "r2": 1.0,
+      "cv": 0.0549,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.002608082453409831
+    },
+    "blocks.8.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.0706301341455475
+      ],
+      "r2": 1.0,
+      "cv": 0.1003,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.006822484758165147
+    },
+    "blocks.8.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.41387202961611
+      ],
+      "r2": 1.0,
+      "cv": 0.0549,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0021654612223307294
+    },
+    "blocks.8.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.41387202961611
+      ],
+      "r2": 1.0,
+      "cv": 0.0549,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.002479070239596897
+    },
+    "blocks.8.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        1.780975125083192
+      ],
+      "r2": 1.0,
+      "cv": 0.0674,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0035693308512369792
+    },
+    "blocks.8.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        2.749735335897484
+      ],
+      "r2": 1.0,
+      "cv": 0.03,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.006659613291422526
+    },
+    "blocks.9.image.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.298886386516752
+      ],
+      "r2": 1.0,
+      "cv": 0.1129,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.004643968794080946
+    },
+    "blocks.9.image.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.144884965564883
+      ],
+      "r2": 1.0,
+      "cv": 0.0738,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.008114920722113715
+    },
+    "blocks.9.image.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.298886386516752
+      ],
+      "r2": 1.0,
+      "cv": 0.1129,
+      "alpha_multiplier": 0.7,
+      "alpha_search_mse": 0.005143769158257379
+    },
+    "blocks.9.image.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.298886386516752
+      ],
+      "r2": 1.0,
+      "cv": 0.1129,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.004433494144015842
+    },
+    "blocks.9.image.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.4746811256919305
+      ],
+      "r2": 1.0,
+      "cv": 0.2478,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.0015396114985148112
+    },
+    "blocks.9.image.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        1.9488870760266048
+      ],
+      "r2": 1.0,
+      "cv": 0.0445,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.003539905971950955
+    },
+    "blocks.9.text.attn.k_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.5790695865792517
+      ],
+      "r2": 1.0,
+      "cv": 0.0713,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.004622704399956597
+    },
+    "blocks.9.text.attn.o_proj": {
+      "degree": 0,
+      "coeffs": [
+        2.5084710454970103
+      ],
+      "r2": 1.0,
+      "cv": 0.0787,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.008364319695366754
+    },
+    "blocks.9.text.attn.q_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.5790695865792517
+      ],
+      "r2": 1.0,
+      "cv": 0.0713,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.003447784211900499
+    },
+    "blocks.9.text.attn.v_proj": {
+      "degree": 0,
+      "coeffs": [
+        1.5790695865792517
+      ],
+      "r2": 1.0,
+      "cv": 0.0713,
+      "alpha_multiplier": 0.6,
+      "alpha_search_mse": 0.006148377312554253
+    },
+    "blocks.9.text.mlp.fc1": {
+      "degree": 0,
+      "coeffs": [
+        2.235917296443831
+      ],
+      "r2": 1.0,
+      "cv": 0.0556,
+      "alpha_multiplier": 0.5,
+      "alpha_search_mse": 0.00466038089328342
+    },
+    "blocks.9.text.mlp.fc2": {
+      "degree": 0,
+      "coeffs": [
+        4.613672943077033
+      ],
+      "r2": 1.0,
+      "cv": 0.0255,
+      "alpha_multiplier": 0.25,
+      "alpha_search_mse": 0.01069690450032552
+    }
+  }
+}

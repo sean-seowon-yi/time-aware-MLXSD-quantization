@@ -1,0 +1,1176 @@
+{
+  "version": 1,
+  "n_layers": 285,
+  "alpha_candidates": [
+    0.25,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9,
+    1.0,
+    1.1,
+    1.25,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    5.0,
+    6,
+    8,
+    10
+  ],
+  "layers": {
+    "blocks.0.image.attn.q_proj": {
+      "multiplier": 0.7,
+      "mse": 0.0017638653649224175
+    },
+    "blocks.0.image.attn.k_proj": {
+      "multiplier": 0.7,
+      "mse": 0.0019399127960205078
+    },
+    "blocks.0.image.attn.v_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0016292729907565646
+    },
+    "blocks.0.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0010727997885810003
+    },
+    "blocks.0.image.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.00021951892640855578
+    },
+    "blocks.0.image.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.0012270658281114367
+    },
+    "blocks.0.text.attn.q_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0007905411190456814
+    },
+    "blocks.0.text.attn.k_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0007691541247897678
+    },
+    "blocks.0.text.attn.v_proj": {
+      "multiplier": 0.6,
+      "mse": 0.00047962167527940537
+    },
+    "blocks.0.text.attn.o_proj": {
+      "multiplier": 0.8,
+      "mse": 0.004379635704888238
+    },
+    "blocks.0.text.mlp.fc1": {
+      "multiplier": 0.9,
+      "mse": 0.005273227691650391
+    },
+    "blocks.0.text.mlp.fc2": {
+      "multiplier": 0.7,
+      "mse": 0.011778810289171007
+    },
+    "blocks.1.image.attn.q_proj": {
+      "multiplier": 0.9,
+      "mse": 0.006254571702745225
+    },
+    "blocks.1.image.attn.k_proj": {
+      "multiplier": 0.9,
+      "mse": 0.004118932088216146
+    },
+    "blocks.1.image.attn.v_proj": {
+      "multiplier": 0.9,
+      "mse": 0.0032964212629530165
+    },
+    "blocks.1.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0025740011003282334
+    },
+    "blocks.1.image.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.000926390012105306
+    },
+    "blocks.1.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.003138544930352105
+    },
+    "blocks.1.text.attn.q_proj": {
+      "multiplier": 0.6,
+      "mse": 0.000494824727376302
+    },
+    "blocks.1.text.attn.k_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0005143974092271593
+    },
+    "blocks.1.text.attn.v_proj": {
+      "multiplier": 0.6,
+      "mse": 0.00020222920841640897
+    },
+    "blocks.1.text.attn.o_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0008077097468905979
+    },
+    "blocks.1.text.mlp.fc1": {
+      "multiplier": 0.8,
+      "mse": 0.004794144100613064
+    },
+    "blocks.1.text.mlp.fc2": {
+      "multiplier": 0.9,
+      "mse": 0.013166805691189236
+    },
+    "blocks.2.image.attn.q_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0034997982449001736
+    },
+    "blocks.2.image.attn.k_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0030762496524386934
+    },
+    "blocks.2.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.00251563835144043
+    },
+    "blocks.2.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.00303409915500217
+    },
+    "blocks.2.image.mlp.fc1": {
+      "multiplier": 0.9,
+      "mse": 0.0018280150095621745
+    },
+    "blocks.2.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.0035436651441786023
+    },
+    "blocks.2.text.attn.q_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0006953861978318956
+    },
+    "blocks.2.text.attn.k_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0007252243889702691
+    },
+    "blocks.2.text.attn.v_proj": {
+      "multiplier": 0.7,
+      "mse": 0.0006866956816779243
+    },
+    "blocks.2.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0026890799204508462
+    },
+    "blocks.2.text.mlp.fc1": {
+      "multiplier": 0.8,
+      "mse": 0.006792686886257595
+    },
+    "blocks.2.text.mlp.fc2": {
+      "multiplier": 0.7,
+      "mse": 0.01609331258138021
+    },
+    "blocks.3.image.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.009162896898057726
+    },
+    "blocks.3.image.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.007654272291395399
+    },
+    "blocks.3.image.attn.v_proj": {
+      "multiplier": 0.8,
+      "mse": 0.006748969184027778
+    },
+    "blocks.3.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0070902040269639754
+    },
+    "blocks.3.image.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.0019256163703070747
+    },
+    "blocks.3.image.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.004174203236897787
+    },
+    "blocks.3.text.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.0005458164744906955
+    },
+    "blocks.3.text.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.000625927554236518
+    },
+    "blocks.3.text.attn.v_proj": {
+      "multiplier": 0.8,
+      "mse": 0.00043277067608303495
+    },
+    "blocks.3.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0037451922098795574
+    },
+    "blocks.3.text.mlp.fc1": {
+      "multiplier": 0.8,
+      "mse": 0.004340431213378906
+    },
+    "blocks.3.text.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.008294234381781684
+    },
+    "blocks.4.image.attn.q_proj": {
+      "multiplier": 0.7,
+      "mse": 0.005604148440890842
+    },
+    "blocks.4.image.attn.k_proj": {
+      "multiplier": 0.7,
+      "mse": 0.005181453280978732
+    },
+    "blocks.4.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.004968907674153646
+    },
+    "blocks.4.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.007252554151746962
+    },
+    "blocks.4.image.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.0019381319681803385
+    },
+    "blocks.4.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.003998984018961589
+    },
+    "blocks.4.text.attn.q_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0009417441685994466
+    },
+    "blocks.4.text.attn.k_proj": {
+      "multiplier": 0.6,
+      "mse": 0.000996986601087782
+    },
+    "blocks.4.text.attn.v_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0009973994361029731
+    },
+    "blocks.4.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.005271099090576172
+    },
+    "blocks.4.text.mlp.fc1": {
+      "multiplier": 0.7,
+      "mse": 0.004781447940402561
+    },
+    "blocks.4.text.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.008131692674424913
+    },
+    "blocks.5.image.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.005137476179334853
+    },
+    "blocks.5.image.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.004588041517469618
+    },
+    "blocks.5.image.attn.v_proj": {
+      "multiplier": 0.6,
+      "mse": 0.005286953396267361
+    },
+    "blocks.5.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.005772485097249349
+    },
+    "blocks.5.image.mlp.fc1": {
+      "multiplier": 0.8,
+      "mse": 0.0019451880984836154
+    },
+    "blocks.5.image.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.00426344723171658
+    },
+    "blocks.5.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0012170931498209636
+    },
+    "blocks.5.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.001499261326260037
+    },
+    "blocks.5.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0013491599824693467
+    },
+    "blocks.5.text.attn.o_proj": {
+      "multiplier": 0.6,
+      "mse": 0.005217157151963975
+    },
+    "blocks.5.text.mlp.fc1": {
+      "multiplier": 0.6,
+      "mse": 0.005335728963216146
+    },
+    "blocks.5.text.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.007975889417860243
+    },
+    "blocks.6.image.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.005411771138509115
+    },
+    "blocks.6.image.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.005231116400824653
+    },
+    "blocks.6.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.005266524844699436
+    },
+    "blocks.6.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.006620924631754557
+    },
+    "blocks.6.image.mlp.fc1": {
+      "multiplier": 0.6,
+      "mse": 0.001610277705722385
+    },
+    "blocks.6.image.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.004346025678846571
+    },
+    "blocks.6.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0018723862965901693
+    },
+    "blocks.6.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.00212635866800944
+    },
+    "blocks.6.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0021735492282443578
+    },
+    "blocks.6.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.00676420169406467
+    },
+    "blocks.6.text.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.004024297078450521
+    },
+    "blocks.6.text.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.00793157704671224
+    },
+    "blocks.7.image.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.00830401611328125
+    },
+    "blocks.7.image.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.007209733751085069
+    },
+    "blocks.7.image.attn.v_proj": {
+      "multiplier": 0.8,
+      "mse": 0.009117267184787326
+    },
+    "blocks.7.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.010970873514811198
+    },
+    "blocks.7.image.mlp.fc1": {
+      "multiplier": 0.9,
+      "mse": 0.0017757369147406684
+    },
+    "blocks.7.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.0034898849063449435
+    },
+    "blocks.7.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0014869334962632921
+    },
+    "blocks.7.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.00207105467054579
+    },
+    "blocks.7.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0018873199886745877
+    },
+    "blocks.7.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.006729467180040148
+    },
+    "blocks.7.text.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.0038659464518229166
+    },
+    "blocks.7.text.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.005384699079725478
+    },
+    "blocks.8.image.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.007252044677734375
+    },
+    "blocks.8.image.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.006775389353434245
+    },
+    "blocks.8.image.attn.v_proj": {
+      "multiplier": 0.8,
+      "mse": 0.00910646226671007
+    },
+    "blocks.8.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.008395758734809028
+    },
+    "blocks.8.image.mlp.fc1": {
+      "multiplier": 0.9,
+      "mse": 0.0014863163630167643
+    },
+    "blocks.8.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.0034730523427327475
+    },
+    "blocks.8.text.attn.q_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0021654612223307294
+    },
+    "blocks.8.text.attn.k_proj": {
+      "multiplier": 0.6,
+      "mse": 0.002608082453409831
+    },
+    "blocks.8.text.attn.v_proj": {
+      "multiplier": 0.6,
+      "mse": 0.002479070239596897
+    },
+    "blocks.8.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.006822484758165147
+    },
+    "blocks.8.text.mlp.fc1": {
+      "multiplier": 0.6,
+      "mse": 0.0035693308512369792
+    },
+    "blocks.8.text.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.006659613291422526
+    },
+    "blocks.9.image.attn.q_proj": {
+      "multiplier": 0.7,
+      "mse": 0.005143769158257379
+    },
+    "blocks.9.image.attn.k_proj": {
+      "multiplier": 0.7,
+      "mse": 0.004643968794080946
+    },
+    "blocks.9.image.attn.v_proj": {
+      "multiplier": 0.6,
+      "mse": 0.004433494144015842
+    },
+    "blocks.9.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.008114920722113715
+    },
+    "blocks.9.image.mlp.fc1": {
+      "multiplier": 0.6,
+      "mse": 0.0015396114985148112
+    },
+    "blocks.9.image.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.003539905971950955
+    },
+    "blocks.9.text.attn.q_proj": {
+      "multiplier": 0.6,
+      "mse": 0.003447784211900499
+    },
+    "blocks.9.text.attn.k_proj": {
+      "multiplier": 0.6,
+      "mse": 0.004622704399956597
+    },
+    "blocks.9.text.attn.v_proj": {
+      "multiplier": 0.6,
+      "mse": 0.006148377312554253
+    },
+    "blocks.9.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.008364319695366754
+    },
+    "blocks.9.text.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.00466038089328342
+    },
+    "blocks.9.text.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.01069690450032552
+    },
+    "blocks.10.image.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.006935201009114583
+    },
+    "blocks.10.image.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.007171718173556858
+    },
+    "blocks.10.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0075473259819878475
+    },
+    "blocks.10.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0076929211086697044
+    },
+    "blocks.10.image.mlp.fc1": {
+      "multiplier": 0.7,
+      "mse": 0.0013593905766805013
+    },
+    "blocks.10.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.0031854091220431856
+    },
+    "blocks.10.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0024969117906358507
+    },
+    "blocks.10.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0029538817935519748
+    },
+    "blocks.10.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0035705765618218315
+    },
+    "blocks.10.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.010157205369737413
+    },
+    "blocks.10.text.mlp.fc1": {
+      "multiplier": 0.7,
+      "mse": 0.004361437479654948
+    },
+    "blocks.10.text.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.010882205539279514
+    },
+    "blocks.11.image.attn.q_proj": {
+      "multiplier": 0.9,
+      "mse": 0.006594580332438151
+    },
+    "blocks.11.image.attn.k_proj": {
+      "multiplier": 0.9,
+      "mse": 0.00683004167344835
+    },
+    "blocks.11.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.007413692898220486
+    },
+    "blocks.11.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.006466496785481771
+    },
+    "blocks.11.image.mlp.fc1": {
+      "multiplier": 0.7,
+      "mse": 0.0012019618352254232
+    },
+    "blocks.11.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.0032872833675808375
+    },
+    "blocks.11.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0030766139560275607
+    },
+    "blocks.11.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.004016956753200955
+    },
+    "blocks.11.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.004860886043972439
+    },
+    "blocks.11.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.007840228610568576
+    },
+    "blocks.11.text.mlp.fc1": {
+      "multiplier": 0.6,
+      "mse": 0.005915588802761502
+    },
+    "blocks.11.text.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.013594419691297743
+    },
+    "blocks.12.image.attn.q_proj": {
+      "multiplier": 0.9,
+      "mse": 0.010683707343207465
+    },
+    "blocks.12.image.attn.k_proj": {
+      "multiplier": 0.9,
+      "mse": 0.011709717644585503
+    },
+    "blocks.12.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.013020544264051649
+    },
+    "blocks.12.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.008625967237684462
+    },
+    "blocks.12.image.mlp.fc1": {
+      "multiplier": 0.7,
+      "mse": 0.0010636882781982421
+    },
+    "blocks.12.image.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.003962520599365234
+    },
+    "blocks.12.text.attn.q_proj": {
+      "multiplier": 0.25,
+      "mse": 0.003152917226155599
+    },
+    "blocks.12.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.003789216783311632
+    },
+    "blocks.12.text.attn.v_proj": {
+      "multiplier": 0.25,
+      "mse": 0.0037745429144965276
+    },
+    "blocks.12.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.00980861579047309
+    },
+    "blocks.12.text.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.0047847476535373265
+    },
+    "blocks.12.text.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.014520411173502603
+    },
+    "blocks.13.image.attn.q_proj": {
+      "multiplier": 0.6,
+      "mse": 0.00466819085015191
+    },
+    "blocks.13.image.attn.k_proj": {
+      "multiplier": 0.6,
+      "mse": 0.005014190673828125
+    },
+    "blocks.13.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.005646941714816623
+    },
+    "blocks.13.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.007758965386284723
+    },
+    "blocks.13.image.mlp.fc1": {
+      "multiplier": 0.6,
+      "mse": 0.0010923870934380425
+    },
+    "blocks.13.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.0030782557593451608
+    },
+    "blocks.13.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.003502370834350586
+    },
+    "blocks.13.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.004187423706054688
+    },
+    "blocks.13.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.006214060465494792
+    },
+    "blocks.13.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.012426907857259115
+    },
+    "blocks.13.text.mlp.fc1": {
+      "multiplier": 0.9,
+      "mse": 0.006269593132866754
+    },
+    "blocks.13.text.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.02465066867404514
+    },
+    "blocks.14.image.attn.q_proj": {
+      "multiplier": 0.9,
+      "mse": 0.008311827765570746
+    },
+    "blocks.14.image.attn.k_proj": {
+      "multiplier": 0.9,
+      "mse": 0.00889868418375651
+    },
+    "blocks.14.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.009382030063205295
+    },
+    "blocks.14.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0110445556640625
+    },
+    "blocks.14.image.mlp.fc1": {
+      "multiplier": 0.7,
+      "mse": 0.0008703123198615181
+    },
+    "blocks.14.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.002589748382568359
+    },
+    "blocks.14.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.004030707041422526
+    },
+    "blocks.14.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.005346734788682726
+    },
+    "blocks.14.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.006276499430338541
+    },
+    "blocks.14.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.015549789428710938
+    },
+    "blocks.14.text.mlp.fc1": {
+      "multiplier": 0.6,
+      "mse": 0.025598997328016494
+    },
+    "blocks.14.text.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.3701559787326389
+    },
+    "blocks.15.image.attn.q_proj": {
+      "multiplier": 0.6,
+      "mse": 0.005208511352539063
+    },
+    "blocks.15.image.attn.k_proj": {
+      "multiplier": 0.6,
+      "mse": 0.005981003655327691
+    },
+    "blocks.15.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.006676180097791883
+    },
+    "blocks.15.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.007631746080186632
+    },
+    "blocks.15.image.mlp.fc1": {
+      "multiplier": 0.6,
+      "mse": 0.0008406785859002007
+    },
+    "blocks.15.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.0024032435946994357
+    },
+    "blocks.15.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.003138456556532118
+    },
+    "blocks.15.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0039521480136447485
+    },
+    "blocks.15.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.004985642751057943
+    },
+    "blocks.15.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.008937811109754775
+    },
+    "blocks.15.text.mlp.fc1": {
+      "multiplier": 0.8,
+      "mse": 0.008194120619032118
+    },
+    "blocks.15.text.mlp.fc2": {
+      "multiplier": 0.6,
+      "mse": 0.008257089402940539
+    },
+    "blocks.16.image.attn.q_proj": {
+      "multiplier": 0.7,
+      "mse": 0.010511781480577256
+    },
+    "blocks.16.image.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.011592992146809896
+    },
+    "blocks.16.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.012898630777994791
+    },
+    "blocks.16.image.attn.o_proj": {
+      "multiplier": 0.25,
+      "mse": 0.006304259830050998
+    },
+    "blocks.16.image.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.000728395938873291
+    },
+    "blocks.16.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.002644680870903863
+    },
+    "blocks.16.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.003094109853108724
+    },
+    "blocks.16.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0039086740281846786
+    },
+    "blocks.16.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.003782073974609375
+    },
+    "blocks.16.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.006333724551730686
+    },
+    "blocks.16.text.mlp.fc1": {
+      "multiplier": 0.6,
+      "mse": 0.008001330057779948
+    },
+    "blocks.16.text.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.020931896633572047
+    },
+    "blocks.17.image.attn.q_proj": {
+      "multiplier": 0.7,
+      "mse": 0.0144346923828125
+    },
+    "blocks.17.image.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.017665162828233508
+    },
+    "blocks.17.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.01710223897298177
+    },
+    "blocks.17.image.attn.o_proj": {
+      "multiplier": 0.6,
+      "mse": 0.008183856540256076
+    },
+    "blocks.17.image.mlp.fc1": {
+      "multiplier": 0.7,
+      "mse": 0.0008597454494900173
+    },
+    "blocks.17.image.mlp.fc2": {
+      "multiplier": 0.25,
+      "mse": 0.002963776058620877
+    },
+    "blocks.17.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.003410626729329427
+    },
+    "blocks.17.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.004349336412217882
+    },
+    "blocks.17.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.004375525580512153
+    },
+    "blocks.17.text.attn.o_proj": {
+      "multiplier": 0.25,
+      "mse": 0.0065866567823621965
+    },
+    "blocks.17.text.mlp.fc1": {
+      "multiplier": 0.7,
+      "mse": 0.021926698472764756
+    },
+    "blocks.17.text.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.029371866861979165
+    },
+    "blocks.18.image.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.009127666897243923
+    },
+    "blocks.18.image.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.010863148159450955
+    },
+    "blocks.18.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.009329878913031685
+    },
+    "blocks.18.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.009626710679796008
+    },
+    "blocks.18.image.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.0007563872867160374
+    },
+    "blocks.18.image.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.002516948488023546
+    },
+    "blocks.18.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.004339592827690972
+    },
+    "blocks.18.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.004695985582139757
+    },
+    "blocks.18.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0064857114156087236
+    },
+    "blocks.18.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.008253746032714844
+    },
+    "blocks.18.text.mlp.fc1": {
+      "multiplier": 0.8,
+      "mse": 0.003852598402235243
+    },
+    "blocks.18.text.mlp.fc2": {
+      "multiplier": 0.6,
+      "mse": 0.004850708855523004
+    },
+    "blocks.19.image.attn.q_proj": {
+      "multiplier": 0.9,
+      "mse": 0.015914642333984375
+    },
+    "blocks.19.image.attn.k_proj": {
+      "multiplier": 0.9,
+      "mse": 0.016336878458658853
+    },
+    "blocks.19.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.017379648844401043
+    },
+    "blocks.19.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.009680266486273872
+    },
+    "blocks.19.image.mlp.fc1": {
+      "multiplier": 0.8,
+      "mse": 0.0010873196919759115
+    },
+    "blocks.19.image.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.00348663330078125
+    },
+    "blocks.19.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0031284234788682727
+    },
+    "blocks.19.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.004929579416910807
+    },
+    "blocks.19.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0042625486585829
+    },
+    "blocks.19.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0068342734442816844
+    },
+    "blocks.19.text.mlp.fc1": {
+      "multiplier": 0.9,
+      "mse": 0.0184399905734592
+    },
+    "blocks.19.text.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.020072916666666666
+    },
+    "blocks.20.image.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.01802005852593316
+    },
+    "blocks.20.image.attn.k_proj": {
+      "multiplier": 0.9,
+      "mse": 0.02515447489420573
+    },
+    "blocks.20.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0180655025906033
+    },
+    "blocks.20.image.attn.o_proj": {
+      "multiplier": 0.6,
+      "mse": 0.023185384114583332
+    },
+    "blocks.20.image.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.001202395863003201
+    },
+    "blocks.20.image.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.0034567926194932724
+    },
+    "blocks.20.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.005650733947753906
+    },
+    "blocks.20.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.00623788833618164
+    },
+    "blocks.20.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.007926027086046008
+    },
+    "blocks.20.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.011543985154893664
+    },
+    "blocks.20.text.mlp.fc1": {
+      "multiplier": 0.9,
+      "mse": 0.019317314995659723
+    },
+    "blocks.20.text.mlp.fc2": {
+      "multiplier": 0.8,
+      "mse": 0.78526220703125
+    },
+    "blocks.21.image.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.017224780612521702
+    },
+    "blocks.21.image.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.020997648451063368
+    },
+    "blocks.21.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.01989837646484375
+    },
+    "blocks.21.image.attn.o_proj": {
+      "multiplier": 0.6,
+      "mse": 0.020613513522677953
+    },
+    "blocks.21.image.mlp.fc1": {
+      "multiplier": 0.7,
+      "mse": 0.0011738189061482748
+    },
+    "blocks.21.image.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.004434937371148004
+    },
+    "blocks.21.text.attn.q_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0043276210361056855
+    },
+    "blocks.21.text.attn.k_proj": {
+      "multiplier": 0.6,
+      "mse": 0.0065352121988932295
+    },
+    "blocks.21.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.006703530629475912
+    },
+    "blocks.21.text.attn.o_proj": {
+      "multiplier": 0.6,
+      "mse": 0.005177052391899957
+    },
+    "blocks.21.text.mlp.fc1": {
+      "multiplier": 1.0,
+      "mse": 0.03268557400173611
+    },
+    "blocks.21.text.mlp.fc2": {
+      "multiplier": 0.9,
+      "mse": 1.1231434461805556
+    },
+    "blocks.22.image.attn.q_proj": {
+      "multiplier": 0.9,
+      "mse": 0.025880301581488716
+    },
+    "blocks.22.image.attn.k_proj": {
+      "multiplier": 0.9,
+      "mse": 0.02616575961642795
+    },
+    "blocks.22.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.02831622314453125
+    },
+    "blocks.22.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.026985165066189237
+    },
+    "blocks.22.image.mlp.fc1": {
+      "multiplier": 0.5,
+      "mse": 0.0019232076009114583
+    },
+    "blocks.22.image.mlp.fc2": {
+      "multiplier": 0.5,
+      "mse": 0.004973570505777995
+    },
+    "blocks.22.text.attn.q_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0036535733540852865
+    },
+    "blocks.22.text.attn.k_proj": {
+      "multiplier": 0.5,
+      "mse": 0.007156499226888021
+    },
+    "blocks.22.text.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.006454469892713759
+    },
+    "blocks.22.text.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.0036437284681532117
+    },
+    "blocks.22.text.mlp.fc1": {
+      "multiplier": 1.25,
+      "mse": 0.19521875
+    },
+    "blocks.22.text.mlp.fc2": {
+      "multiplier": 1.0,
+      "mse": 33.156607638888886
+    },
+    "blocks.23.image.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.013112011379665799
+    },
+    "blocks.23.image.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.009778784010145399
+    },
+    "blocks.23.image.attn.v_proj": {
+      "multiplier": 0.5,
+      "mse": 0.015442252265082465
+    },
+    "blocks.23.image.attn.o_proj": {
+      "multiplier": 0.5,
+      "mse": 0.01281238301595052
+    },
+    "blocks.23.image.mlp.fc1": {
+      "multiplier": 0.7,
+      "mse": 0.0010497876273261176
+    },
+    "blocks.23.image.mlp.fc2": {
+      "multiplier": 0.8,
+      "mse": 0.0018744386037190756
+    },
+    "blocks.23.text.attn.q_proj": {
+      "multiplier": 0.8,
+      "mse": 0.000384039216571384
+    },
+    "blocks.23.text.attn.k_proj": {
+      "multiplier": 0.8,
+      "mse": 0.006718255784776476
+    },
+    "blocks.23.text.attn.v_proj": {
+      "multiplier": 0.7,
+      "mse": 0.005477760738796658
+    }
+  },
+  "meta": {
+    "quantized_dir": "quantized/w4a8_l2_a0.50_gs32_static",
+    "prompts_file": "src/settings/coco_100_calibration_prompts.txt",
+    "num_prompts": 50,
+    "num_steps": 30,
+    "cfg_weight": 4.0,
+    "latent_size": 64,
+    "subsample_rows": 128,
+    "reference_fp16": true,
+    "elapsed_sec": 14700.0
+  }
+}

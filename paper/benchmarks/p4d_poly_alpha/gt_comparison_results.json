@@ -1,0 +1,59 @@
+{
+  "ground_truth_dir": "results/gt/images",
+  "fp16_images_dir": "results/fp16/images",
+  "w4a8_images_dir": "benchmark_results/w4a8_eval_alpha_search/images",
+  "quantized_dir": "quantized/w4a8_l2_a0.50_gs32_static_alpha_search",
+  "n_target": 512,
+  "img_digits": 3,
+  "prompt_file": "src/settings/evaluation_set.txt",
+  "fid_fp16_vs_gt": {
+    "fid": 105.8698461895329,
+    "isc_mean": 18.199349131846297,
+    "isc_std": 1.2256906357191812,
+    "kid_mean": 0.011445305347442626,
+    "kid_std": 6.823104868533224e-08,
+    "precision": 0.40234375,
+    "recall": 0.69140625
+  },
+  "fid_w4a8_vs_gt": {
+    "fid": 104.6306849714374,
+    "isc_mean": 18.266893903634475,
+    "isc_std": 1.2272277674860013,
+    "kid_mean": 0.008671183586120606,
+    "kid_std": 1.551736840750978e-07,
+    "precision": 0.505859375,
+    "recall": 0.646484375
+  },
+  "cmmd_fp16_vs_gt": 0.5068778991699219,
+  "cmmd_w4a8_vs_gt": 0.5556344985961914,
+  "clip_score_fp16": {
+    "clip_image_text_mean": 0.2688864624942653,
+    "clip_image_text_std": 0.03170530734912305,
+    "n_pairs": 512,
+    "clip_model_id": "ViT-L-14-336:openai"
+  },
+  "clip_score_w4a8": {
+    "clip_image_text_mean": 0.26782810589065775,
+    "clip_image_text_std": 0.031210172322896735,
+    "n_pairs": 512,
+    "clip_model_id": "ViT-L-14-336:openai"
+  },
+  "lpips_w4a8_vs_fp16": {
+    "lpips_mean": 0.38249289788655005,
+    "lpips_std": 0.11556600639116124,
+    "n_pairs": 512
+  },
+  "metric_options": {
+    "config": "w4a8_poly",
+    "kid_subset_max": 1000,
+    "fidelity_cuda": false,
+    "clip_arch": "ViT-L-14-336",
+    "clip_pretrained": "openai",
+    "clip_batch_size": 16,
+    "lpips_net": "alex",
+    "lpips_resize": 256,
+    "num_steps": 30,
+    "cfg_scale": 4.0,
+    "seed": 42
+  }
+}

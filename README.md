@@ -1,132 +1,113 @@
-# time-aware-MLXSD-quantization
+# PQ4DiT: Time-Aware Polynomial Clipping for Post-Training Quantization of Stable Diffusion 3
 
-Time-aware post-training quantization for **Stable Diffusion 3 Medium (MMDiT)** on **Apple Silicon**, using **DiffusionKit (MLX)**. The implementation follows **PTQ4DiT**-style **Channel-wise Salience Balancing (CSB)** and **Spearman-based Sigma Calibration (SSC)** for **W4A8** (4-bit weights, 8-bit activations), with optional **static** activation scales derived from Phase 1 calibration data.
+**David Holt, A. Michael Tjhin, Seo Won Yi**
 
----
+W4A8 post-training quantization of **Stable Diffusion 3 Medium** (MM-DiT backbone), implemented end-to-end in **MLX on Apple Silicon** (no CUDA anywhere in the pipeline). Paper: [`paper/uoft-csc2210w26-paper3.pdf`](paper/uoft-csc2210w26-paper3.pdf).
 
-## What this repository contains
+## Summary
 
-| Area | Role |
-|------|------|
-| **`src/phase1/`** | Diagnostic collection: hooks on target `nn.Linear` layers, activation stats per σ-step, weight salience. Outputs under `diagnostics/`. |
-| **`src/phase2/`** | Calibration (`calibrate.py`), CSB (`balance.py`), dynamic W4A8 (`quantize.py`), **static** W4A8 (`quantize_static.py`), end-to-end CLI (`run_e2e.py`), inference (`run_inference.py`), optional post-quant diagnostics (`run_diagnose.py`), and **visualization scripts** (`plot_post_csb.py`, `plot_weight_profile.py`, `plot_quantized_weight.py`, `plot_mse_vs_block.py`). |
-| **`src/benchmark/`** | `gt_comparison_pipeline.py` — GT comparison: generates W4A8 images if needed, then computes FID, CMMD, CLIP scores, and LPIPS against ground truth and FP16 baselines. |
-| **`src/settings/`** | `coco_100_calibration_prompts.txt` (100 tab-separated seed/prompt pairs for Phase 1) and `evaluation_set.txt` (larger set for benchmarks/sweeps). |
-| **`DiffusionKit/`** | Vendored DiffusionKit Python sources (see `DiffusionKit/README.md`). |
+Diffusion transformers are hard to quantize for two reasons: per-layer activation ranges drift across the denoising schedule, and a few salient channels dominate each layer's dynamic range. We study a lightweight, time-aware activation clipping scheme on top of PTQ4DiT:
 
-**Documentation** (in `src/`):
+1. **Polynomial clipping (Poly)** — each layer's A8 clipping range is a low-degree polynomial in the noise level σ, fit by least squares to per-timestep activation absmax (degree 0 when CV < 0.10, otherwise 2–4).
+2. **PTQ4DiT transforms (P4D)** — Channel-wise Salience Balancing (CSB) and Spearman-guided Salience Calibration (SSC), applied independently to SD3's image and text sub-blocks *before* the polynomial fit.
+3. **α-search** — a per-layer scalar multiplier α on the polynomial range, chosen by grid search to minimize per-layer reconstruction MSE on calibration data.
 
-- `PHASE1.md` -- design and architecture notes for Phase 1 diagnostics.
-- `PHASE2.md` -- CSB/SSC/W4A8 pipeline, data flow, CLI reference.
-- `phase1_findings.md` -- summarized empirical findings from collected diagnostics.
+**Main finding (negative result):** the full pipeline P4D + Poly + α matches, but does not beat, the PTQ4DiT baseline within evaluation noise. Adding polynomial clipping to P4D degrades CMMD, and α-search only recovers that loss. Once CSB/SSC is applied, a static per-tensor 8-bit activation scale is already competitive on this architecture.
 
-There is **no** `src/calibration_sample_generation/` or `src/activation_diagnostics/` tree; those paths referred to an older scaffold and are **not** present in this codebase.
+**Contributions:** to our knowledge, the first public W4A8 PTQ benchmark on SD3 MM-DiT (12 quantized configurations), plus a self-contained MLX/Apple Silicon reference implementation.
 
----
+## Results
 
-## Environment and dependencies
+SD3-medium, W4A8 (per-group W4, group size 32; per-tensor A8), 512×512, 30 Euler steps, CFG 4.0, 512 held-out MS-COCO prompts ([`src/settings/evaluation_set.txt`](src/settings/evaluation_set.txt)). FID/CMMD are against ground-truth images; LPIPS pairs each image with its matched-seed FP16 image. CMMD is the primary metric.
 
-- **Platform:** macOS with Apple Silicon (MLX).
-- **Python:** 3.10+ (use a conda env with MLX + DiffusionKit stack, or a venv).
+| Pipeline | FID ↓ | CMMD ↓ | LPIPS ↓ | CLIP ↑ |
+|---|---:|---:|---:|---:|
+| FP16 (reference) | 105.87 | 0.507 | – | 0.269 (0.032) |
+| *Static-calibration baselines* | | | | |
+| Vanilla W4A8 | 250.85 | 2.696 | 0.667 (0.075) | 0.160 (0.034) |
+| GPTQ | 106.53 | 0.684 | 0.406 (0.105) | 0.265 (0.032) |
+| *PTQ4DiT baseline* | | | | |
+| P4D | **103.80** | **0.553** | 0.384 (0.114) | 0.266 (0.033) |
+| *Polynomial clipping without P4D* | | | | |
+| Poly + GPTQ | 357.92 | 3.457 | 0.729 (0.056) | 0.119 (0.024) |
+| Poly + AdaRound | 142.64 | 1.498 | 0.558 (0.077) | 0.238 (0.036) |
+| Poly + MW AdaRound | 145.57 | 1.436 | 0.565 (0.083) | 0.238 (0.036) |
+| Poly + α | 109.75 | 0.858 | 0.476 (0.097) | 0.259 (0.033) |
+| Poly + α + GPTQ | 104.83 | 0.660 | 0.406 (0.109) | 0.266 (0.033) |
+| *Polynomial clipping with P4D (ours)* | | | | |
+| P4D + Poly | 106.32 | 0.662 | 0.394 (0.109) | 0.265 (0.032) |
+| P4D + Poly + AdaRound | 107.12 | 0.697 | 0.440 (0.095) | **0.268** (0.032) |
+| P4D + Poly + MW AdaRound | 107.90 | 0.730 | 0.466 (0.095) | 0.266 (0.031) |
+| **P4D + Poly + α (ours)** | 104.63 | 0.556 | **0.383** (0.116) | **0.268** (0.031) |
 
-Install dependencies from the repo root:
+Naming: RTN is the implicit default for both the W4 rounder and the A8 quantizer. "MW AdaRound" reweights AdaRound's per-timestep loss by the mean absolute derivative of the polynomial schedule.
+
+Raw metric outputs plus the quantization config, polynomial schedule, and α-search results for the P4D, P4D + Poly, and P4D + Poly + α rows are in [`paper/benchmarks/`](paper/benchmarks/). Qualitative comparisons and method figures are in the [paper](paper/uoft-csc2210w26-paper3.pdf).
+
+## Where each configuration lives
+
+| Configurations | Code |
+|---|---|
+| P4D, P4D + Poly, P4D + Poly + α | `src/phase1/` → `src/phase2/` → `src/phase3/` → `src/phase4_1/`, orchestrated by `src/run_poly_alpha_pipeline.py` (CLI reference: [`src/settings/commands.md`](src/settings/commands.md)) |
+| Poly + AdaRound, Poly + MW AdaRound | `src/generate_poly_schedule.py`, `src/cache_adaround_data.py`, `src/adaround_optimize.py --poly-schedule ... [--derivative-weighted --deriv-agg mean]` (see [`POLYNOMIAL_CLIPPING_EXPLAINER.md`](POLYNOMIAL_CLIPPING_EXPLAINER.md), [`RESEARCH_LOG.md`](RESEARCH_LOG.md)) |
+| P4D + Poly + AdaRound, P4D + Poly + MW AdaRound | branch `ptq4dit-polynomial-adaround` (`src/phase4/`) |
+| GPTQ, Poly + GPTQ, Poly + α, Poly + α + GPTQ | branch `gptq` (`src/gptq/`) |
+| FID / CMMD / LPIPS / CLIP evaluation | `src/benchmark/gt_comparison_pipeline.py` |
+
+## Setup
+
+macOS on Apple Silicon (tested on M1, M4, M5), Python 3.10+.
 
 ```bash
 pip install -r requirements.txt
-```
-
-Key packages include: `mlx`, `torch`, `safetensors`, `transformers`, `pillow`, `numpy`, `scipy`, `matplotlib`, and (for benchmarks) `torch-fidelity`, `open-clip-torch`, `lpips`, `psutil`.
-
-Ensure DiffusionKit is importable (this repo expects `DiffusionKit/python/src` on `PYTHONPATH`, or the Phase 2 scripts add it when run as modules):
-
-```bash
 export PYTHONPATH="$PWD/DiffusionKit/python/src:$PYTHONPATH"
 ```
 
----
+## Reproducing P4D + Poly + α
 
-## Phase 1 — Diagnostic collection
+Calibration uses 100 MS-COCO prompt/seed pairs ([`src/settings/coco_100_calibration_prompts.txt`](src/settings/coco_100_calibration_prompts.txt)); CSB β = 0.5, SSC τ = 1.0. The settings below are the ones recorded in [`paper/benchmarks/p4d_poly_alpha/`](paper/benchmarks/p4d_poly_alpha/).
 
-Collects per-layer activation trajectories (per-channel max over tokens at each denoising step) and weight salience, using **100** COCO-caption–style seed/prompt pairs by default (`src/settings/coco_100_calibration_prompts.txt`), **30** Euler steps, **CFG 4.0**, latent **64×64** (512×512 pixels).
-
-**Entry points**
-
-- **Collection** (writes `diagnostics/activation_stats/`, `weight_stats.npz`, `config.json`, adaLN stats; no plots):  
-  `python -m src.phase1.run_collection`  
-  Optional: `--pilot` (2 prompts), `--num-prompts N`.
-
-- **Analysis + plots** (requires existing `diagnostics/`):  
-  `python -m src.phase1.run_analysis`
-
-See `src/PHASE1.md` and `src/phase1_findings.md` for methodology and results.
-
----
-
-## Phase 2 — W4A8 quantization (PTQ4DiT-style)
-
-**End-to-end (collection → calibration → CSB → quantize → save):**
+**1. Calibrate, quantize (P4D), fit the polynomial schedule, and run α-search** (α-search on 50 prompts took ~4 h on Apple Silicon):
 
 ```bash
-python -m src.phase2.run_e2e --output-dir quantized/
+python -m src.run_poly_alpha_pipeline --prompts-file src/settings/coco_100_calibration_prompts.txt --output-dir quantized --diagnostics-dir diagnostics --qkv-method l2 --alpha 0.5 --group-size 32 --bits 4 --static-mode ssc_weighted --static-granularity per_tensor --ssc-tau 1.0 --max-degree 4 --alpha-num-prompts 50
 ```
 
-**Reuse existing diagnostics** (skip Phase 1 collection):
+This writes `quantized/w4a8_l2_a0.50_gs32_static/`, containing the P4D checkpoint and a `poly_schedule.json` with the per-layer α merged in. The schedule before α-search is kept as `poly_schedule.json.pre_alpha_search.bak` (the P4D + Poly row).
+
+**2. Benchmark against ground truth and FP16:**
 
 ```bash
-python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection
+python -m src.benchmark.gt_comparison_pipeline --ground-truth-dir results/gt/images --fp16-images-dir results/fp16/images --quantized-dir quantized/w4a8_l2_a0.50_gs32_static --output-dir benchmark_results/p4d_poly_alpha --config w4a8_poly --poly-schedule quantized/w4a8_l2_a0.50_gs32_static/poly_schedule.json --group-size 32 --prompt-file src/settings/evaluation_set.txt
 ```
 
-**Static activation quantization** (scales from calibration; separate from dynamic fake-quant per forward):
+For the P4D baseline, use `--config w4a8_static` and omit `--poly-schedule`.
 
-```bash
-python -m src.phase2.run_e2e --output-dir quantized/ --skip-collection \
-  --act-quant static --static-mode ssc_weighted --static-granularity per_tensor
+## Repository layout
+
+```
+paper/                    Paper (PDF) and benchmark outputs for the P4D rows
+src/phase1/               Activation/weight diagnostics collection (σ-trajectories, salience)  — docs: src/PHASE1.md
+src/phase2/               CSB + SSC calibration, W4A8 quantization, inference                  — docs: src/Phase2.md
+src/phase3/               Polynomial clipping schedule fitting and visualization               — docs: src/PHASE3.md
+src/phase4_1/             Per-layer α-search                                                   — docs: src/PHASE4_1.md
+src/benchmark/            FID / CMMD / LPIPS / CLIP evaluation
+src/settings/             Calibration and evaluation prompt sets, CLI reference (commands.md)
+src/*.py                  Polynomial schedule, AdaRound / MW AdaRound, SmoothQuant, benchmarking scripts
+src/calibration_sample_generation/, src/activation_diagnostics/
+                          Early TaQ-DiT-style calibration and post-GELU profiling
+plans/, PLAN.md, RESEARCH_LOG.md, POLYNOMIAL_CLIPPING_EXPLAINER.md
+                          Design notes and research log
+DiffusionKit/             Vendored DiffusionKit (MLX SD3)
+tests/                    pytest suite
 ```
 
-**Standalone quantize** (no static path; dynamic W4A8 only): `python -m src.phase2.run_quantize` — see `--calibrate-only` and `--from-calibration`.
+## Citation
 
-**Inference**
-
-```bash
-python -m src.phase2.run_inference --mode fp16 --prompts-file src/settings/evaluation_set.txt --output-dir results/
-python -m src.phase2.run_inference --mode w4a8 --quantized-dir quantized/<tag>/ --prompts-file src/settings/evaluation_set.txt --output-dir results/
+```bibtex
+@misc{holt2026pq4dit,
+  title  = {PQ4DiT: Time-Aware Polynomial Clipping for Post-Training Quantization of Stable Diffusion 3},
+  author = {Holt, David and Tjhin, A. Michael and Yi, Seo Won},
+  year   = {2026}
+}
 ```
-
-Images are written under **`results/fp16/`** (fp16 mode) or **`results/<config_tag>/`** (w4a8 mode, where `<config_tag>` comes from `quantize_config.json` via `config_tag_from_meta`, e.g. `w4a8_l2_a0.50_gs32`). Filenames use **3-digit** indices (`000.png`, `001.png`, …) aligned with prompt order and per-line seeds in tab-separated prompt files.
-
-**Benchmark (GT comparison)**
-
-```bash
-python -m src.benchmark.gt_comparison_pipeline \
-  --ground-truth-dir /path/to/gt_images \
-  --fp16-images-dir benchmark_results/fp16_p2/images \
-  --quantized-dir quantized/<tag>/ \
-  --output-dir benchmark_results/<tag>_gt_eval \
-  --config w4a8_poly
-```
-
-Computes FID, CMMD, CLIP image-text scores, and LPIPS. Generates W4A8 images automatically if not already present. See `gt_comparison_pipeline.py` docstring.
-
-**Visualization helpers** (several require **`--calibration-dir`** on a quantized output tree with `calibration.npz`):
-
-- `python -m src.phase2.plot_post_csb --calibration-dir quantized/<tag>/ [--diagnostics-dir diagnostics]` — activation absmax vs σ (pre/post CSB).
-- `python -m src.phase2.plot_weight_profile --calibration-dir quantized/<tag>/` — per-channel weight absmax (pre/post CSB).
-- `python -m src.phase2.plot_quantized_weight --quantized-dir quantized/<tag>/` — per-group FP vs dequantized W4 (**requires MLX**).
-- `python -m src.phase2.plot_mse_vs_block --quantized-dir quantized/<tag>/` — analytical W4 / dynamic-A8 MSE vs block (**requires MLX**).
-
-Full detail, theory, and artifact tables: **`src/PHASE2.md`** (all-caps `PHASE2`; on case-sensitive systems this is the only path -- not `Phase2.md`).
-
----
-
-## Current status
-
-- **Phase 1:** Implemented (`src/phase1/`); outputs in `diagnostics/` when collection is run.
-- **Phase 2:** W4A8 with CSB + SSC, dynamic and static activation quantization, inference, benchmark integration, sweep, and plotting utilities.
-- **Default Phase 2 hyperparameters** are in `src/phase2/config.py` (`PHASE2_CONFIG`: e.g. `alpha=0.5`, `group_size=64`, `qkv_method=max`, `ssc_tau=1.0`, `per_token_rho_threshold=0.5`).
-
----
-
-## References
-
-- **PTQ4DiT** (methodology): *Post-training Quantization for Diffusion Transformers*.
-- This repo implements **PTQ4DiT-aligned CSB/SSC**, polynomial σ-aware activation clipping, and alpha search on SD3/MMDiT via DiffusionKit.
