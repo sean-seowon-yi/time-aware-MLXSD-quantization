@@ -232,7 +232,7 @@ class TestQuantizeModelStatic:
 class TestPatchPipeline:
 
     def test_modulation_dict_returns_adaln(self, mock_mmdit):
-        from conftest import MockPipeline
+        from tests.conftest import MockPipeline
 
         pipeline = MockPipeline(mock_mmdit)
         patch_pipeline_for_quantized_inference(pipeline)
@@ -244,7 +244,7 @@ class TestPatchPipeline:
             assert "adaLN" in k
 
     def test_full_load_falls_through(self, mock_mmdit):
-        from conftest import MockPipeline
+        from tests.conftest import MockPipeline
 
         pipeline = MockPipeline(mock_mmdit)
         original_result = pipeline.load_mmdit(only_modulation_dict=False)

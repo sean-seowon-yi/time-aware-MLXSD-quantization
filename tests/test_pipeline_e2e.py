@@ -4,7 +4,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from conftest import H, FFN_H, MockMMDiT, MockPipeline
+from tests.conftest import H, FFN_H, MockMMDiT, MockPipeline
 
 from src.phase2.balance import apply_csb_to_model
 from src.phase2.calibrate import calibrate_all_layers, save_calibration, load_calibration
