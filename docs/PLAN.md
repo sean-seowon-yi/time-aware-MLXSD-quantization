@@ -13,7 +13,7 @@ against standard FP16, using MS-COCO val prompts as the evaluation set.
 | Calibration data (100 images × 25 timesteps) | ✅ Cached (`calibration_data_100/`) |
 | Pooled embeddings for calibration images | ✅ Cached (`calibration_data_100/pooled/`) |
 | FP16 reference benchmark | ✅ Done (50 images, 28 steps, CFG 1.5, seed 42) |
-| MS-COCO prompts CSV | ✅ Ready (`coco_prompts.csv`, 5040 captions) |
+| MS-COCO prompts CSV | ✅ Ready (`data/prompts/coco_prompts.csv`, 5040 captions) |
 | AdaRound optimization | 🔄 Running (NaN fixed — float32 backward pass) |
 | Poly-clipping benchmark run | ❌ Not started |
 | σ-weighted AdaRound loss | ❌ Not started |
@@ -66,7 +66,7 @@ conda run -n diffusionkit python -m src.benchmark_model \
   --config adaround_w4a8_poly \
   --adaround-weights quantized_weights_poly/weights \
   --poly-schedule polynomial_clipping_schedule.json \
-  --prompt-csv coco_prompts.csv \
+  --prompt-csv data/prompts/coco_prompts.csv \
   --num-images 500 \
   --num-steps 28 \
   --cfg-scale 1.5 \
@@ -80,7 +80,7 @@ The existing `fp16_ref` used only 50 images. Re-run with 500 images for statisti
 ```bash
 conda run -n diffusionkit python -m src.benchmark_model \
   --config fp16 \
-  --prompt-csv coco_prompts.csv \
+  --prompt-csv data/prompts/coco_prompts.csv \
   --num-images 500 \
   --num-steps 28 \
   --cfg-scale 1.5 \
@@ -171,7 +171,7 @@ Once the approach is validated on 500 images:
 | `calibration_data_100/` | Cached block I/O for AdaRound (100 images × 25 steps) |
 | `quantized_weights_poly/` | Output of AdaRound optimization |
 | `benchmark_results/fp16_ref/` | FP16 reference (50 images, 28 steps) |
-| `coco_prompts.csv` | 5040 MS-COCO val captions for benchmarking |
+| `data/prompts/coco_prompts.csv` | 5040 MS-COCO val captions for benchmarking |
 
 ---
 

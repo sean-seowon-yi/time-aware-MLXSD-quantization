@@ -9,14 +9,14 @@ image tokens vs 1024). A clean rebuild at 256×256 with matched data throughout 
 before starting adaround from scratch.
 
 **Target settings:** 256×256 images, 32×32 latents, cfg=1.5, seed=42, 25 denoising steps,
-100 COCO prompts from `coco_prompts.csv` (10k prompts available).
+100 COCO prompts from `data/prompts/coco_prompts.csv` (10k prompts available).
 
 ---
 
 ## Pipeline Overview
 
 ```
-coco_prompts.csv
+data/prompts/coco_prompts.csv
        │
        ├─► generate_calibration_data.py ──► calibration_data_256/
        │       (images + trajectories)         manifest.json
@@ -71,7 +71,7 @@ conda run --no-capture-output -n diffusionkit python -m src.generate_calibration
   --seed 42 \
   --image-size 256 \
   --calib-dir calibration_data_256 \
-  --prompt-csv coco_prompts.csv
+  --prompt-csv data/prompts/coco_prompts.csv
 ```
 
 **Output:** `calibration_data_256/` with manifest.json, 100 images × 25 step `.npz` files
@@ -94,7 +94,7 @@ conda run --no-capture-output -n diffusionkit python -m src.calibration_sample_g
   --num-fid-samples 100 \
   --num-sampling-steps 25 \
   --num-selected-steps 25 \
-  --prompt-file coco_prompts.csv \
+  --prompt-file data/prompts/coco_prompts.csv \
   --output DiT_cali_data_256.npz
 ```
 

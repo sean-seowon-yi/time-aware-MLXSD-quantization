@@ -9,10 +9,10 @@ specific calibration images. Success criterion: median nRMSE < 5% for Group A vs
 
 Usage:
     conda run -n diffusionkit python -m src.validate_poly_generalization \\
-        --coco-prompts coco_prompts.csv \\
+        --coco-prompts data/prompts/coco_prompts.csv \\
         --group-size 30 \\
         --num-groups 3 \\
-        --output-dir generalization_results \\
+        --output-dir data/generalization_results \\
         --num-steps 25
 """
 
@@ -465,7 +465,7 @@ def print_ranked_mse(summary, top_n=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--coco-prompts", type=Path, default=Path("coco_prompts.csv"))
+    parser.add_argument("--coco-prompts", type=Path, default=Path("data/prompts/coco_prompts.csv"))
     parser.add_argument("--group-size", type=int, default=30)
     parser.add_argument("--num-groups", type=int, default=2,
                         help="Number of NEW groups to run (ignored groups use --load-group-schedules)")
@@ -476,7 +476,7 @@ def main():
                         metavar="JSON",
                         help="Paths to previously computed group schedule JSONs to compare "
                              "against new groups without re-running them")
-    parser.add_argument("--output-dir", type=Path, default=Path("generalization_results"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data/generalization_results"))
     parser.add_argument("--num-steps", type=int, default=25)
     parser.add_argument("--cfg-weight", type=float, default=7.5)
     parser.add_argument("--latent-size", type=int, default=64,

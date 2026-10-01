@@ -81,7 +81,7 @@ conda run -n diffusionkit python -m src.benchmark_model \
   --config adaround_w4a8_poly_sigma \
   --adaround-weights quantized_weights_poly_sigma/weights \
   --poly-schedule polynomial_clipping_schedule.json \
-  --prompt-csv coco_prompts.csv \
+  --prompt-csv data/prompts/coco_prompts.csv \
   --num-images 500 \
   --num-steps 28 --cfg-scale 1.5 --seed 42 \
   --output-dir benchmark_results/poly_sigma_weighted
@@ -94,7 +94,7 @@ conda run -n diffusionkit python -m src.benchmark_model \
   --config adaround_w4a8_poly \
   --adaround-weights quantized_weights_poly_baseline/weights \
   --poly-schedule polynomial_clipping_schedule.json \
-  --prompt-csv coco_prompts.csv \
+  --prompt-csv data/prompts/coco_prompts.csv \
   --num-images 500 \
   --num-steps 28 --cfg-scale 1.5 --seed 42 \
   --output-dir benchmark_results/poly_baseline

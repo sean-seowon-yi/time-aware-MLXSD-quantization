@@ -22,3 +22,6 @@ psutil
 torch-fidelity
 open-clip-torch
 scipy
+
+# Tests
+pytest

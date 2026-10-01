@@ -3,7 +3,7 @@ Download MS-COCO 2014 validation captions and export as prompts CSV.
 
 Usage
 -----
-    python -m src.download_coco_prompts --output coco_prompts.csv --count 10000
+    python -m src.download_coco_prompts --output data/prompts/coco_prompts.csv --count 10000
 
 Downloads captions_val2014.json (~1 MB) from the official COCO API, picks one
 caption per image (first annotation), shuffles with a fixed seed, and writes
@@ -68,8 +68,8 @@ def load_one_caption_per_image(json_path: Path) -> list[str]:
 
 def main():
     parser = argparse.ArgumentParser(description="Export MS-COCO val captions as prompts CSV")
-    parser.add_argument("--output", type=Path, default=Path("coco_prompts.csv"),
-                        help="Output CSV path (default: coco_prompts.csv)")
+    parser.add_argument("--output", type=Path, default=Path("data/prompts/coco_prompts.csv"),
+                        help="Output CSV path (default: data/prompts/coco_prompts.csv)")
     parser.add_argument("--count", type=int, default=10000,
                         help="Number of prompts to export (default: 10000)")
     parser.add_argument("--seed", type=int, default=42,

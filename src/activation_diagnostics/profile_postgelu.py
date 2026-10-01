@@ -20,7 +20,7 @@ Strategy for correctness:
 
 CLI (typical dry run, using a subset of calibration points):
 
-  cd /Users/seanyi/Documents/time-aware-MLXSD-quantization
+  cd time-aware-MLXSD-quantization
   python -m src.activation_diagnostics.profile_postgelu \\
       --calibration-file DiT_cali_data.npz \\
       --num-samples 512 \\

@@ -39,7 +39,7 @@ NPZ key convention inside each sample file
 Usage
 -----
     conda run -n diffusionkit python -m src.cache_adaround_data \\
-        --calib-dir /Users/davidholt/ai_projects/mlxproject/calibration_data \\
+        --calib-dir calibration_data \\
         --num-images 5 \\
         --stride 5 \\
         --force

@@ -186,7 +186,7 @@ gs=32 marginal entropy gain (+0.038 over gs=64) not worth doubled saturation rat
 conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \
     --adaround-cache calibration_data_512/adaround_cache \
     --output quantized_weights_w4a8_adaround_poly_p100_group64 \
-    --poly-schedule polynomial_clipping_schedule_512_p100.json \
+    --poly-schedule data/schedules/polynomial_clipping_schedule_512_p100.json \
     --group-size 64 \
     --iters 3000 \
     --batch-size 8
@@ -222,7 +222,7 @@ Command:
 conda run --no-capture-output -n diffusionkit python -m src.adaround_optimize \
     --adaround-cache calibration_data_512/adaround_cache \
     --output quantized_weights_w4a8_adaround_poly_p100_derivmax \
-    --poly-schedule polynomial_clipping_schedule_512_p100.json \
+    --poly-schedule data/schedules/polynomial_clipping_schedule_512_p100.json \
     --derivative-weighted --deriv-agg max \
     --iters 3000 --batch-size 8
 ```

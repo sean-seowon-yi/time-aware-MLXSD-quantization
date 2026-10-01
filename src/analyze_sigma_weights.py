@@ -9,7 +9,7 @@ weight, suggesting a smaller offset to emphasize those timesteps.
 
 Usage:
   python src/analyze_sigma_weights.py --stats activation_stats_512.npz \
-      --schedule polynomial_clipping_schedule_512_p100.json
+      --schedule data/schedules/polynomial_clipping_schedule_512_p100.json
 """
 
 import argparse
@@ -218,7 +218,7 @@ def compare_offset_weights(sigma_max=1.0, sigma_min=0.09):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--schedule', type=str, default='polynomial_clipping_schedule_512_p100.json',
+    parser.add_argument('--schedule', type=str, default='data/schedules/polynomial_clipping_schedule_512_p100.json',
                         help='Path to polynomial schedule JSON')
     parser.add_argument('--output', type=str, default='sigma_weight_analysis.png',
                         help='Output path for visualization')

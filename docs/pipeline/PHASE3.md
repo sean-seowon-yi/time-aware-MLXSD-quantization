@@ -686,7 +686,7 @@ Based on Phase 1 findings:
 
 - **Phase 1 diagnostics:** `diagnostics/` (activation trajectories, sigma schedule).
 - **Phase 2 calibration:** `quantized/<tag>/calibration.npz` (balancing vectors `b`), `calibration_meta.json` (layer names, mean Spearman ρ).
-- **Phase 2 documentation:** `src/Phase2.md` (CSB, SSC, W4A8 architecture).
+- **Phase 2 documentation:** `docs/pipeline/PHASE2.md` (CSB, SSC, W4A8 architecture).
 - **Polynomial clipping:** `src/phase3/poly_clipping.py` and this document.
 - **Phase 3 implementation:** `src/phase3/` (schedule generation, polynomial eval, inference module).
 - **PTQ4DiT paper:** Eq. 4 (salience), Eq. 7 (balancing), Eq. 11 (SSC weights).

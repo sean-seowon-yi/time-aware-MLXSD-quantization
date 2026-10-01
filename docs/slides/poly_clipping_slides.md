@@ -508,7 +508,7 @@ x_q = fake_quant(x, scale)                # quantize activations
 
 SD3's adaptive layer normalization injects a timestep-conditioned shift into activations before the FFN. Across all 188 traced activation points, the shift distribution is highly concentrated — 185 layers sit within ±0.5 units of zero, and 3 layers are dramatic outliers:
 
-![Shift across all 188 layers](shift_all_layers.png)
+![Shift across all 188 layers](../figures/shift_all_layers.png)
 
 The per-channel shift distribution reveals the true picture — not just the mean across channels but how many channels are severely displaced:
 
@@ -545,7 +545,7 @@ mm22:                         [+25 ......... +35]   ✓ all buckets used
 
 The shift trajectory is smooth and polynomial-amenable — it rises during mid-denoising and falls near σ→0, following the same rectified flow physics as the clipping range:
 
-![Shift trajectories for extreme layers](shift_trajectories.png)
+![Shift trajectories for extreme layers](../figures/shift_trajectories.png)
 
 | Layer | Cubic R² | Residual std | Verdict |
 |-------|----------|--------------|---------|
@@ -612,7 +612,7 @@ Concretely for a layer with hidden dimension D and T calibration timesteps:
 
 A high ratio means channels live in systematically different regimes — per-tensor quantization wastes resolution.
 
-![Per-channel vs within-channel variance across all 188 layers](per_channel_variance.png)
+![Per-channel vs within-channel variance across all 188 layers](../figures/per_channel_variance.png)
 
 **Results across all 188 traced activation points:**
 

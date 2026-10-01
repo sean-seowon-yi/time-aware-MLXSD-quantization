@@ -19,7 +19,7 @@ import pytest
 
 # Load module without mlx (it's available but we test at numpy level where possible)
 import sys, os
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 # ---------------------------------------------------------------------------

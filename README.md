@@ -2,7 +2,7 @@
 
 **David Holt, A. Michael Tjhin, Seo Won Yi**
 
-W4A8 post-training quantization of **Stable Diffusion 3 Medium** (MM-DiT backbone), implemented end-to-end in **MLX on Apple Silicon** (no CUDA anywhere in the pipeline). Paper: [`paper/uoft-csc2210w26-paper3.pdf`](paper/uoft-csc2210w26-paper3.pdf).
+W4A8 post-training quantization of **Stable Diffusion 3 Medium** (MM-DiT backbone), implemented end-to-end in **MLX on Apple Silicon** (no CUDA anywhere in the pipeline). **Paper: [PDF](paper/PQ4DiT%20-%20Time-Aware%20Polynomial%20Clipping%20for%20Post-Training%20Quantization%20of%20Stable%20Diffusion%203.pdf)**
 
 ## Summary
 
@@ -42,14 +42,14 @@ SD3-medium, W4A8 (per-group W4, group size 32; per-tensor A8), 512×512, 30 Eule
 
 Naming: RTN is the implicit default for both the W4 rounder and the A8 quantizer. "MW AdaRound" reweights AdaRound's per-timestep loss by the mean absolute derivative of the polynomial schedule.
 
-Raw metric outputs plus the quantization config, polynomial schedule, and α-search results for the P4D, P4D + Poly, and P4D + Poly + α rows are in [`paper/benchmarks/`](paper/benchmarks/). Qualitative comparisons and method figures are in the [paper](paper/uoft-csc2210w26-paper3.pdf).
+Raw metric outputs plus the quantization config, polynomial schedule, and α-search results for the P4D, P4D + Poly, and P4D + Poly + α rows are in [`paper/benchmarks/`](paper/benchmarks/). Qualitative comparisons and method figures are in the [paper](paper/PQ4DiT%20-%20Time-Aware%20Polynomial%20Clipping%20for%20Post-Training%20Quantization%20of%20Stable%20Diffusion%203.pdf).
 
 ## Where each configuration lives
 
 | Configurations | Code |
 |---|---|
 | P4D, P4D + Poly, P4D + Poly + α | `src/phase1/` → `src/phase2/` → `src/phase3/` → `src/phase4_1/`, orchestrated by `src/run_poly_alpha_pipeline.py` (CLI reference: [`src/settings/commands.md`](src/settings/commands.md)) |
-| Poly + AdaRound, Poly + MW AdaRound | `src/generate_poly_schedule.py`, `src/cache_adaround_data.py`, `src/adaround_optimize.py --poly-schedule ... [--derivative-weighted --deriv-agg mean]` (see [`POLYNOMIAL_CLIPPING_EXPLAINER.md`](POLYNOMIAL_CLIPPING_EXPLAINER.md), [`RESEARCH_LOG.md`](RESEARCH_LOG.md)) |
+| Poly + AdaRound, Poly + MW AdaRound | `src/generate_poly_schedule.py`, `src/cache_adaround_data.py`, `src/adaround_optimize.py --poly-schedule ... [--derivative-weighted --deriv-agg mean]` (see [`docs/POLYNOMIAL_CLIPPING_EXPLAINER.md`](docs/POLYNOMIAL_CLIPPING_EXPLAINER.md), [`docs/RESEARCH_LOG.md`](docs/RESEARCH_LOG.md)) |
 | P4D + Poly + AdaRound, P4D + Poly + MW AdaRound | branch `ptq4dit-polynomial-adaround` (`src/phase4/`) |
 | GPTQ, Poly + GPTQ, Poly + α, Poly + α + GPTQ | branch `gptq` (`src/gptq/`) |
 | FID / CMMD / LPIPS / CLIP evaluation | `src/benchmark/gt_comparison_pipeline.py` |
@@ -86,21 +86,35 @@ For the P4D baseline, use `--config w4a8_static` and omit `--poly-schedule`.
 ## Repository layout
 
 ```
-paper/                    Paper (PDF) and benchmark outputs for the P4D rows
-src/phase1/               Activation/weight diagnostics collection (σ-trajectories, salience)  — docs: src/PHASE1.md
-src/phase2/               CSB + SSC calibration, W4A8 quantization, inference                  — docs: src/Phase2.md
-src/phase3/               Polynomial clipping schedule fitting and visualization               — docs: src/PHASE3.md
-src/phase4_1/             Per-layer α-search                                                   — docs: src/PHASE4_1.md
-src/benchmark/            FID / CMMD / LPIPS / CLIP evaluation
-src/settings/             Calibration and evaluation prompt sets, CLI reference (commands.md)
-src/*.py                  Polynomial schedule, AdaRound / MW AdaRound, SmoothQuant, benchmarking scripts
-src/calibration_sample_generation/, src/activation_diagnostics/
-                          Early TaQ-DiT-style calibration and post-GELU profiling
-plans/, PLAN.md, RESEARCH_LOG.md, POLYNOMIAL_CLIPPING_EXPLAINER.md
-                          Design notes and research log
-DiffusionKit/             Vendored DiffusionKit (MLX SD3)
-tests/                    pytest suite
+paper/                        Paper (PDF) and benchmark outputs for the P4D rows
+src/
+  phase1/ … phase4_1/         P4D → Poly → α-search pipeline (see docs/pipeline/)
+  run_poly_alpha_pipeline.py  End-to-end driver for the pipeline above
+  benchmark/                  FID / CMMD / LPIPS / CLIP evaluation
+  settings/                   Calibration + evaluation prompts, CLI reference (commands.md)
+  *.py                        Polynomial schedule, AdaRound / MW AdaRound, SmoothQuant, benchmarking
+  calibration_sample_generation/, activation_diagnostics/
+                              Early TaQ-DiT-style calibration and post-GELU profiling
+data/
+  prompts/                    MS-COCO prompt sets used by the src/*.py scripts
+  schedules/                  Fitted polynomial / LUT clipping schedules
+  generalization_results/     Polynomial-schedule generalization study
+docs/
+  pipeline/                   Design docs for each phase (PHASE1–PHASE4_1) and Phase 1 findings
+  plans/, slides/, figures/   Design plans, explainer slides, and their figures
+  RESEARCH_LOG.md, PLAN.md, POLYNOMIAL_CLIPPING_EXPLAINER.md
+scripts/                      Small standalone utilities and plotting scripts
+tests/                        pytest suite (tests/integration needs local calibration data)
+DiffusionKit/                 Vendored DiffusionKit (MLX SD3)
 ```
+
+## Tests
+
+```bash
+pytest
+```
+
+`tests/integration/` is skipped by default because it needs local calibration data and AdaRound weights that are not in the repo. Run it explicitly with `pytest tests/integration`.
 
 ## Citation
 

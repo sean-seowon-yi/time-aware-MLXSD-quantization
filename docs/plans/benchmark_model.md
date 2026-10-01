@@ -27,7 +27,7 @@ with distributional metrics (FID, IS, KID), latency profiling, and memory profil
 |------|--------|
 | `src/benchmark_model.py` | NEW |
 | `tests/test_benchmark_model.py` | NEW |
-| `plans/benchmark_model.md` | THIS FILE |
+| `docs/plans/benchmark_model.md` | THIS FILE |
 
 ## Output Format
 

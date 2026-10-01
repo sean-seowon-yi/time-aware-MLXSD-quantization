@@ -432,7 +432,7 @@ For these layers, $B^{-1}$ is applied **online** as an element-wise multiply at 
 
 ### 6.1 Data Flow with Online Balancing
 
-**For `o_proj`** (referencing the architecture in `useful_doc/model.txt`):
+**For `o_proj`** (referencing the architecture in `docs/model.txt`):
 
 ```
 Joint SDPA output → split into img/txt slices
@@ -1174,8 +1174,8 @@ For each comparison, compute:
 ## 17. References
 
 - **Phase 1 diagnostics data:** `diagnostics/` (activation trajectories, weight salience, summary table)
-- **Phase 1 findings:** `src/phase1_findings.md` (salience patterns, complementarity, modality asymmetry, risk ranking)
+- **Phase 1 findings:** `docs/pipeline/phase1_findings.md` (salience patterns, complementarity, modality asymmetry, risk ranking)
 - **Phase 1 implementation:** `src/phase1/` (reusable: `analyze.py` for `compute_spearman_trajectory`, `compute_ssc_weights`; `registry.py` for `build_layer_registry`)
 - **DiffusionKit architecture:** `DiffusionKit/python/src/diffusionkit/mlx/mmdit.py` (`TransformerBlock.pre_sdpa`, `affine_transform`, `adaLN_modulation`, `FinalLayer`)
-- **Architecture diagram:** `useful_doc/model.txt`
+- **Architecture diagram:** `docs/model.txt`
 - **PTQ4DiT paper:** Eq. 4 (salience), Eq. 7 (balancing matrix), Eq. 11 (SSC weights), Eq. 13 (adaLN), Eq. 20 (re-parameterization)
