@@ -4,6 +4,8 @@
 
 Run Diffusion Models on Apple Silicon with Core ML and MLX
 
+> **Vendored in `time-aware-MLXSD-quantization`:** This directory is a copy of the upstream DiffusionKit tree used for local development (`PYTHONPATH=DiffusionKit/python/src`). For the latest upstream docs and installation, see the [DiffusionKit repository](https://github.com/argmaxinc/DiffusionKit) and PyPI package `diffusionkit`.
+
 This repository comprises
 - `diffusionkit`, a Python package for converting PyTorch models to Core ML format and performing image generation with [MLX](https://github.com/ml-explore/mlx) in Python
 - `DiffusionKit`, a Swift package for on-device inference of diffusion models using Core ML and MLX

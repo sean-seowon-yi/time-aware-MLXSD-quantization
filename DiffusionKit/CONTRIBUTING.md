@@ -1,5 +1,7 @@
 # Contributing to DiffusionKit
 
+> If you are working inside **`time-aware-MLXSD-quantization`**, contribute changes to **upstream** [DiffusionKit](https://github.com/argmaxinc/DiffusionKit); this file describes the main project’s contribution flow.
+
 ## Overview
 
 We welcome and encourage contributions to DiffusionKit! Whether you're fixing bugs, improving documentation, or adding new features from the roadmap, your help is appreciated. This guide will help you get started with contributing to DiffusionKit.

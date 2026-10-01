@@ -1,0 +1,24 @@
+# DiffusionKit dependencies
+argmaxtools>=0.1.13
+torch
+safetensors
+mlx
+jaxtyping
+transformers
+pillow
+sentencepiece
+
+# Phase 1 diagnostics
+numpy
+scipy
+matplotlib
+
+# Sweep metrics (Step 3)
+lpips
+torchvision
+
+# Benchmark metrics
+psutil
+torch-fidelity
+open-clip-torch
+scipy
