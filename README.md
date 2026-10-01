@@ -1,6 +1,6 @@
 # PQ4DiT: Time-Aware Polynomial Clipping for Post-Training Quantization of Stable Diffusion 3
 
-**David Holt, A. Michael Tjhin, Seo Won Yi**
+**David Holt, Alexander Michael Tjhin, Seo Won Yi**
 
 W4A8 post-training quantization of **Stable Diffusion 3 Medium** (MM-DiT backbone), implemented end-to-end in **MLX on Apple Silicon** (no CUDA anywhere in the pipeline). **Paper: [PDF](paper/PQ4DiT%20-%20Time-Aware%20Polynomial%20Clipping%20for%20Post-Training%20Quantization%20of%20Stable%20Diffusion%203.pdf)**
 
